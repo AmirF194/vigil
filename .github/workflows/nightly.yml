@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_DB: deeptempo_test
           POSTGRES_USER: test
@@ -52,6 +52,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
+      - name: Enable Postgres extensions
+        run: |
+          PGPASSWORD=test psql -h localhost -p 5432 -U test -d deeptempo_test \
+            -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+
+      - name: Initialize schema
+        run: python -c "from database.connection import init_database; init_database()"
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/deeptempo_test
+
       - name: Run all tests
         run: |
           pytest tests/ -v --cov --cov-report=xml --cov-report=term
@@ -140,7 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_DB: migration_test
           POSTGRES_USER: test
