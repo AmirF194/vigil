@@ -21,6 +21,17 @@ jobs:
     # Skipping (not failing) keeps forks quiet.
     if: github.repository == 'Vigil-SOC/vigil'
     runs-on: ubuntu-latest
+    # Mirrors ci-cd.yml's test-integration: the schema and the tests resolve the
+    # database from POSTGRES_*, so a DATABASE_URL here would be ignored.
+    env:
+      TESTING: 'true'
+      DEV_MODE: 'true'
+      SECRET_KEY: test-secret-key
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: '5432'
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: deeptempo_test
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -59,15 +70,13 @@ jobs:
 
       - name: Initialize schema
         run: python -c "from database.connection import init_database; init_database()"
-        env:
-          DATABASE_URL: postgresql://test:test@localhost:5432/deeptempo_test
 
       - name: Run all tests
         run: |
           pytest tests/ -v --cov --cov-report=xml --cov-report=term
         env:
-          TESTING: true
-          DATABASE_URL: postgresql://test:test@localhost:5432/deeptempo_test
+          CLAUDE_API_KEY: ${{ secrets.CLAUDEAPI }}
+          ANTHROPIC_API_KEY: ${{ secrets.CLAUDEAPI }}
       
       - name: Upload coverage
         uses: codecov/codecov-action@v5
