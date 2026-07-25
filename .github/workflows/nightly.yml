@@ -25,7 +25,6 @@ jobs:
     # database from POSTGRES_*, so a DATABASE_URL here would be ignored.
     env:
       TESTING: 'true'
-      DEV_MODE: 'true'
       SECRET_KEY: test-secret-key
       POSTGRES_HOST: localhost
       POSTGRES_PORT: '5432'
@@ -71,12 +70,20 @@ jobs:
       - name: Initialize schema
         run: python -c "from database.connection import init_database; init_database()"
 
-      - name: Run all tests
+      # Split by DEV_MODE: the integration suite needs the auth bypass on, while
+      # the security suite exists to prove the gates it bypasses still hold.
+      - name: Run unit + integration tests
         run: |
-          pytest tests/ -v --cov --cov-report=xml --cov-report=term
+          pytest tests/unit tests/integration -v --cov --cov-report=xml --cov-report=term
         env:
+          DEV_MODE: 'true'
           CLAUDE_API_KEY: ${{ secrets.CLAUDEAPI }}
           ANTHROPIC_API_KEY: ${{ secrets.CLAUDEAPI }}
+
+      - name: Run security tests
+        run: pytest tests/security -v --no-cov
+        env:
+          DEV_MODE: 'false'
       
       - name: Upload coverage
         uses: codecov/codecov-action@v5
