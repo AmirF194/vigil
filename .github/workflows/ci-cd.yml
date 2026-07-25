@@ -155,8 +155,7 @@ jobs:
       
       - name: Run unit tests
         working-directory: frontend
-        run: npm run test:unit || echo "Frontend tests not yet implemented"
-        continue-on-error: true
+        run: npm run test:run
 
   # ============================================================================
   # Integration Tests
@@ -405,11 +404,14 @@ jobs:
   # ============================================================================
   # Build Frontend Assets
   # ============================================================================
+  # Runs on pull_request too: this is the only job that type-checks
+  # (`npm run build` is `tsc && vite build`), so gating it on push alone let a
+  # non-compiling frontend merge and only fail afterwards.
   build-frontend:
     name: Build Frontend
     runs-on: ubuntu-latest
     needs: [lint-frontend]
-    if: github.event_name == 'push' && github.repository == 'Vigil-SOC/vigil'
+    if: github.repository == 'Vigil-SOC/vigil'
     steps:
       - uses: actions/checkout@v5
       
@@ -429,6 +431,7 @@ jobs:
         run: npm run build
       
       - name: Upload build artifacts
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v5
         with:
           name: frontend-build
