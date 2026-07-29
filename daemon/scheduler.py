@@ -121,7 +121,21 @@ class TaskScheduler:
                 ))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Threat feed poller unavailable: {e}")
-    
+
+        # ThreatFox poller — only runs when the threatfox integration is enabled.
+        try:
+            from daemon.threatfox_poller import ThreatFoxFeedPoller
+            if ThreatFoxFeedPoller.is_enabled():
+                self._tasks.append(ScheduledTask(
+                    name="threatfox_feed_poll",
+                    func=self._run_threatfox_feed_poll,
+                    interval=ThreatFoxFeedPoller.poll_interval_seconds(),
+                    enabled=True,
+                    run_on_start=True,
+                ))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"ThreatFox poller unavailable: {e}")
+
     def _init_services(self):
         """Initialize required services."""
         try:
@@ -419,6 +433,17 @@ class TaskScheduler:
             return
         poller = ThreatFeedPoller()
         return await poller.run_once()
+
+    async def _run_threatfox_feed_poll(self):
+        """Pull ThreatFox indicators into threat_indicators."""
+        try:
+            from daemon.threatfox_poller import ThreatFoxFeedPoller
+        except Exception as e:
+            logger.warning(f"ThreatFox poller unavailable: {e}")
+            return
+        if not ThreatFoxFeedPoller.is_enabled():
+            return
+        return await ThreatFoxFeedPoller().run_once()
 
     async def _run_health_check(self):
         """Run system health check."""
