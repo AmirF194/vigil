@@ -24,6 +24,7 @@ from hashlib import sha256
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
+from api._meta import Auth, RouterMeta
 from core.config import get_settings
 from core.secrets import get_secret
 
@@ -46,6 +47,23 @@ def cloudy_ingestion_enabled() -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.debug("system_config read for cloudflare.cloudy.enabled failed: %s", exc)
     return get_settings().cloudy_ingestion_enabled
+
+
+ROUTER_META = RouterMeta(
+    prefix="/api/webhooks/cloudflare",
+    tags=["cloudflare"],
+    auth=Auth.PUBLIC_WEBHOOK,
+    reason=(
+        "Inbound receiver for Cloudflare Cloudy pushes — the caller is a "
+        "machine, so there is no session to authenticate. The endpoints "
+        "verify an HMAC shared secret and re-check the enable flag at request "
+        "time, so even a misconfigured mount fails closed."
+    ),
+    # Hard-off by default: the upstream API contract is not yet stable. Flip
+    # CLOUDY_INGESTION_ENABLED=true (or system_config cloudflare.cloudy.enabled)
+    # once the partnership confirms the wire format.
+    enabled=cloudy_ingestion_enabled,
+)
 
 
 def _get_secret() -> Optional[str]:

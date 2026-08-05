@@ -10,6 +10,7 @@ import os
 
 # Import new secrets manager
 import sys
+from api._meta import Auth, RouterMeta
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from secrets_manager import get_secret, set_secret, delete_secret, get_secrets_manager
@@ -22,6 +23,12 @@ from services.integration_secrets import redact_secrets, secret_fields_for, spli
 from core.config import get_settings, vigil_path
 
 router = APIRouter()
+
+ROUTER_META = RouterMeta(
+    prefix="/api/config",
+    tags=["config"],
+    auth=Auth.REQUIRED,
+)
 logger = logging.getLogger(__name__)
 
 

@@ -25,12 +25,41 @@ from typing import Any, Callable, Dict, Optional
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from services.darktrace_ingestion import DarktraceIngestionService
+from api._meta import Auth, RouterMeta
 from core.config import get_settings
 from core.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def darktrace_enabled() -> bool:
+    """Master flag for the Darktrace webhook receiver.
+
+    Off unless explicitly enabled. Lives here rather than inline in
+    ``backend/main.py`` so the gate travels with the receiver it guards and
+    can be unit-tested directly (issue #478). Reads the typed ``Settings``
+    field rather than the raw env var so there is a single source of truth
+    for the flag, matching ``cloudflare_webhooks.cloudy_ingestion_enabled``.
+    """
+    return get_settings().darktrace_enabled
+
+
+ROUTER_META = RouterMeta(
+    prefix="/api/webhooks/darktrace",
+    tags=["darktrace"],
+    auth=Auth.PUBLIC_WEBHOOK,
+    reason=(
+        "Inbound receiver for Darktrace pushes — the caller is a machine, so "
+        "there is no session to authenticate. Each endpoint verifies an "
+        "HMAC-SHA256 X-Darktrace-Signature and fails closed when no shared "
+        "secret is configured."
+    ),
+    # env.example and docs/integrations/DARKTRACE.md document DARKTRACE_ENABLED
+    # as the on/off toggle; leaving it unset must leave the receiver off.
+    enabled=darktrace_enabled,
+)
 
 
 def _get_settings() -> Dict[str, Any]:
