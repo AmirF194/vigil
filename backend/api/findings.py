@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import logging
 
 from services.database_data_service import DatabaseDataService
+from core.config import vigil_path
 from services.findings.enrichment import (
     FindingNotFound,
     NoProviderConfigured,
@@ -137,19 +138,9 @@ def get_findings_summary():
 
 @router.post("/export")
 def export_findings(output_format: str = "json"):
-    """
-    Export findings to a file.
-    
-    Args:
-        output_format: Export format (json or jsonl)
-    
-    Returns:
-        Export result
-    """
-    from pathlib import Path
     from datetime import datetime
     
-    output_dir = Path.home() / ".deeptempo" / "exports"
+    output_dir = vigil_path("exports", write=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
