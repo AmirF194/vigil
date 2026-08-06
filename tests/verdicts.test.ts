@@ -52,6 +52,7 @@ function evidenceOn(
       provenance: "worker",
       attacker_influenceable: options.attackerInfluenceable ?? false,
       instruction_like: false,
+      entities: [],
       captured_at: new Date().toISOString(),
     },
   });
@@ -98,6 +99,7 @@ function gapOn(ledger: Ledger, hypothesisId: string | null, intent = `question $
       provenance: "tool_failure",
       attacker_influenceable: false,
       instruction_like: false,
+      entities: [],
       captured_at: new Date().toISOString(),
     },
   });
@@ -123,6 +125,7 @@ function controllerFor(
   return new HuntController(
     ledger,
     new ScriptedDecisionProvider(decisions, costPerDecision),
+    undefined,
     undefined,
     undefined,
     undefined,

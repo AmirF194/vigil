@@ -82,7 +82,10 @@ describe("reap", () => {
         question_id: questionId,
         question: "check 10.0.0.1",
         status: "open",
+        entity_key: null,
         spawning_evidence_id: null,
+        spawning_dispatch_id: null,
+        spawned_iteration: 1,
         hypothesis_id: null,
       },
     });

@@ -4,7 +4,7 @@ import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { estimateTokens, Limiter, statusOf } from "./limiter.js";
 import type { DecisionProvider, DisconfirmationCritic, WorkerDispatcher } from "./ports.js";
-import type { HuntSpec, Rates, RoleName, RoleSpec } from "./spec.js";
+import type { HuntSpec, Rates, RoleSpec } from "./spec.js";
 import { toOpenAITools, type Tool } from "./tools.js";
 import type {
   Decision,
@@ -27,7 +27,7 @@ const MAX_TOOL_RESULT_CHARS = 4_000;
 
 // A snapshot naming "v1" while the prompt underneath it changes is not a
 // snapshot. The hash is over what the role was actually told.
-export function promptVersion(name: RoleName, role: RoleSpec): string {
+export function promptVersion(name: string, role: RoleSpec): string {
   return `${name}/${createHash("sha256").update(role.prompt).digest("hex").slice(0, 12)}`;
 }
 
@@ -97,6 +97,27 @@ export function renderDigest(digest: Digest): string {
     );
   }
 
+  // PIVOT changes the entity and DEEPEN keeps it, so the boundary between them
+  // is undecidable without seeing what the hunt has actually touched.
+  if (digest.entities.length > 0) {
+    lines.push(
+      "",
+      "## Entities seen",
+      `Currently looking at: ${digest.focus.entity ?? "nothing in particular"}${digest.focus.hypothesis === null ? "" : ` on ${digest.focus.hypothesis}`}.`,
+      "DEEPEN keeps both; PIVOT must change at least one, naming target_entity.",
+      ...digest.entities.map((e) => `- ${e.type} ${e.value} (${e.count} record(s), first ${e.first_evidence_id})`),
+    );
+  }
+
+  if (digest.pivot_candidates.length > 0) {
+    lines.push(
+      "",
+      "## Where a pivot could go",
+      "Entities the current focus co-occurs with, most frequent first.",
+      ...digest.pivot_candidates.map((e) => `- ${e.type}:${e.value} (${e.count} record(s))`),
+    );
+  }
+
   lines.push("", "## Evidence");
   for (const record of digest.recent_evidence) {
     lines.push(
@@ -105,6 +126,29 @@ export function renderDigest(digest: Digest): string {
       record.why_notable ? `why notable: ${record.why_notable}` : "",
       "</vigil:evidence>",
     );
+  }
+
+  // Named rather than discarded: the lead can see what compression cost it and
+  // EXPAND anything the summary line makes it want.
+  if (digest.omitted.count > 0) {
+    lines.push(
+      "",
+      "## Compressed",
+      `${digest.omitted.count} routine record(s) are not shown: ${digest.omitted.evidence_ids.join(", ")}.`,
+      "EXPAND any of these ids to read it in full.",
+    );
+  }
+
+  // Raw telemetry, so delimited exactly like the summaries it came from.
+  if (digest.expansions.length > 0) {
+    lines.push("", "## Expanded payloads");
+    for (const expansion of digest.expansions) {
+      lines.push(
+        `<vigil:evidence id="${expansion.evidence_id}" source="raw payload" salience="expanded">`,
+        expansion.payload,
+        "</vigil:evidence>",
+      );
+    }
   }
 
   if (digest.notes.length > 0) lines.push("", "## Notes", ...digest.notes.map((n) => `- ${n}`));
@@ -458,26 +502,25 @@ function cappedPayload(payload: Record<string, unknown> | undefined): Record<str
 }
 
 export class LlmWorkerDispatcher implements WorkerDispatcher {
-  private readonly role: RoleSpec;
-  private readonly tools: Tool[];
-
   constructor(
     private readonly spec: HuntSpec,
-    tools: readonly Tool[] = [],
+    private readonly tools: readonly Tool[] = [],
     private readonly limiter: Limiter = createLimiter(spec),
     private readonly client: OpenAI = createClient(),
-  ) {
-    this.role = spec.roles.worker;
-    this.tools = toolsFor(this.role, tools);
-  }
+  ) {}
 
+  // Resolved per request, not in the constructor: which specialist runs is the
+  // Hunt Lead's decision, and each one carries its own prompt and tool scope.
   async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+    const role = this.spec.roles.workers[request.agent_id];
+    if (role === undefined) throw new LlmError(`no such worker ${request.agent_id}`);
+
     const result = await llm_output<WorkerOutput>({
       client: this.client,
       model: this.spec.model,
-      messages: input(this.role, renderDispatch(request, this.spec.narrative)),
-      schema: output_schema(this.role),
-      tools: this.tools,
+      messages: input(role, renderDispatch(request, this.spec.narrative)),
+      schema: output_schema(role),
+      tools: toolsFor(role, this.tools),
       limiter: this.limiter,
       rates: this.spec.rates,
     });

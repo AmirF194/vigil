@@ -3,8 +3,10 @@ import type {
   DecisionResult,
   DispatchRequest,
   DispatchResult,
+  Entity,
   NullCheckInput,
   NullCheckResult,
+  WorkerEvidence,
 } from "./types.js";
 
 // The Hunt Lead: one digest in, exactly one typed decision out. Implementations
@@ -25,3 +27,8 @@ export interface WorkerDispatcher {
 export interface DisconfirmationCritic {
   argueNull(check: NullCheckInput): Promise<NullCheckResult>;
 }
+
+// Every chain that applies to one entity, run without a model. A function rather
+// than an interface because depth, dedup and the per-round cap are ledger facts
+// and stay with the controller.
+export type Enricher = (entity: Entity) => Promise<WorkerEvidence[]>;

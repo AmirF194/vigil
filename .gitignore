@@ -1,5 +1,7 @@
 node_modules/
 runs/
 *.tsbuildinfo
+index.scip
 .DS_Store
 .claude/
+index.scip.stamp

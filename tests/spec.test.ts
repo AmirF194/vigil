@@ -9,7 +9,7 @@ function arch(roles: string): string {
   return `name: t\nroles:\n${roles}`;
 }
 const LEAD = `  lead:\n    prompt: decide\n    output_schema:\n      properties:\n        action: { enum: [INVESTIGATE, CONCLUDE] }\n`;
-const WORKER = `  worker:\n    prompt: query\n    output_schema: { type: object }\n`;
+const WORKER = `  workers:\n    threat_hunter:\n      description: queries things\n      prompt: query\n      output_schema: { type: object }\n`;
 
 describe("the three layers", () => {
   const spec = buildSpec({ workflowPath: "frothly.yaml" });
@@ -17,23 +17,29 @@ describe("the three layers", () => {
   it("merges arch, playbook and config into one spec", () => {
     expect(spec.arch).toBe("threathunt");
     expect(spec.hypotheses).toHaveLength(2);
-    expect(spec.tools.map((tool) => tool.id)).toEqual(["duckdb_query", "expand"]);
+    expect(spec.tools.map((tool) => tool.id)).toEqual(["duckdb_query", "expand", "intel_lookup", "web_intel"]);
     expect(spec.roles.lead.prompt).toContain("Hunt Lead");
     expect(spec.narrative).toContain("Frothly");
   });
 
   it("appends playbook directives to the arch prompt rather than replacing it", () => {
     const base = loadArch(DEFAULT_ARCH);
-    expect(base.roles.worker.prompt).not.toContain("froth.ly");
-    expect(spec.roles.worker.prompt.startsWith(base.roles.worker.prompt)).toBe(true);
-    expect(spec.roles.worker.prompt).toContain("froth.ly");
+    const worker = base.roles.workers["threat_hunter"]!;
+    expect(worker.prompt).not.toContain("froth.ly");
+    expect(spec.roles.workers["threat_hunter"]!.prompt.startsWith(worker.prompt)).toBe(true);
+    expect(spec.roles.workers["threat_hunter"]!.prompt).toContain("froth.ly");
     // Worker guidance stays off the lead.
     expect(spec.roles.lead.prompt).not.toContain("froth.ly");
   });
 
-  it("keeps the query tool off the lead", () => {
+  it("gives the reserved workers directive to every specialist, not just one", () => {
+    for (const role of Object.values(spec.roles.workers)) expect(role.prompt).toContain("froth.ly");
+  });
+
+  it("keeps the query tool off the lead and off threat intel", () => {
     expect(spec.roles.lead.tools).toEqual(["expand"]);
-    expect(spec.roles.worker.tools).toEqual(["duckdb_query"]);
+    expect(spec.roles.workers["network_analyst"]!.tools).toEqual(["duckdb_query"]);
+    expect(spec.roles.workers["threat_intel"]!.tools).toEqual(["intel_lookup", "web_intel"]);
   });
 
   it("rejects a key that belongs to a different layer", () => {
@@ -63,10 +69,12 @@ describe("decision vocabulary", () => {
 
   it("refuses a verb the vocabulary knows but the controller does not act on", () => {
     // A journaled no-op costs an iteration and moves nothing, so it is refused at
-    // load rather than left for the lead to keep choosing.
-    const parseable = LEAD.replace("CONCLUDE]", "CONCLUDE, DEEPEN]");
-    expect(() => parseArch(arch(parseable + WORKER))).toThrow(/cannot run: DEEPEN/);
-    expect(DECISION_ACTIONS).toContain("DEEPEN");
+    // load rather than left for the lead to keep choosing. CHECKPOINT is in the
+    // Phase-1 vocabulary and arrives with the checkpoint machinery, not before.
+    const parseable = LEAD.replace("CONCLUDE]", "CONCLUDE, CHECKPOINT]");
+    expect(() => parseArch(arch(parseable + WORKER))).toThrow(/cannot run: CHECKPOINT/);
+    expect(DECISION_ACTIONS).toContain("CHECKPOINT");
+    expect(EXECUTABLE_ACTIONS).not.toContain("CHECKPOINT");
   });
 
   it("ships an arch that declares exactly what the controller implements", () => {
@@ -115,6 +123,11 @@ describe("digest rendering", () => {
         },
       ],
       weakens: { "h-1": [] },
+      entities: [],
+      focus: { entity: null, hypothesis: null },
+      pivot_candidates: [],
+      omitted: { count: 0, evidence_ids: [] },
+      expansions: [],
       open_questions: [],
       budget_remaining: { iterations: 5, cost_usd: 1 },
       directives: ["alice: pivot to DNS if this stalls"],

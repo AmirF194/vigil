@@ -26,18 +26,28 @@ export const DECISION_ACTIONS = [
   "HANDOFF_IR",
 ] as const satisfies readonly DecisionAction[];
 
-// These rest on a judgement about existing evidence, so an uncited one is unauditable.
+// These rest on a judgement about existing evidence, so an uncited one is
+// unauditable. EXPAND is here for a different reason: it names what to read.
 export const ACTIONS_REQUIRING_CITATION: ReadonlySet<DecisionAction> = new Set([
   "ABANDON",
   "VALIDATE",
   "PIVOT",
+  "EXPAND",
 ]);
 
 // What the controller actually does something about. An arch may only declare
-// these: a verb that is merely in the vocabulary would burn an iteration and
-// change nothing, and the Hunt Lead would keep choosing it. Grows as the
-// controller learns a verb, which is the only place this list may change.
-export const EXECUTABLE_ACTIONS = ["INVESTIGATE", "VALIDATE", "CONCLUDE"] as const satisfies readonly DecisionAction[];
+// these: a verb that is merely in the vocabulary would be journaled, change
+// nothing, and cost an iteration, and the Hunt Lead would keep choosing it.
+// Grows as the controller learns a verb — CHECKPOINT and HANDOFF_IR wait on 09.
+export const EXECUTABLE_ACTIONS = [
+  "INVESTIGATE",
+  "EXPAND",
+  "PIVOT",
+  "DEEPEN",
+  "ABANDON",
+  "VALIDATE",
+  "CONCLUDE",
+] as const satisfies readonly DecisionAction[];
 
 export type HuntStatus = "pending_approval" | "active" | "terminal";
 
@@ -73,8 +83,25 @@ export interface Budgets {
 
 export const DEFAULT_BUDGETS: Budgets = { max_iterations: 20, max_cost_usd: 25.0 };
 
+// Closed, so a typo in an extraction key pattern cannot invent a type, and a
+// seed entity lands in the same namespace as everything the graph extracts.
+export const ENTITY_TYPES = [
+  "ip",
+  "domain",
+  "host",
+  "url",
+  "email",
+  "hash",
+  "arn",
+  "aws_key",
+  "user",
+  "process",
+] as const;
+
+export type EntityType = (typeof ENTITY_TYPES)[number];
+
 export interface Entity {
-  type: string;
+  type: EntityType;
   value: string;
 }
 
@@ -96,6 +123,8 @@ export interface HuntState {
   // Resolved once at hunt start: resume needs no YAML, and editing an arch file
   // mid-run cannot silently change what a hunt in flight was told.
   spec: HuntSpec;
+  // Journaled so stochastic resurfacing replays exactly, on resume and on audit.
+  seed: string;
   status: HuntStatus;
   outcome: HuntOutcome | null;
   iteration: number;
@@ -129,11 +158,19 @@ export interface EvidenceStrength {
   survived_disconfirmation: boolean;
 }
 
+// A lead on the frontier. The three provenance fields are facts of capture and
+// are stored; everything the priority score derives from them is computed on read.
 export interface OpenQuestion {
   question_id: string;
   question: string;
   status: "open" | "closed";
+  // The entity this lead is about, so a worker taking it is told what to look at.
+  entity_key: string | null;
+  // Set when a decision cited one record; a worker's follow-up names its dispatch
+  // instead, because attributing it to a single record would be invented provenance.
   spawning_evidence_id: string | null;
+  spawning_dispatch_id: string | null;
+  spawned_iteration: number;
   // The hypothesis this lead was opened in service of. Without it a lead that
   // fails is a gap belonging to nothing, and no hypothesis is ever gap-locked.
   hypothesis_id: string | null;
@@ -152,6 +189,9 @@ export interface EvidenceRecord {
   // Set when an adversary could have written the value; an ABANDON must not rest on it alone.
   attacker_influenceable: boolean;
   instruction_like: boolean;
+  // Extracted once at capture and stored, so tightening the pattern later cannot
+  // rewrite the graph a past decision was made against.
+  entities: Entity[];
   captured_at: string;
 }
 
@@ -192,8 +232,17 @@ export interface Decision {
   stated_confidence?: number | null;
   evidence_citations?: string[];
   target_hypothesis_id?: string | null;
+  // An entity key the graph already knows. With target_hypothesis_id it is the
+  // focus, which is what makes DEEPEN and PIVOT distinguishable.
+  target_entity?: string | null;
   worker_agent_id?: string | null;
   query_intent?: string;
+}
+
+// What the hunt is currently looking at. Derived from the decisions, never stored.
+export interface Focus {
+  entity: string | null;
+  hypothesis: string | null;
 }
 
 export interface DecisionResult {
@@ -227,6 +276,19 @@ export interface EvidenceView {
   instruction_like: boolean;
 }
 
+export interface EntityView {
+  type: EntityType;
+  value: string;
+  count: number;
+  first_evidence_id: string;
+}
+
+// A raw payload the lead asked for by id. Rendered delimited, like all evidence.
+export interface Expansion {
+  evidence_id: string;
+  payload: string;
+}
+
 export interface Digest {
   hunt_id: string;
   hunt_name: string;
@@ -236,6 +298,17 @@ export interface Digest {
   recent_evidence: EvidenceView[];
   // Strongest counter-evidence per active hypothesis; one-sidedness is itself a finding.
   weakens: Record<string, EvidenceView[]>;
+  // What the hunt has touched. PIVOT changes the entity, DEEPEN keeps it, so the
+  // lead cannot tell the two apart without seeing them.
+  entities: EntityView[];
+  focus: Focus;
+  // Entities adjacent to the focus in the graph, so a PIVOT names something the
+  // evidence has actually seen rather than inventing a value.
+  pivot_candidates: EntityView[];
+  // Routine records the window dropped. Named rather than discarded, so the lead
+  // knows they exist and can EXPAND one.
+  omitted: { count: number; evidence_ids: string[] };
+  expansions: Expansion[];
   open_questions: string[];
   budget_remaining: { iterations: number; cost_usd: number };
   // Operator instructions. Unlike evidence, these are direction.
@@ -255,10 +328,11 @@ export interface DispatchRequest {
 }
 
 // supports/weakens name the hypotheses this record bears on; the controller
-// turns them into links, so a worker still never writes state itself.
+// turns them into links, so a worker still never writes state itself. entities
+// are extracted rather than declared, for the same reason.
 export type WorkerEvidence = Omit<
   EvidenceRecord,
-  "evidence_id" | "dispatch_id" | "iteration" | "captured_at"
+  "evidence_id" | "dispatch_id" | "iteration" | "entities" | "captured_at"
 > & { supports?: string[]; weakens?: string[] };
 
 export interface DispatchResult {
@@ -307,6 +381,8 @@ export interface IterationResult {
   decision_id: string;
   cost_usd: number;
   evidence_appended: number;
+  // Records the controller enriched in on its own, spending no decision on them.
+  enriched: number;
   hunt_status: HuntStatus;
   hunt_outcome: HuntOutcome | null;
   note: string;

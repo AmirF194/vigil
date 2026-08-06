@@ -2,6 +2,7 @@
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline/promises";
 import { HuntController, resumeHunt, startHunt } from "../ai/loop.js";
+import { createEnricher } from "../ai/enrich.js";
 import { criticFor, LlmDecisionProvider, LlmWorkerDispatcher } from "../ai/llm.js";
 import { Lease } from "../ai/lease.js";
 import { steer } from "../ai/inbox.js";
@@ -12,7 +13,6 @@ import {
   type ScriptedDecision,
 } from "../ai/scripted.js";
 import { buildSpec, SpecError, type HuntSpec } from "../ai/spec.js";
-import { isGap } from "../ai/strength.js";
 import { buildTools, closeTools } from "../ai/tools.js";
 import type { Ledger } from "../ai/ledger.js";
 import type { Digest, Entity, WorkerEvidence } from "../ai/types.js";
@@ -70,16 +70,25 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
   return ["y", "yes"].includes(answer.trim().toLowerCase());
 }
 
+// Carries observables and a payload rather than a bare sentence, and couples them
+// to the hunt's own seed, so --scripted exercises extraction, the graph, pivot
+// candidates, EXPAND and the enrichment chains rather than skipping any of them.
 // Two source systems, because the verdict predicates a scripted walk has to
 // clear are the same ones a real hunt clears — one system agreeing with itself
 // would never reach proven. Declared domains when the playbook has them, or the
 // controller would collapse invented labels into one and nothing would prove.
-function scriptedEvidence(hypothesisId: string, domains: readonly string[]): WorkerEvidence[] {
-  const sources = domains.length >= 2 ? domains.slice(0, 2) : ["scripted-siem", "scripted-edr"];
+function scriptedEvidence(spec: HuntSpec, hypothesisId: string): WorkerEvidence[] {
+  const seed = (spec.scope["entity"] as Entity | undefined)?.value ?? "10.0.0.5";
+  const sources = spec.data_domains.length >= 2 ? spec.data_domains.slice(0, 2) : ["scripted-siem", "scripted-edr"];
+
   return sources.map((source) => ({
     source_system: source,
-    summary: `${source}: scripted evidence, no telemetry was queried`,
-    payload: { scripted: true },
+    summary: `${source}: ${seed} reached cdn.example.com and 45.77.53.176, no telemetry was queried`,
+    payload: {
+      rows: [
+        { src_ip: seed, dest_ip: "45.77.53.176", dest_host: "cdn.example.com", process: "powershell.exe", connections: 412 },
+      ],
+    },
     salience: "routine" as const,
     why_notable: "",
     provenance: "worker",
@@ -87,6 +96,27 @@ function scriptedEvidence(hypothesisId: string, domains: readonly string[]): Wor
     instruction_like: false,
     supports: [hypothesisId],
   }));
+}
+
+// Answers every chain the config declares, so --scripted exercises the depth
+// bound, the once-per-entity rule and the value guard without a database.
+function scriptedEnricher(spec: HuntSpec) {
+  const chains = spec.enrichment.chains;
+  if (chains.length === 0) return undefined;
+
+  return async (entity: Entity) =>
+    chains
+      .filter((chain) => chain.on === entity.type)
+      .map((chain) => ({
+        source_system: chain.id,
+        summary: `${chain.id} on ${entity.type}:${entity.value}: scripted, no query was run`,
+        payload: { chain: chain.id, entity: `${entity.type}:${entity.value}`, result: "scripted" },
+        salience: "routine" as const,
+        why_notable: `deterministic ${chain.id} enrichment; no one chose to run it`,
+        provenance: `enrichment:${chain.id}`,
+        attacker_influenceable: true,
+        instruction_like: false,
+      }));
 }
 
 const SCRIPTED_INVESTIGATE = {
@@ -153,9 +183,10 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
     ? new HuntController(
         ledger,
         new ScriptedDecisionProvider(scriptedRun(Number(values.iterations), hypothesisId)),
-        new ScriptedWorkerDispatcher(scriptedEvidence(hypothesisId, spec.data_domains)),
+        new ScriptedWorkerDispatcher(scriptedEvidence(spec, hypothesisId)),
         spec.dispatch,
         spec.digest,
+        scriptedEnricher(spec),
         new ScriptedDisconfirmationCritic(),
         spec.verdicts,
       )
@@ -165,6 +196,7 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
         new LlmWorkerDispatcher(spec, tools),
         spec.dispatch,
         spec.digest,
+        createEnricher(spec, tools),
         criticFor(spec, tools),
         spec.verdicts,
       );
@@ -181,12 +213,10 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
     for (let turn = 0; turn < Number(values.iterations); turn += 1) {
       const result = await controller.advanceIteration();
       const outcome = result.hunt_outcome === null ? "" : ` (${result.hunt_outcome})`;
+      const enriched = result.enriched === 0 ? "" : ` enriched+${result.enriched}`;
       console.log(
-        `  [${result.iteration}] ${result.action.padEnd(12)} evidence+${result.evidence_appended}` +
-          `  $${result.cost_usd.toFixed(4)}  ${result.hunt_status}${outcome}` +
-          // A refused verdict is the interesting half of VALIDATE; without the
-          // note it reads exactly like a turn that did nothing.
-          (result.note ? `\n       ${result.note}` : ""),
+        `  [${result.iteration}] ${result.action.padEnd(12)} evidence+${result.evidence_appended}${enriched}` +
+          `  $${result.cost_usd.toFixed(4)}  ${result.hunt_status}${outcome}`,
       );
       if (result.hunt_status === "terminal") break;
       lease.renew();
@@ -293,7 +323,7 @@ function summarize(ledger: Ledger): void {
     if (hypothesis.resolution_reason) console.log(`                 ${hypothesis.resolution_reason}`);
   }
 
-  const gaps = [...evidence.values()].filter(isGap);
+  const gaps = [...evidence.values()].filter((record) => record.provenance === "tool_failure");
   console.log(`\nevidence (${evidence.size}, ${gaps.length} visibility gap(s))`);
   for (const record of evidence.values()) {
     console.log(`  ${record.evidence_id}  ${record.salience.padEnd(9)} ${record.summary}`);

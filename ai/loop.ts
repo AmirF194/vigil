@@ -1,11 +1,14 @@
 import { join } from "node:path";
-import { buildDigest } from "./digest.js";
+import { buildDigest, focusOf, rankFrontier } from "./digest.js";
+import { buildEntityGraph, entitiesOf, key } from "./entities.js";
 import { drain } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
-import type { DecisionProvider, DisconfirmationCritic, WorkerDispatcher } from "./ports.js";
+import type { DecisionProvider, DisconfirmationCritic, Enricher, WorkerDispatcher } from "./ports.js";
+import { sanitize, sanitizeQuestion } from "./sanitize.js";
 import {
   DEFAULT_DIGEST,
   DEFAULT_DISPATCH,
+  DEFAULT_ENRICHMENT,
   DEFAULT_VERDICTS,
   type DigestPolicy,
   type DispatchPolicy,
@@ -15,7 +18,6 @@ import {
 import {
   CRITIC_SOURCE_SYSTEM,
   evidenceStrength,
-  isGap,
   NULL_CHECK_PROVENANCE,
   UNDECLARED_SOURCE,
   unmetPredicates,
@@ -29,13 +31,16 @@ import {
   type Digest,
   type DispatchRequest,
   type DispatchResult,
+  type Entity,
   type EvidenceRecord,
+  type Expansion,
   type HuntOutcome,
   type Hypothesis,
   type IterationResult,
   type NullCheckEvidence,
   type NullCheckInput,
   type NullCheckResult,
+  type OpenQuestion,
   type WorkerEvidence,
 } from "./types.js";
 
@@ -44,6 +49,13 @@ export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
 // One emission plus two re-asks. Bounded because a Hunt Lead that cannot obey
 // the vocabulary will not learn to on the tenth try, and every ask costs money.
 export const MAX_DECISION_ATTEMPTS = 3;
+
+// EXPAND does not advance the iteration, so only this stops a lead reading forever.
+export const MAX_EXPANSIONS = 3;
+
+// Total characters of raw payload one expansion may add. Rounds are bounded
+// already; without this the context is bounded only by how many ids are named.
+const EXPANSION_BUDGET = 12_000;
 
 export class HuntAlreadyTerminal extends Error {}
 export class InvalidDecision extends Error {}
@@ -75,34 +87,6 @@ function spentBefore(error: unknown): number {
   return typeof cost === "number" ? cost : 0;
 }
 
-// The controller rejects anything outside the closed vocabulary, so the Hunt
-// Lead cannot widen its own action space by emitting a new verb.
-export function validateDecision(decision: Decision, projection: Projection): void {
-  if (!DECISION_ACTIONS.includes(decision.action)) {
-    throw new InvalidDecision(`unknown action ${String(decision.action)}`);
-  }
-  if (!ACTIONS_REQUIRING_CITATION.has(decision.action)) return;
-
-  const citations = decision.evidence_citations ?? [];
-  if (citations.length === 0) {
-    throw new InvalidDecision(`${decision.action} must cite the evidence it rests on`);
-  }
-  const unknown = citations.filter((id) => !projection.evidence.has(id));
-  if (unknown.length > 0) {
-    throw new InvalidDecision(`${decision.action} cites unknown evidence: ${unknown.join(", ")}`);
-  }
-
-  // A verdict is about one claim. Without the target there is nothing to argue
-  // the null against, so this is as much a violation as an uncited citation.
-  if (decision.action === "VALIDATE") {
-    const target = decision.target_hypothesis_id;
-    if (!target) throw new InvalidDecision("VALIDATE must name the target_hypothesis_id it puts up for a verdict");
-    if (!projection.hypotheses.has(target)) {
-      throw new InvalidDecision(`VALIDATE names unknown hypothesis: ${target}`);
-    }
-  }
-}
-
 // Raw payloads, not digest summaries: the critic argues against what was
 // actually collected rather than against the Hunt Lead's compression of it.
 function nullCheckInput(projection: Projection, hypothesis: Hypothesis): NullCheckInput {
@@ -117,6 +101,94 @@ function nullCheckInput(projection: Projection, hypothesis: Hypothesis): NullChe
     narrative: projection.hunt.narrative,
     evidence,
   };
+}
+
+// The controller rejects anything outside the closed vocabulary, so the Hunt
+// Lead cannot widen its own action space by emitting a new verb or a worker
+// the registry never declared.
+export function validateDecision(decision: Decision, projection: Projection): void {
+  if (!DECISION_ACTIONS.includes(decision.action)) {
+    throw new InvalidDecision(`unknown action ${String(decision.action)}`);
+  }
+
+  const workers = projection.hunt.spec.roles.workers;
+  const agentId = decision.worker_agent_id;
+  if (agentId !== undefined && agentId !== null && !(agentId in workers)) {
+    throw new InvalidDecision(`no such worker ${agentId}; the registry declares ${Object.keys(workers).sort().join(", ")}`);
+  }
+
+  const hypothesisId = decision.target_hypothesis_id;
+  if (hypothesisId !== undefined && hypothesisId !== null && !projection.hypotheses.has(hypothesisId)) {
+    throw new InvalidDecision(`no such hypothesis ${hypothesisId}`);
+  }
+
+  // Citations before focus: a decision resting on evidence that does not exist
+  // is wrong about the data, which is worth saying before it is wrong about a verb.
+  if (ACTIONS_REQUIRING_CITATION.has(decision.action)) {
+    const citations = decision.evidence_citations ?? [];
+    if (citations.length === 0) {
+      throw new InvalidDecision(`${decision.action} must cite the evidence it rests on`);
+    }
+    const unknown = citations.filter((id) => !projection.evidence.has(id));
+    if (unknown.length > 0) {
+      throw new InvalidDecision(`${decision.action} cites unknown evidence: ${unknown.join(", ")}`);
+    }
+  }
+  validateFocus(decision, projection);
+  if (decision.action === "ABANDON") validateAbandon(decision, projection);
+
+  // A verdict is about one claim. Without the target there is nothing to argue
+  // the null against, so this is as much a violation as an uncited citation.
+  if (decision.action === "VALIDATE" && !decision.target_hypothesis_id) {
+    throw new InvalidDecision("VALIDATE must name the target_hypothesis_id it puts up for a verdict");
+  }
+}
+
+// Dropping a branch is the one decision an adversary most wants the hunt to make,
+// and the evidence it would rest on is exactly what an adversary can write. So a
+// branch may not be abandoned on attacker-authored grounds alone.
+function validateAbandon(decision: Decision, projection: Projection): void {
+  if (!decision.target_hypothesis_id && !decision.target_entity) {
+    throw new InvalidDecision("ABANDON must name the hypothesis or entity it is dropping");
+  }
+
+  const cited = (decision.evidence_citations ?? [])
+    .map((id) => projection.evidence.get(id))
+    .filter((record): record is EvidenceRecord => record !== undefined);
+
+  if (!cited.some((record) => !record.attacker_influenceable && !record.instruction_like)) {
+    throw new InvalidDecision(
+      "every record ABANDON cites is attacker-influenceable; cite at least one whose content an adversary could not have authored",
+    );
+  }
+}
+
+// DEEPEN keeps the current entity and hypothesis; PIVOT changes at least one.
+// Without the graph the rule is unenforceable, and the two verbs collapse into
+// a preference the lead states and nothing checks.
+function validateFocus(decision: Decision, projection: Projection): void {
+  const graph = buildEntityGraph([...projection.evidence.values()], projection.hunt.scope["entity"] as Entity);
+  const target = decision.target_entity;
+
+  if (target !== undefined && target !== null && graph.node(target) === undefined) {
+    const known = graph.nodes().map((node) => key(node.entity)).sort();
+    throw new InvalidDecision(
+      `no evidence mentions ${target}; the graph knows ${known.slice(0, 8).join(", ") || "nothing yet"}`,
+    );
+  }
+  if (decision.action !== "DEEPEN" && decision.action !== "PIVOT") return;
+
+  const focus = focusOf(projection);
+  const held =
+    (target ?? focus.entity) === focus.entity &&
+    (decision.target_hypothesis_id ?? focus.hypothesis) === focus.hypothesis;
+
+  if (decision.action === "DEEPEN" && !held) {
+    throw new InvalidDecision("DEEPEN must keep the current entity and hypothesis; changing one is a PIVOT");
+  }
+  if (decision.action === "PIVOT" && held) {
+    throw new InvalidDecision("PIVOT must change the entity or the hypothesis; keeping both is a DEEPEN");
+  }
 }
 
 // The violation goes back to the Hunt Lead as a digest note, which is where the
@@ -139,6 +211,7 @@ export function startHunt(spec: HuntSpec, dir: string): Ledger {
     hunt_id: huntId,
     name: spec.name,
     spec,
+    seed: newId("seed", 8),
     status: "active",
     outcome: null,
     iteration: 0,
@@ -183,11 +256,18 @@ export class HuntController {
     private readonly dispatcher?: WorkerDispatcher | undefined,
     private readonly policy: DispatchPolicy = DEFAULT_DISPATCH,
     private readonly digestPolicy: DigestPolicy = DEFAULT_DIGEST,
+    private readonly enricher?: Enricher | undefined,
     // Optional: a hunt with no critic runs to a legible end, it just cannot
     // prove anything, and says so rather than transitioning quietly.
     private readonly critic?: DisconfirmationCritic | undefined,
     private readonly verdicts: Verdicts = DEFAULT_VERDICTS,
   ) {}
+
+  // Read from the journaled spec rather than passed in: the chains a hunt runs
+  // were fixed when it started, and resume must not pick up an edited config.
+  private get enrichment() {
+    return this.ledger.projection.hunt.spec.enrichment ?? DEFAULT_ENRICHMENT;
+  }
 
   async advanceIteration(): Promise<IterationResult> {
     if (this.ledger.projection.hunt.status === "terminal") {
@@ -200,13 +280,13 @@ export class HuntController {
 
     const projection = this.ledger.projection;
     const iteration = projection.hunt.iteration + 1;
-    const digest = buildDigest(projection, iteration, this.digestPolicy.evidence_window);
+    const digest = buildDigest(projection, iteration, this.digestPolicy);
 
     const { presented, result } = await this.decide(digest, projection);
 
     const dispatchResults = await this.runDispatches(iteration, result.decision);
     const nullCheck = await this.runNullCheck(result.decision);
-    return this.write(iteration, presented, result, dispatchResults, nullCheck);
+    return await this.write(iteration, presented, result, dispatchResults, nullCheck);
   }
 
   // A rejection is a correctable mistake, not a lost iteration: the Hunt Lead is
@@ -225,8 +305,10 @@ export class HuntController {
     // cost-per-verdict and lets a hunt overrun max_cost_usd.
     let spent = 0;
     let presented = digest;
+    let attempts = 0;
+    let expansions = 0;
 
-    for (let attempt = 0; attempt < MAX_DECISION_ATTEMPTS; attempt += 1) {
+    while (attempts < MAX_DECISION_ATTEMPTS) {
       const result = await this.provider.decide(presented);
       rejected.push(...(result.rejected_attempts ?? []));
       spent += result.cost_usd;
@@ -235,8 +317,25 @@ export class HuntController {
         validateDecision(result.decision, projection);
       } catch (error) {
         if (!(error instanceof InvalidDecision)) throw error;
+        attempts += 1;
         rejected.push(error.message);
         presented = withRejection(presented, error.message);
+        continue;
+      }
+
+      // EXPAND is a read, not a move: it buys raw payloads and asks again without
+      // advancing the iteration. Cost still accrues, so it is not free, only
+      // free of the iteration budget.
+      if (result.decision.action === "EXPAND") {
+        if (expansions < MAX_EXPANSIONS) {
+          expansions += 1;
+          presented = this.expand(presented, result.decision.evidence_citations ?? []);
+          continue;
+        }
+        attempts += 1;
+        const exhausted = `all ${MAX_EXPANSIONS} expansions are used; decide on what you have`;
+        rejected.push(exhausted);
+        presented = withRejection(presented, exhausted);
         continue;
       }
 
@@ -262,6 +361,29 @@ export class HuntController {
     );
   }
 
+  // Whole records are dropped at the budget rather than one being cut mid-JSON,
+  // and what was dropped is named so the lead can ask for less next time.
+  private expand(digest: Digest, ids: readonly string[]): Digest {
+    const expansions: Expansion[] = [];
+    const dropped: string[] = [];
+    let budget = EXPANSION_BUDGET;
+
+    for (const evidenceId of ids) {
+      const record = this.ledger.projection.evidence.get(evidenceId);
+      if (record === undefined) continue;
+      const payload = JSON.stringify(record.payload, null, 2);
+      if (payload.length > budget) {
+        dropped.push(evidenceId);
+        continue;
+      }
+      budget -= payload.length;
+      expansions.push({ evidence_id: evidenceId, payload });
+    }
+
+    const notes = dropped.length === 0 ? digest.notes : [...digest.notes, `Too large to expand: ${dropped.join(", ")}.`];
+    return { ...digest, expansions: [...digest.expansions, ...expansions], notes };
+  }
+
   // Returns true when a directive ended the hunt. A lead becomes a real lead; a
   // note only reaches the digest, so it steers without mutating anything.
   private applyDirectives(): boolean {
@@ -269,18 +391,7 @@ export class HuntController {
     for (const directive of drain(this.ledger)) {
       if (directive.kind === "abort") abort = true;
       if (directive.kind !== "lead") continue;
-      this.ledger.append({
-        kind: "question",
-        question: {
-          question_id: newId("q", 4),
-          question: directive.text,
-          status: "open",
-          spawning_evidence_id: null,
-          // An operator lead names no hypothesis; whatever it turns up links
-          // through the worker, not through the lead it arrived on.
-          hypothesis_id: null,
-        },
-      });
+      this.raise(directive.text, { spawned_iteration: this.ledger.projection.hunt.iteration + 1 });
     }
     if (abort) this.terminate("aborted");
     return abort;
@@ -295,6 +406,7 @@ export class HuntController {
       decision_id: "",
       cost_usd: 0,
       evidence_appended: 0,
+      enriched: 0,
       hunt_status: hunt.status,
       hunt_outcome: hunt.outcome,
       note: "aborted by operator directive",
@@ -326,20 +438,29 @@ export class HuntController {
   // One worker per open lead, capped. Serial is simply max_workers of 1, so
   // there is no second code path for it.
   private fanOut(decision: Decision): FanOutTarget[] {
+    const held = decision.target_entity ?? focusOf(this.ledger.projection).entity;
+    const scoped = (text: string, entityKey: string | null) =>
+      entityKey === null ? text : `${text} [entity ${entityKey}]`;
+
     const fallback: FanOutTarget[] = [
-      { focus: "", hypothesisId: decision.target_hypothesis_id ?? null, questionId: null },
+      {
+        focus: scoped("", held ?? null).trim(),
+        hypothesisId: decision.target_hypothesis_id ?? null,
+        questionId: null,
+      },
     ];
     if (this.policy.max_workers === 1) return fallback;
 
     const projection = this.ledger.projection;
     const targets: FanOutTarget[] =
       this.policy.fan_out_over === "questions"
-        ? [...projection.questions.values()]
-            .filter((question) => question.status === "open")
+        ? rankFrontier(projection, projection.hunt.iteration + 1)
             .map((question) => ({
-              focus: question.question,
-              // The lead carries its hypothesis, so a fanned-out worker that
-              // fails leaves a gap attributed to what it was serving.
+              // A lead carries the entity it is about, so the worker is told what
+              // to look at rather than inferring it from prose.
+              focus: scoped(question.question, question.entity_key),
+              // The lead carries the hypothesis it was opened for, so a worker
+              // that fails leaves a gap attributed to what it was serving.
               hypothesisId: question.hypothesis_id,
               questionId: question.question_id,
             }))
@@ -354,8 +475,65 @@ export class HuntController {
     return targets.length === 0 ? fallback : targets.slice(0, this.policy.max_workers);
   }
 
+  // One appender for every lead, so the priority features are always populated:
+  // a lead with no provenance is a lead the frontier cannot rank.
+  private raise(question: string, provenance: Partial<Omit<OpenQuestion, "question_id" | "question" | "status">>): void {
+    this.ledger.append({
+      kind: "question",
+      question: {
+        question_id: newId("q", 4),
+        question,
+        status: "open",
+        entity_key: null,
+        spawning_evidence_id: null,
+        spawning_dispatch_id: null,
+        spawned_iteration: 0,
+        hypothesis_id: null,
+        ...provenance,
+      },
+    });
+  }
+
+  // PIVOT is a move of attention, not a query: it puts its new target on the
+  // frontier and lets the next INVESTIGATE pick it up from there.
+  private pivot(iteration: number, decision: Decision): void {
+    const target = decision.target_entity ?? decision.target_hypothesis_id ?? "";
+    this.raise(decision.query_intent || `pursue ${target}: ${decision.rationale}`, {
+      entity_key: decision.target_entity ?? null,
+      spawning_evidence_id: decision.evidence_citations?.[0] ?? null,
+      spawned_iteration: iteration,
+    });
+  }
+
+  // Parked rather than disproven: the hunt stopped looking, which is not the same
+  // as having cleared the branch. validateAbandon has already established that
+  // the grounds are not attacker-authored alone.
+  private abandon(decision: Decision): void {
+    const reason = `abandoned at the Hunt Lead's decision: ${decision.rationale} [${(decision.evidence_citations ?? []).join(", ")}]`;
+    if (decision.target_hypothesis_id) {
+      this.ledger.patch("hypothesis", decision.target_hypothesis_id, { status: "parked", resolution_reason: reason });
+    }
+
+    for (const question of this.ledger.projection.questions.values()) {
+      if (question.status === "open" && question.entity_key !== null && question.entity_key === decision.target_entity) {
+        this.ledger.patch("question", question.question_id, { status: "closed" });
+      }
+    }
+  }
+
+  // DEEPEN dispatches like INVESTIGATE; validateFocus has already established
+  // that it kept the focus, so the only difference is what the worker is told.
   private async runDispatches(iteration: number, decision: Decision): Promise<DispatchResult[]> {
-    if (decision.action !== "INVESTIGATE" || this.dispatcher === undefined) return [];
+    if (decision.action === "PIVOT") {
+      this.pivot(iteration, decision);
+      return [];
+    }
+    if (decision.action === "ABANDON") {
+      this.abandon(decision);
+      return [];
+    }
+    const dispatches = decision.action === "INVESTIGATE" || decision.action === "DEEPEN";
+    if (!dispatches || this.dispatcher === undefined) return [];
     const dispatcher = this.dispatcher;
 
     const targets = this.fanOut(decision);
@@ -452,44 +630,37 @@ export class HuntController {
     if (attempt.result === null) return `${hypothesisId}: ${attempt.blocked}`;
     const nullCheck = attempt.result;
 
-    const evidenceId = newId("ev");
-    this.ledger.append({
-      kind: "evidence",
-      evidence: {
-        evidence_id: evidenceId,
-        dispatch_id: null,
-        iteration,
-        source_system: CRITIC_SOURCE_SYSTEM,
-        summary: `strongest benign explanation: ${nullCheck.strongest_benign_explanation}`,
-        payload: {
-          hypothesis_id: hypothesisId,
-          survives: nullCheck.survives,
-          // What the argument was made against, so a later verdict can tell a
-          // current survival from one that predates half the evidence.
-          argued_evidence_ids: attempt.argued,
-          strongest_benign_explanation: nullCheck.strongest_benign_explanation,
-          rationale: nullCheck.rationale,
-          model_id: nullCheck.model_id,
-          prompt_version: nullCheck.prompt_version,
-          cost_usd: nullCheck.cost_usd,
+    const [record] = this.appendEvidence(
+      [
+        {
+          source_system: CRITIC_SOURCE_SYSTEM,
+          summary: `strongest benign explanation: ${nullCheck.strongest_benign_explanation}`,
+          payload: {
+            hypothesis_id: hypothesisId,
+            survives: nullCheck.survives,
+            // What the argument was made against, so a later verdict can tell a
+            // current survival from one that predates half the evidence.
+            argued_evidence_ids: attempt.argued,
+            strongest_benign_explanation: nullCheck.strongest_benign_explanation,
+            rationale: nullCheck.rationale,
+            model_id: nullCheck.model_id,
+            prompt_version: nullCheck.prompt_version,
+            cost_usd: nullCheck.cost_usd,
+          },
+          salience: "notable",
+          why_notable: nullCheck.rationale,
+          provenance: NULL_CHECK_PROVENANCE,
+          attacker_influenceable: false,
+          instruction_like: false,
+          // A benign explanation that stands is counter-evidence like any other:
+          // it enters the record, reaches the next digest, and is never a verdict.
+          ...(nullCheck.survives ? {} : { weakens: [hypothesisId] }),
         },
-        salience: "notable",
-        why_notable: nullCheck.rationale,
-        provenance: NULL_CHECK_PROVENANCE,
-        attacker_influenceable: false,
-        instruction_like: false,
-        captured_at: new Date().toISOString(),
-      },
-    });
-
-    // A benign explanation that stands is counter-evidence like any other: it
-    // enters the record, reaches the next digest, and is never a verdict itself.
-    if (!nullCheck.survives) {
-      this.ledger.append({
-        kind: "link",
-        link: { evidence_id: evidenceId, hypothesis_id: hypothesisId, relation: "weakens" },
-      });
-    }
+      ],
+      iteration,
+      null,
+    );
+    if (record === undefined) return `${hypothesisId}: the critic's argument could not be recorded`;
 
     const strength = evidenceStrength(this.ledger.projection, hypothesisId);
 
@@ -519,13 +690,28 @@ export class HuntController {
     return `${hypothesisId} proven`;
   }
 
-  private write(
+  // Corroboration is counted over source systems, so a label the hunt never
+  // declared earns no independence credit: it collapses into one bucket rather
+  // than letting two invented names read as two systems agreeing. The worker's
+  // claim stays on the record.
+  private attributeSource(record: WorkerEvidence): Pick<EvidenceRecord, "source_system" | "payload"> {
+    const declared = this.ledger.projection.hunt.spec.data_domains;
+    if (record.provenance !== "worker" || declared.length === 0 || declared.includes(record.source_system)) {
+      return { source_system: record.source_system, payload: record.payload };
+    }
+    return {
+      source_system: UNDECLARED_SOURCE,
+      payload: { ...record.payload, claimed_source_system: record.source_system },
+    };
+  }
+
+  private async write(
     iteration: number,
     digest: Digest,
     result: DecisionResult,
     dispatchResults: readonly DispatchResult[],
     nullCheck: NullCheckAttempt,
-  ): IterationResult {
+  ): Promise<IterationResult> {
     const decisionId = newId("dec");
     this.ledger.append({
       kind: "decision",
@@ -549,10 +735,8 @@ export class HuntController {
       cost_usd: Number((hunt.cost_usd + spent).toFixed(6)),
     });
 
-    const appended = dispatchResults.reduce(
-      (total, dispatchResult) => total + this.persistDispatch(iteration, dispatchResult),
-      0,
-    );
+    const appended = dispatchResults.flatMap((dispatchResult) => this.persistDispatch(iteration, dispatchResult));
+    const enriched = await this.enrich(iteration, appended.flatMap((record) => record.entities));
 
     // Before termination: a verdict reached this iteration must be on the record
     // when the terminal path coerces whatever is still active.
@@ -567,6 +751,7 @@ export class HuntController {
       this.terminate("budget_terminated");
       notes.push("budget exhausted");
     }
+    const note = notes.filter((entry) => entry !== "").join("; ");
 
     const final = this.ledger.projection.hunt;
     return {
@@ -575,40 +760,92 @@ export class HuntController {
       action: result.decision.action,
       decision_id: decisionId,
       cost_usd: spent,
-      evidence_appended: appended,
+      evidence_appended: appended.length,
+      enriched,
       hunt_status: final.status,
       hunt_outcome: final.outcome,
-      note: notes.filter((entry) => entry !== "").join("; "),
+      note,
     };
   }
 
-  // Corroboration is counted over source systems, so a label the hunt never
-  // declared earns no independence credit: it collapses into one bucket rather
-  // than letting two invented names read as two systems agreeing. The worker's
-  // claim stays on the record.
-  private attributeSource(record: WorkerEvidence): Pick<EvidenceRecord, "source_system" | "payload"> {
-    const declared = this.ledger.projection.hunt.spec.data_domains;
-    if (record.provenance !== "worker" || declared.length === 0 || declared.includes(record.source_system)) {
-      return { source_system: record.source_system, payload: record.payload };
+  // A link to a hypothesis the worker invented would corrupt the contrarian
+  // quota, so only ids the ledger already knows are linked.
+  private link(evidenceId: string, supports?: string[], weakens?: string[]): void {
+    const known = this.ledger.projection.hypotheses;
+    for (const [relation, ids] of [["supports", supports], ["weakens", weakens]] as const) {
+      for (const hypothesisId of ids ?? []) {
+        if (!known.has(hypothesisId)) continue;
+        this.ledger.append({ kind: "link", link: { evidence_id: evidenceId, hypothesis_id: hypothesisId, relation } });
+      }
     }
-    return {
-      source_system: UNDECLARED_SOURCE,
-      payload: { ...record.payload, claimed_source_system: record.source_system },
-    };
   }
 
-  private persistDispatch(iteration: number, result: DispatchResult): number {
+  // Shared by workers and by enrichment, so no evidence source can reach the
+  // ledger without sanitize() and entity extraction.
+  private appendEvidence(
+    records: readonly WorkerEvidence[],
+    iteration: number,
+    dispatchId: string | null,
+  ): EvidenceRecord[] {
+    return records.map(sanitize).map(({ supports, weakens, ...record }) => {
+      const evidenceId = newId("ev");
+      const stored: EvidenceRecord = {
+        ...record,
+        ...this.attributeSource(record),
+        evidence_id: evidenceId,
+        dispatch_id: dispatchId,
+        iteration,
+        entities: entitiesOf(record),
+        captured_at: new Date().toISOString(),
+      };
+      this.ledger.append({ kind: "evidence", evidence: stored });
+      this.link(evidenceId, supports, weakens);
+      return stored;
+    });
+  }
+
+  // Read-only follow-up on the entities this iteration introduced. Deterministic,
+  // so it costs no decision — only rounds, breadth and the once-per-entity rule
+  // bound it. Dedup is on the entity alone because the enricher runs every chain
+  // that applies to one, so an enriched entity has had all of its chains run.
+  private async enrich(iteration: number, seed: readonly Entity[]): Promise<number> {
+    const enricher = this.enricher;
+    if (enricher === undefined) return 0;
+    const { max_depth, max_entities } = this.enrichment;
+
+    let frontier = seed;
+    let total = 0;
+
+    for (let depth = 0; depth < max_depth && frontier.length > 0; depth += 1) {
+      const done = this.enrichedEntities();
+      const fresh = new Map(frontier.map((entity) => [key(entity), entity] as const));
+      const pending = [...fresh].filter(([id]) => !done.has(id)).slice(0, max_entities);
+      if (pending.length === 0) break;
+
+      const records = (await Promise.all(pending.map(([, entity]) => enricher(entity)))).flat();
+      const appended = this.appendEvidence(records, iteration, null);
+      total += appended.length;
+      frontier = appended.flatMap((record) => record.entities);
+    }
+    return total;
+  }
+
+  private enrichedEntities(): Set<string> {
+    const done = new Set<string>();
+    for (const record of this.ledger.projection.evidence.values()) {
+      if (record.provenance.startsWith("enrichment:")) done.add(String(record.payload["entity"] ?? ""));
+    }
+    return done;
+  }
+
+  private persistDispatch(iteration: number, result: DispatchResult): EvidenceRecord[] {
     // Idempotency on dispatch_id: a retried dispatch re-delivers the same
-    // evidence, and appending it twice would inflate corroboration counts. A gap
-    // record does not count as delivery, or a retry of a dispatch that failed
-    // could never bring anything back.
-    const already = [...this.ledger.projection.evidence.values()].some(
-      (record) => record.dispatch_id === result.dispatch_id && !isGap(record),
-    );
-    if (already) {
-      this.ledger.patch("dispatch", result.dispatch_id, { status: "complete" });
-      return 0;
-    }
+    // evidence, and appending it twice would inflate corroboration counts. Keyed
+    // on the dispatch row rather than a scan for its evidence, so a dispatch that
+    // legitimately found nothing is still settled exactly once. A row that failed
+    // is not settled — a retry of it must still be able to bring something back.
+    const settled = this.ledger.projection.dispatches.get(result.dispatch_id)?.status;
+    if (settled === undefined || settled === "complete") return [];
 
     // A failed worker is evidence about visibility, not a lost turn.
     const records = result.failed
@@ -626,47 +863,15 @@ export class HuntController {
         ]
       : result.evidence;
 
-    const known = this.ledger.projection.hypotheses;
-    const dispatch = this.ledger.projection.dispatches.get(result.dispatch_id);
-    for (const { supports, weakens, ...record } of records) {
-      const evidenceId = newId("ev");
-      this.ledger.append({
-        kind: "evidence",
-        evidence: {
-          ...record,
-          ...this.attributeSource(record),
-          evidence_id: evidenceId,
-          dispatch_id: result.dispatch_id,
-          iteration,
-          captured_at: new Date().toISOString(),
-        },
-      });
-
-      // A link to a hypothesis the worker invented would corrupt the contrarian
-      // quota, so only ids the ledger already knows are linked.
-      for (const [relation, ids] of [["supports", supports], ["weakens", weakens]] as const) {
-        for (const hypothesisId of ids ?? []) {
-          if (!known.has(hypothesisId)) continue;
-          this.ledger.append({
-            kind: "link",
-            link: { evidence_id: evidenceId, hypothesis_id: hypothesisId, relation },
-          });
-        }
-      }
-    }
+    const appended = this.appendEvidence(records, iteration, result.dispatch_id);
 
     for (const question of result.questions ?? []) {
-      this.ledger.append({
-        kind: "question",
-        question: {
-          question_id: newId("q", 4),
-          question,
-          status: "open",
-          spawning_evidence_id: null,
-          // Inherited from the work that opened it, so the lead stays attached to
-          // the hypothesis it serves however far it travels down the frontier.
-          hypothesis_id: dispatch?.target_hypothesis_id ?? null,
-        },
+      this.raise(sanitizeQuestion(question), {
+        spawning_dispatch_id: result.dispatch_id,
+        spawned_iteration: iteration,
+        // Inherited from the work that opened it, so the lead stays attached to
+        // the hypothesis it serves however far it travels down the frontier.
+        hypothesis_id: this.ledger.projection.dispatches.get(result.dispatch_id)?.target_hypothesis_id ?? null,
       });
     }
 
@@ -676,7 +881,9 @@ export class HuntController {
       cost_usd: result.cost_usd,
       calls: result.calls ?? [],
     });
-    return records.length;
+    // A gap record is a fact about visibility, not a finding, so it counts as
+    // neither evidence appended nor something worth enriching.
+    return result.failed ? [] : appended;
   }
 
   // Unresolved hypotheses become inconclusive, never disproven: the hunt
