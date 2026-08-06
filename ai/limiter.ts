@@ -41,7 +41,7 @@ class Bucket {
   }
 }
 
-function statusOf(error: unknown): number | undefined {
+export function statusOf(error: unknown): number | undefined {
   const status = (error as { status?: unknown }).status;
   return typeof status === "number" ? status : undefined;
 }

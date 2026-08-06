@@ -7,7 +7,8 @@ import { Ledger, newId } from "../ai/ledger.js";
 import { HuntController, InvalidDecision, startHunt, validateDecision } from "../ai/loop.js";
 import { ScriptedDecisionProvider, ScriptedWorkerDispatcher } from "../ai/scripted.js";
 import { buildSpec, parseSpec, SpecError } from "../ai/spec.js";
-import type { Decision } from "../ai/types.js";
+import type { WorkerDispatcher } from "../ai/ports.js";
+import type { Decision, DispatchRequest, DispatchResult } from "../ai/types.js";
 
 let dir: string;
 beforeEach(() => {
@@ -113,6 +114,111 @@ describe("controller", () => {
     expect(() =>
       validateDecision({ action: "ABANDON", rationale: "no", evidence_citations: ["ev-nope"] }, ledger.projection),
     ).toThrow(/unknown evidence/);
+  });
+});
+
+describe("fan-out", () => {
+  // Resolves in reverse order of dispatch, so completion order and request
+  // order genuinely disagree.
+  class OutOfOrderDispatcher implements WorkerDispatcher {
+    private seen = 0;
+    async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+      const delay = (3 - this.seen++) * 20;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return {
+        dispatch_id: request.dispatch_id,
+        evidence: [
+          {
+            source_system: "duckdb",
+            summary: `answered: ${request.focus}`,
+            payload: {},
+            salience: "routine",
+            why_notable: "",
+            provenance: "worker",
+            attacker_influenceable: false,
+            instruction_like: false,
+          },
+        ],
+        failed: false,
+        failure_reason: "",
+      };
+    }
+  }
+
+  function withQuestions(questions: string[]): Ledger {
+    const ledger = ledgerFor();
+    for (const question of questions) {
+      ledger.append({
+        kind: "question",
+        question: { question_id: newId("q", 4), question, status: "open", spawning_evidence_id: null },
+      });
+    }
+    return ledger;
+  }
+
+  const QUESTIONS = ["check 10.0.0.1", "check 10.0.0.2", "check 10.0.0.3"];
+
+  it("dispatches one worker per open lead, capped at max_workers", async () => {
+    const ledger = withQuestions(QUESTIONS);
+    const result = await new HuntController(
+      ledger,
+      new ScriptedDecisionProvider([INVESTIGATE]),
+      new OutOfOrderDispatcher(),
+      { mode: "parallel", fan_out_over: "questions", max_workers: 2 },
+    ).advanceIteration();
+
+    expect(result.evidence_appended).toBe(2);
+    expect(ledger.projection.dispatches.size).toBe(2);
+  });
+
+  it("merges results in request order however they complete", async () => {
+    const summaries = async () => {
+      const ledger = withQuestions(QUESTIONS);
+      await new HuntController(ledger, new ScriptedDecisionProvider([INVESTIGATE]), new OutOfOrderDispatcher(), {
+        mode: "parallel",
+        fan_out_over: "questions",
+        max_workers: 3,
+      }).advanceIteration();
+      return [...ledger.projection.evidence.values()].map((record) => record.summary);
+    };
+
+    const expected = QUESTIONS.map((question) => `answered: ${question}`);
+    expect(await summaries()).toEqual(expected);
+    expect(await summaries()).toEqual(expected);
+  });
+
+  it("closes a lead once taken so it is not re-issued next iteration", async () => {
+    const ledger = withQuestions(QUESTIONS);
+    const controller = new HuntController(
+      ledger,
+      new ScriptedDecisionProvider([INVESTIGATE, INVESTIGATE]),
+      new OutOfOrderDispatcher(),
+      { mode: "parallel", fan_out_over: "questions", max_workers: 2 },
+    );
+
+    await controller.advanceIteration();
+    expect([...ledger.projection.questions.values()].filter((q) => q.status === "open")).toHaveLength(1);
+
+    await controller.advanceIteration();
+    expect([...ledger.projection.questions.values()].filter((q) => q.status === "open")).toHaveLength(0);
+    // Three leads, three dispatches — none re-issued.
+    expect(ledger.projection.dispatches.size).toBe(3);
+  });
+
+  it("falls back to a single worker when nothing is open to fan out over", async () => {
+    const ledger = ledgerFor();
+    const result = await new HuntController(
+      ledger,
+      new ScriptedDecisionProvider([INVESTIGATE]),
+      new OutOfOrderDispatcher(),
+      { mode: "parallel", fan_out_over: "questions", max_workers: 4 },
+    ).advanceIteration();
+    expect(result.evidence_appended).toBe(1);
+  });
+
+  it("rejects a nonsense dispatch policy at spec load", () => {
+    expect(() => parseSpec("runtime:\n  dispatch:\n    mode: swarm\n")).toThrow(/serial or parallel/);
+    expect(() => parseSpec("runtime:\n  dispatch:\n    max_workers: 0\n")).toThrow(/positive integer/);
   });
 });
 

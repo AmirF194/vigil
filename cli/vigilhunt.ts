@@ -91,8 +91,13 @@ async function main(): Promise<number> {
 
   const tools = values.scripted ? [] : await buildTools(spec, ledger);
   const controller = values.scripted
-    ? new HuntController(ledger, new ScriptedDecisionProvider([]), new ScriptedWorkerDispatcher())
-    : new HuntController(ledger, new LlmDecisionProvider(spec, tools), new LlmWorkerDispatcher(spec, tools));
+    ? new HuntController(ledger, new ScriptedDecisionProvider([]), new ScriptedWorkerDispatcher(), spec.runtime.dispatch)
+    : new HuntController(
+        ledger,
+        new LlmDecisionProvider(spec, tools),
+        new LlmWorkerDispatcher(spec, tools),
+        spec.runtime.dispatch,
+      );
 
   try {
     for (let turn = 0; turn < Number(values.iterations); turn += 1) {

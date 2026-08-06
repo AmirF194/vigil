@@ -1,7 +1,7 @@
 import { Ajv, type ValidateFunction } from "ajv";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { estimateTokens, Limiter } from "./limiter.js";
+import { estimateTokens, Limiter, statusOf } from "./limiter.js";
 import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
 import type { HuntSpec, RoleSpec } from "./spec.js";
 import { toOpenAITools, type Tool } from "./tools.js";
@@ -83,6 +83,7 @@ export function renderDigest(digest: Digest): string {
 
 export function renderDispatch(request: DispatchRequest, narrative: string): string {
   const lines = [`# Query intent`, request.query_intent];
+  if (request.focus) lines.push("", "## Your focus", request.focus);
   if (request.target_hypothesis_id !== null) {
     lines.push("", `This bears on hypothesis ${request.target_hypothesis_id}.`);
   }
@@ -164,13 +165,10 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
   const validate = compile(schema);
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const response = await call({
-      model,
-      messages: [...messages, { role: "user", content: "Emit your decision now as JSON matching the schema." }],
-      response_format: { type: "json_schema", json_schema: { name: "decision", strict: false, schema } },
-    });
-
-    const content = response.choices[0]?.message?.content ?? "";
+    const content = await emitJson(call, model, [
+      ...messages,
+      { role: "user", content: "Emit your decision now as JSON matching the schema." },
+    ], schema);
     const parsed = tryParse(content);
     if (parsed !== undefined && validate(parsed)) {
       return { value: parsed as T, model, cost_usd: cost, rejected };
@@ -182,6 +180,49 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
   }
 
   throw new LlmError(`model never emitted a valid decision: ${rejected.join(" | ")}`);
+}
+
+export const EMIT_TOOL = "emit_decision";
+
+// Not every provider Bifrost fronts honours response_format. A tool whose
+// parameters are the schema works everywhere, so a 400 downgrades to it once
+// and the process remembers rather than probing on every call.
+let emitMode: "schema" | "tool" = "schema";
+
+export function resetEmitMode(): void {
+  emitMode = "schema";
+}
+
+type Call = (body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming) => Promise<OpenAI.Chat.ChatCompletion>;
+
+async function emitJson(
+  call: Call,
+  model: string,
+  messages: ChatCompletionMessageParam[],
+  schema: Record<string, unknown>,
+): Promise<string> {
+  if (emitMode === "schema") {
+    try {
+      const response = await call({
+        model,
+        messages,
+        response_format: { type: "json_schema", json_schema: { name: "decision", strict: false, schema } },
+      });
+      return response.choices[0]?.message?.content ?? "";
+    } catch (error) {
+      if (statusOf(error) !== 400) throw error;
+      emitMode = "tool";
+    }
+  }
+
+  const response = await call({
+    model,
+    messages,
+    tools: [{ type: "function", function: { name: EMIT_TOOL, description: "Emit the decision.", parameters: schema } }],
+    tool_choice: { type: "function", function: { name: EMIT_TOOL } },
+  });
+  const toolCall = response.choices[0]?.message?.tool_calls?.[0];
+  return toolCall?.type === "function" ? toolCall.function.arguments : "";
 }
 
 async function runTool(tool: Tool | undefined, rawArgs: string): Promise<string> {

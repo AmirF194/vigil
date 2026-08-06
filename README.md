@@ -59,6 +59,26 @@ The DuckDB tool is read-only, rejects anything that is not a single `SELECT`/
 `WITH`, caps rows and wall time, and caches identical queries so parallel
 workers chasing adjacent leads do not re-run them.
 
+## Topology
+
+Serial and swarm are the same loop with a different `runtime.dispatch`:
+
+```yaml
+dispatch:
+  mode: parallel          # serial is max_workers: 1
+  fan_out_over: questions # or hypotheses
+  max_workers: 4
+```
+
+On INVESTIGATE the controller opens one worker per open lead, capped, and merges
+results in request order however they complete — so two runs over the same
+inputs produce the same ledger. A lead is closed when it is taken, not when it
+is answered, so nothing is re-issued next turn. Failures become visibility-gap
+records and the hunt continues.
+
+The "hypothesis/ledger method" is not a mode: it is the record vocabulary and
+the digest rules, and both are already data.
+
 ## Layout
 
 | path | what |

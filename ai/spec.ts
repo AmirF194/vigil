@@ -15,10 +15,19 @@ export interface RateLimit {
   tpm: number;
 }
 
+// Serial is parallel with one worker. The "hypothesis/ledger method" is not a
+// mode at all — it is the record vocabulary and the digest rules, both already data.
+export interface DispatchPolicy {
+  mode: "serial" | "parallel";
+  fan_out_over: "questions" | "hypotheses";
+  max_workers: number;
+}
+
 export interface Runtime {
   concurrency: number;
   rate_limit: RateLimit;
   retry_attempts: number;
+  dispatch: DispatchPolicy;
 }
 
 export interface ToolSpec {
@@ -69,6 +78,7 @@ export const DEFAULT_RUNTIME: Runtime = {
   concurrency: 4,
   rate_limit: { rpm: 60, tpm: 200_000 },
   retry_attempts: 3,
+  dispatch: { mode: "serial", fan_out_over: "questions", max_workers: 1 },
 };
 
 export const DEFAULT_LEAD_PROMPT = `You are the Hunt Lead on a hypothesis-driven threat hunt.
@@ -205,12 +215,29 @@ function parseBudgets(raw: unknown): Budgets {
   return { ...DEFAULT_BUDGETS, ...record } as Budgets;
 }
 
+function parseDispatch(raw: unknown): DispatchPolicy {
+  const record = asRecord(raw, "dispatch");
+  const policy = { ...DEFAULT_RUNTIME.dispatch, ...record } as DispatchPolicy;
+
+  if (policy.mode !== "serial" && policy.mode !== "parallel") {
+    throw new SpecError(`dispatch.mode must be serial or parallel, got ${String(policy.mode)}`);
+  }
+  if (policy.fan_out_over !== "questions" && policy.fan_out_over !== "hypotheses") {
+    throw new SpecError(`dispatch.fan_out_over must be questions or hypotheses, got ${String(policy.fan_out_over)}`);
+  }
+  if (!Number.isInteger(policy.max_workers) || policy.max_workers < 1) {
+    throw new SpecError(`dispatch.max_workers must be a positive integer, got ${String(policy.max_workers)}`);
+  }
+  return policy.mode === "serial" ? { ...policy, max_workers: 1 } : policy;
+}
+
 function parseRuntime(raw: unknown): Runtime {
   const record = asRecord(raw, "runtime");
   return {
     ...DEFAULT_RUNTIME,
     ...record,
     rate_limit: { ...DEFAULT_RUNTIME.rate_limit, ...asRecord(record["rate_limit"], "rate_limit") },
+    dispatch: parseDispatch(record["dispatch"]),
   } as Runtime;
 }
 

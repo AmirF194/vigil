@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { buildDigest } from "./digest.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
 import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
-import type { HuntSpec } from "./spec.js";
+import { DEFAULT_RUNTIME, type DispatchPolicy, type HuntSpec } from "./spec.js";
 import {
   ACTIONS_REQUIRING_CITATION,
   DECISION_ACTIONS,
@@ -20,6 +20,12 @@ export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
 
 export class HuntAlreadyTerminal extends Error {}
 export class InvalidDecision extends Error {}
+
+interface FanOutTarget {
+  focus: string;
+  hypothesisId: string | null;
+  questionId: string | null;
+}
 
 // The controller rejects anything outside the closed vocabulary, so the Hunt
 // Lead cannot widen its own action space by emitting a new verb.
@@ -77,6 +83,7 @@ export class HuntController {
     private readonly ledger: Ledger,
     private readonly provider: DecisionProvider,
     private readonly dispatcher?: WorkerDispatcher | undefined,
+    private readonly policy: DispatchPolicy = DEFAULT_RUNTIME.dispatch,
     private readonly dispatchIdFactory: () => string = () => newId("dsp"),
   ) {}
 
@@ -92,57 +99,100 @@ export class HuntController {
     const result = await this.provider.decide(digest);
     validateDecision(result.decision, projection);
 
-    const dispatchResult = await this.runDispatch(iteration, result.decision);
-    return this.write(iteration, digest, result, dispatchResult);
+    const dispatchResults = await this.runDispatches(iteration, result.decision);
+    return this.write(iteration, digest, result, dispatchResults);
   }
 
-  private async runDispatch(
-    iteration: number,
-    decision: Decision,
-  ): Promise<DispatchResult | null> {
-    if (decision.action !== "INVESTIGATE" || this.dispatcher === undefined) return null;
+  // One worker per open lead, capped. Serial is simply max_workers of 1, so
+  // there is no second code path for it.
+  private fanOut(decision: Decision): FanOutTarget[] {
+    const fallback: FanOutTarget[] = [
+      { focus: "", hypothesisId: decision.target_hypothesis_id ?? null, questionId: null },
+    ];
+    if (this.policy.max_workers === 1) return fallback;
 
-    const request: DispatchRequest = {
+    const projection = this.ledger.projection;
+    const targets: FanOutTarget[] =
+      this.policy.fan_out_over === "questions"
+        ? [...projection.questions.values()]
+            .filter((question) => question.status === "open")
+            .map((question) => ({
+              focus: question.question,
+              hypothesisId: null,
+              questionId: question.question_id,
+            }))
+        : [...projection.hypotheses.values()]
+            .filter((hypothesis) => hypothesis.status === "active")
+            .map((hypothesis) => ({
+              focus: hypothesis.statement,
+              hypothesisId: hypothesis.hypothesis_id,
+              questionId: null,
+            }));
+
+    return targets.length === 0 ? fallback : targets.slice(0, this.policy.max_workers);
+  }
+
+  private async runDispatches(iteration: number, decision: Decision): Promise<DispatchResult[]> {
+    if (decision.action !== "INVESTIGATE" || this.dispatcher === undefined) return [];
+    const dispatcher = this.dispatcher;
+
+    const targets = this.fanOut(decision);
+    const requests = targets.map(({ focus, hypothesisId }) => ({
       dispatch_id: this.dispatchIdFactory(),
       hunt_id: this.ledger.projection.hunt.hunt_id,
       agent_id: decision.worker_agent_id ?? DEFAULT_WORKER_AGENT_ID,
       query_intent: decision.query_intent || decision.rationale,
-      target_hypothesis_id: decision.target_hypothesis_id ?? null,
+      focus,
+      target_hypothesis_id: hypothesisId,
       scope: this.ledger.projection.hunt.scope,
-    };
+    })) satisfies DispatchRequest[];
 
-    // Written before the worker runs, so a crash mid-dispatch leaves a pending
-    // row rather than no trace at all.
-    this.ledger.append({
-      kind: "dispatch",
-      dispatch: {
-        dispatch_id: request.dispatch_id,
-        iteration,
-        agent_id: request.agent_id,
-        status: "pending",
-        query_intent: request.query_intent,
-        target_hypothesis_id: request.target_hypothesis_id,
-        failure_reason: null,
-      },
-    });
-
-    try {
-      return await this.dispatcher.dispatch(request);
-    } catch (error) {
-      return {
-        dispatch_id: request.dispatch_id,
-        evidence: [],
-        failed: true,
-        failure_reason: (error as Error).message,
-      };
+    // Closed once taken, not once answered: a lead left open would be re-issued
+    // every iteration, and a failed one is already recorded as a visibility gap.
+    for (const { questionId } of targets) {
+      if (questionId !== null) this.ledger.patch("question", questionId, { status: "closed" });
     }
+
+    // Written before the workers run, so a crash mid-dispatch leaves pending
+    // rows rather than no trace at all.
+    for (const request of requests) {
+      this.ledger.append({
+        kind: "dispatch",
+        dispatch: {
+          dispatch_id: request.dispatch_id,
+          iteration,
+          agent_id: request.agent_id,
+          status: "pending",
+          query_intent: request.focus ? `${request.query_intent} — ${request.focus}` : request.query_intent,
+          target_hypothesis_id: request.target_hypothesis_id,
+          failure_reason: null,
+        },
+      });
+    }
+
+    // Promise.all resolves in request order regardless of completion order, so
+    // two runs over the same inputs produce the same ledger.
+    return Promise.all(
+      requests.map(async (request) => {
+        try {
+          return await dispatcher.dispatch(request);
+        } catch (error) {
+          return {
+            dispatch_id: request.dispatch_id,
+            evidence: [],
+            failed: true,
+            failure_reason: (error as Error).message,
+          };
+        }
+      }),
+    );
   }
 
   private write(
     iteration: number,
     digest: Digest,
     result: DecisionResult,
-    dispatchResult: DispatchResult | null,
+    dispatchResults: readonly DispatchResult[],
   ): IterationResult {
     const decisionId = newId("dec");
     this.ledger.append({
@@ -162,7 +212,10 @@ export class HuntController {
       cost_usd: Number((hunt.cost_usd + result.cost_usd).toFixed(6)),
     });
 
-    const appended = dispatchResult === null ? 0 : this.persistDispatch(iteration, dispatchResult);
+    const appended = dispatchResults.reduce(
+      (total, dispatchResult) => total + this.persistDispatch(iteration, dispatchResult),
+      0,
+    );
 
     let note = "";
     if (result.decision.action === "CONCLUDE") {

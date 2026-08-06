@@ -19,6 +19,11 @@ runtime:
   concurrency: 4
   rate_limit: { rpm: 60, tpm: 200000 }
   retry_attempts: 3
+  # One worker per open lead. Set mode: serial for a single worker per turn.
+  dispatch:
+    mode: parallel
+    fan_out_over: questions
+    max_workers: 4
 
 tools:
   - id: duckdb_query

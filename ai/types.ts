@@ -193,6 +193,8 @@ export interface DispatchRequest {
   hunt_id: string;
   agent_id: string;
   query_intent: string;
+  // The one lead or hypothesis this worker owns when an iteration fans out.
+  focus: string;
   target_hypothesis_id: string | null;
   scope: Record<string, unknown>;
 }
