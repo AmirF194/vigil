@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import List, Optional
 
 from core.hunting.controller import HuntController
-from core.hunting.schema import Decision, DecisionAction, EvidenceRecord, HuntSpec
+from core.hunting.schema import (
+    Decision,
+    DecisionAction,
+    EvidenceRecord,
+    HuntSpec,
+    HuntStatus,
+)
 from core.hunting.scripted import ScriptedDecisionProvider, ScriptedWorkerDispatcher
 from core.hunting.spec_loader import HuntSpecError, build_hunt_spec
 from core.hunting.uow import HuntUnitOfWork
@@ -123,6 +129,7 @@ async def _run_start(args: argparse.Namespace) -> int:
         dispatcher=ScriptedWorkerDispatcher(_load_evidence(args.evidence)),
     )
 
+    result = None
     for _ in range(args.iterations):
         result = await controller.advance_iteration(hunt_id)
         print(
@@ -131,8 +138,16 @@ async def _run_start(args: argparse.Namespace) -> int:
             f"{result.hunt_status.value}"
             + (f" ({result.hunt_outcome.value})" if result.hunt_outcome else "")
         )
-        if result.hunt_status.value == "terminal":
+        if result.hunt_status is HuntStatus.TERMINAL:
             break
+
+    # Running out of --iterations looks identical to finishing unless we say
+    # otherwise, and a hunt left mid-flight reads as a broken one.
+    if result is not None and result.hunt_status is not HuntStatus.TERMINAL:
+        print(
+            "\nstill active — stopped at the --iterations limit, not at a "
+            "verdict.\nstart a hunt with a higher --iterations to reach one."
+        )
 
     return 0
 
