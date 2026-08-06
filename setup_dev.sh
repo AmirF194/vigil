@@ -29,6 +29,12 @@ ensure_venv "$PYTHON"
 install_python_deps
 echo "Python dependencies installed."
 
+# CLI tools on PATH. The repo root is not a pip-installable package, so there
+# is no console_scripts entry point to hang these off; a link into the venv's
+# bin is the same result without packaging the whole tree.
+ln -sf "$REPO_ROOT/scripts/vigilhunt" "$REPO_ROOT/venv/bin/vigilhunt"
+echo "CLI installed: vigilhunt"
+
 # Frontend
 if command -v npm &>/dev/null && [ -d "$REPO_ROOT/frontend" ]; then
     if [ ! -d "$REPO_ROOT/frontend/node_modules" ]; then
