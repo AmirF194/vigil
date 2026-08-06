@@ -72,6 +72,8 @@ export interface Entity {
 export interface HuntState {
   hunt_id: string;
   name: string;
+  // Which architecture produced these decisions; the digest and vocabulary depend on it.
+  arch: string;
   status: HuntStatus;
   outcome: HuntOutcome | null;
   iteration: number;
@@ -138,7 +140,6 @@ export interface Decision {
   stated_confidence?: number | null;
   evidence_citations?: string[];
   target_hypothesis_id?: string | null;
-  target_question?: string | null;
   worker_agent_id?: string | null;
   query_intent?: string;
 }

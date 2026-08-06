@@ -12,8 +12,10 @@ const USAGE = `vigilhunt --prompt <prompt> --id <entity> --workflow <spec.yaml>
 
   --prompt    the question to hunt; may be used alone
   --id        seed entity (10.0.0.1, host:web-01); never alone
-  --workflow  hunt spec with roles, tools and budgets; never alone
+  --workflow  playbook: hypotheses, ATT&CK mapping, directives; never alone
 
+  --arch PATH      loop architecture (default arch/threathunt.yaml)
+  --config PATH    model, budgets and tools (default vigil.config.yaml)
   --iterations N   turns to run (default 1)
   --scripted       run without an LLM, for wiring checks
   --yes            skip the hypothesis approval prompt`;
@@ -40,6 +42,7 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
   const entity = spec.scope["entity"] as Entity | undefined;
   if (entity !== undefined) console.log(`  target: ${entity.type} ${entity.value}`);
   console.log(`  budgets: ${spec.budgets.max_iterations} iterations, $${spec.budgets.max_cost_usd.toFixed(2)}`);
+  console.log(`  arch: ${spec.arch} (${spec.dispatch.mode}, up to ${spec.dispatch.max_workers} worker(s))`);
   console.log(`  model: ${spec.model}`);
 
   if (assumeYes || !process.stdin.isTTY) return true;
@@ -55,6 +58,8 @@ async function main(): Promise<number> {
       prompt: { type: "string" },
       id: { type: "string" },
       workflow: { type: "string" },
+      arch: { type: "string" },
+      config: { type: "string" },
       iterations: { type: "string", default: "1" },
       scripted: { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
@@ -75,7 +80,13 @@ async function main(): Promise<number> {
 
   let spec: HuntSpec;
   try {
-    spec = buildSpec({ specPath: values.workflow, prompt: values.prompt, entity: values.id });
+    spec = buildSpec({
+      archPath: values.arch,
+      workflowPath: values.workflow,
+      configPath: values.config,
+      prompt: values.prompt,
+      entity: values.id,
+    });
   } catch (error) {
     console.error(`error: ${error instanceof SpecError ? error.message : String(error)}`);
     return 2;
@@ -91,12 +102,19 @@ async function main(): Promise<number> {
 
   const tools = values.scripted ? [] : await buildTools(spec, ledger);
   const controller = values.scripted
-    ? new HuntController(ledger, new ScriptedDecisionProvider([]), new ScriptedWorkerDispatcher(), spec.runtime.dispatch)
+    ? new HuntController(
+        ledger,
+        new ScriptedDecisionProvider([]),
+        new ScriptedWorkerDispatcher(),
+        spec.dispatch,
+        spec.digest,
+      )
     : new HuntController(
         ledger,
         new LlmDecisionProvider(spec, tools),
         new LlmWorkerDispatcher(spec, tools),
-        spec.runtime.dispatch,
+        spec.dispatch,
+        spec.digest,
       );
 
   try {

@@ -48,6 +48,7 @@ describe("llm_output", () => {
       messages: [{ role: "user", content: "go" }],
       schema: SCHEMA,
       limiter: limiter(),
+      rates: { input: 1, output: 1 },
     });
 
     expect(result.value.action).toBe("CONCLUDE");
@@ -73,6 +74,7 @@ describe("llm_output", () => {
       messages: [{ role: "user" as const, content: "go" }],
       schema: SCHEMA,
       limiter: limiter(),
+      rates: { input: 1, output: 1 },
     };
     expect((await llm_output<{ action: string }>(options)).value.action).toBe("CONCLUDE");
 
@@ -96,6 +98,7 @@ describe("llm_output", () => {
       messages: [{ role: "user", content: "go" }],
       schema: SCHEMA,
       limiter: limiter(),
+      rates: { input: 1, output: 1 },
     });
 
     expect(result.value.action).toBe("CONCLUDE");
@@ -112,6 +115,7 @@ describe("llm_output", () => {
         messages: [{ role: "user", content: "go" }],
         schema: SCHEMA,
         limiter: limiter(),
+        rates: { input: 1, output: 1 },
       }),
     ).rejects.toThrow(LlmError);
   });
@@ -127,6 +131,7 @@ describe("llm_output", () => {
         messages: [{ role: "user", content: "go" }],
         schema: SCHEMA,
         limiter: limiter(),
+        rates: { input: 1, output: 1 },
       }),
     ).rejects.toThrow(/nope/);
   });

@@ -1,0 +1,25 @@
+model: anthropic/claude-opus-5
+
+# USD per million tokens. Wrong here means the cost budget is wrong.
+rates:
+  input: 15.00
+  output: 75.00
+
+budgets:
+  max_iterations: 12
+  max_cost_usd: 5.00
+
+runtime:
+  concurrency: 4
+  rate_limit: { rpm: 60, tpm: 200000 }
+  retry_attempts: 3
+
+tools:
+  - id: duckdb_query
+    kind: duckdb
+    database: ~/Downloads/botsv3_duckdb/botsv3.duckdb
+    max_rows: 200
+    timeout_ms: 30000
+    memory_limit: 2GB
+  - id: expand
+    kind: expand

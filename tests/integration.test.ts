@@ -6,7 +6,7 @@ import type OpenAI from "openai";
 import { Limiter } from "../ai/limiter.js";
 import { LlmDecisionProvider, LlmWorkerDispatcher, resetEmitMode } from "../ai/llm.js";
 import { HuntController, startHunt } from "../ai/loop.js";
-import { loadSpec } from "../ai/spec.js";
+import { buildSpec } from "../ai/spec.js";
 import { buildTools, closeTools, type Tool } from "../ai/tools.js";
 import { Ledger } from "../ai/ledger.js";
 
@@ -86,7 +86,7 @@ describe.skipIf(!existsSync(DATABASE))("hunt end to end (stubbed gateway, real e
   afterAll(async () => closeTools(tools));
 
   it("runs a hunt from spec to verdict and leaves a replayable ledger", async () => {
-    const spec = loadSpec("threat-hunt.yaml");
+    const spec = buildSpec({ workflowPath: "frothly.yaml" });
     const ledger = startHunt(spec, mkdtempSync(join(tmpdir(), "hunt-")));
     const hypothesisId = [...ledger.projection.hypotheses.keys()][0]!;
 
@@ -99,7 +99,8 @@ describe.skipIf(!existsSync(DATABASE))("hunt end to end (stubbed gateway, real e
       ledger,
       new LlmDecisionProvider(spec, tools, limiter, client),
       new LlmWorkerDispatcher(spec, tools, limiter, client),
-      spec.runtime.dispatch,
+      spec.dispatch,
+      spec.digest,
     );
 
     const first = await controller.advanceIteration();

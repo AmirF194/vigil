@@ -6,7 +6,7 @@ import { buildDigest } from "../ai/digest.js";
 import { Ledger, newId } from "../ai/ledger.js";
 import { HuntController, InvalidDecision, startHunt, validateDecision } from "../ai/loop.js";
 import { ScriptedDecisionProvider, ScriptedWorkerDispatcher } from "../ai/scripted.js";
-import { buildSpec, parseSpec, SpecError } from "../ai/spec.js";
+import { buildSpec, loadArch, parsePlaybook, SpecError } from "../ai/spec.js";
 import type { WorkerDispatcher } from "../ai/ports.js";
 import type { Decision, DispatchRequest, DispatchResult } from "../ai/types.js";
 
@@ -216,9 +216,8 @@ describe("fan-out", () => {
     expect(result.evidence_appended).toBe(1);
   });
 
-  it("rejects a nonsense dispatch policy at spec load", () => {
-    expect(() => parseSpec("runtime:\n  dispatch:\n    mode: swarm\n")).toThrow(/serial or parallel/);
-    expect(() => parseSpec("runtime:\n  dispatch:\n    max_workers: 0\n")).toThrow(/positive integer/);
+  it("rejects a nonsense dispatch policy at arch load", () => {
+    expect(() => loadArch("tests/fixtures/bad-dispatch.yaml")).toThrow(/serial or parallel/);
   });
 });
 
@@ -258,14 +257,10 @@ describe("digest", () => {
 });
 
 describe("spec", () => {
-  it("rejects an unknown front-matter key", () => {
-    expect(() => parseSpec("---\nname: x\nbudget: 5\n---\n")).toThrow(/unknown key/);
-  });
-
-  it("layers a prompt onto a spec file rather than replacing it", () => {
-    const spec = parseSpec("---\nname: base\nhypotheses:\n  - one\n---\nnarrative here");
-    expect(spec.hypotheses).toEqual(["one"]);
-    expect(spec.narrative).toBe("narrative here");
+  it("reads a playbook from front matter, keeping the body as narrative", () => {
+    const playbook = parsePlaybook("---\nname: base\nhypotheses:\n  - one\n---\nnarrative here");
+    expect(playbook.hypotheses).toEqual(["one"]);
+    expect(playbook.narrative).toBe("narrative here");
   });
 
   it("refuses a hunt with nothing to test", () => {

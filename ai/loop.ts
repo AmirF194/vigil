@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { buildDigest } from "./digest.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
 import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
-import { DEFAULT_RUNTIME, type DispatchPolicy, type HuntSpec } from "./spec.js";
+import { DEFAULT_DIGEST, DEFAULT_DISPATCH, type DigestPolicy, type DispatchPolicy, type HuntSpec } from "./spec.js";
 import {
   ACTIONS_REQUIRING_CITATION,
   DECISION_ACTIONS,
@@ -51,6 +51,7 @@ export function startHunt(spec: HuntSpec, dir: string): Ledger {
   const ledger = Ledger.create(join(dir, `${huntId}.jsonl`), {
     hunt_id: huntId,
     name: spec.name,
+    arch: spec.arch,
     status: "active",
     outcome: null,
     iteration: 0,
@@ -83,8 +84,8 @@ export class HuntController {
     private readonly ledger: Ledger,
     private readonly provider: DecisionProvider,
     private readonly dispatcher?: WorkerDispatcher | undefined,
-    private readonly policy: DispatchPolicy = DEFAULT_RUNTIME.dispatch,
-    private readonly dispatchIdFactory: () => string = () => newId("dsp"),
+    private readonly policy: DispatchPolicy = DEFAULT_DISPATCH,
+    private readonly digestPolicy: DigestPolicy = DEFAULT_DIGEST,
   ) {}
 
   async advanceIteration(): Promise<IterationResult> {
@@ -94,7 +95,7 @@ export class HuntController {
     }
 
     const iteration = projection.hunt.iteration + 1;
-    const digest = buildDigest(projection, iteration);
+    const digest = buildDigest(projection, iteration, this.digestPolicy.evidence_window);
 
     const result = await this.provider.decide(digest);
     validateDecision(result.decision, projection);
@@ -138,7 +139,7 @@ export class HuntController {
 
     const targets = this.fanOut(decision);
     const requests = targets.map(({ focus, hypothesisId }) => ({
-      dispatch_id: this.dispatchIdFactory(),
+      dispatch_id: newId("dsp"),
       hunt_id: this.ledger.projection.hunt.hunt_id,
       agent_id: decision.worker_agent_id ?? DEFAULT_WORKER_AGENT_ID,
       query_intent: decision.query_intent || decision.rationale,

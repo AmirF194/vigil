@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { estimateTokens, Limiter, statusOf } from "./limiter.js";
 import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
-import type { HuntSpec, RoleSpec } from "./spec.js";
+import type { HuntSpec, Rates, RoleSpec } from "./spec.js";
 import { toOpenAITools, type Tool } from "./tools.js";
 import type {
   Decision,
@@ -30,17 +30,8 @@ export function createClient(): OpenAI {
 
 // USD per million tokens. An unknown model costs a visible zero rather than a
 // silently misattributed number.
-const RATES: Record<string, { input: number; output: number }> = {
-  "gpt-4o": { input: 2.5, output: 10 },
-  "gpt-4o-mini": { input: 0.15, output: 0.6 },
-  "gpt-4-turbo": { input: 10, output: 30 },
-  "gpt-4": { input: 30, output: 60 },
-};
-
-export function costOf(model: string, inputTokens: number, outputTokens: number): number {
-  const rate = RATES[model.replace(/^[^/]+\//, "")];
-  if (rate === undefined) return 0;
-  return (inputTokens * rate.input + outputTokens * rate.output) / 1_000_000;
+export function costOf(rates: Rates, inputTokens: number, outputTokens: number): number {
+  return (inputTokens * rates.input + outputTokens * rates.output) / 1_000_000;
 }
 
 // Evidence is attacker-controlled text. It never reaches the system prompt, and
@@ -124,6 +115,7 @@ interface LlmOptions {
   schema: Record<string, unknown>;
   tools?: readonly Tool[];
   limiter: Limiter;
+  rates: Rates;
 }
 
 // Two stages on purpose: a free-form tool loop, then a separate schema-constrained
@@ -131,7 +123,7 @@ interface LlmOptions {
 // across the providers Bifrost fronts, and a silent schema violation is the worst
 // failure mode available here.
 export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> {
-  const { client, model, schema, limiter } = options;
+  const { client, model, schema, limiter, rates } = options;
   const tools = options.tools ?? [];
   const messages = [...options.messages];
   let cost = 0;
@@ -140,7 +132,7 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
     const estimate = estimateTokens(JSON.stringify(body));
     const response = await limiter.run(estimate, () => client.chat.completions.create(body));
     if (!("choices" in response)) throw new LlmError("streaming responses are not supported");
-    cost += costOf(model, response.usage?.prompt_tokens ?? 0, response.usage?.completion_tokens ?? 0);
+    cost += costOf(rates, response.usage?.prompt_tokens ?? 0, response.usage?.completion_tokens ?? 0);
     return response;
   };
 
@@ -290,6 +282,7 @@ export class LlmDecisionProvider implements DecisionProvider {
       schema: output_schema(this.role),
       tools: this.tools,
       limiter: this.limiter,
+      rates: this.spec.rates,
     });
 
     return {
@@ -336,6 +329,7 @@ export class LlmWorkerDispatcher implements WorkerDispatcher {
       schema: output_schema(this.role),
       tools: this.tools,
       limiter: this.limiter,
+      rates: this.spec.rates,
     });
 
     return {

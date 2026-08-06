@@ -1,37 +1,77 @@
 import { describe, expect, it } from "vitest";
-import { loadSpec, parseSpec } from "../ai/spec.js";
+import { buildSpec, DEFAULT_ARCH, loadArch, parseArch, parsePlaybook } from "../ai/spec.js";
 import { assertReadOnly, UnsafeQuery } from "../tools/duckdb.js";
 import { renderDigest } from "../ai/llm.js";
-import type { Digest } from "../ai/types.js";
+import { DECISION_ACTIONS, type Digest } from "../ai/types.js";
 
-describe("threat-hunt.yaml", () => {
-  const spec = loadSpec("threat-hunt.yaml");
+// A minimal but valid arch, so a test can vary one thing at a time.
+function arch(roles: string): string {
+  return `name: t\nroles:\n${roles}`;
+}
+const LEAD = `  lead:\n    prompt: decide\n    output_schema:\n      properties:\n        action: { enum: [INVESTIGATE, CONCLUDE] }\n`;
+const WORKER = `  worker:\n    prompt: query\n    output_schema: { type: object }\n`;
 
-  it("is self-contained: prompts, schemas, tools and budgets all inline", () => {
+describe("the three layers", () => {
+  const spec = buildSpec({ workflowPath: "frothly.yaml" });
+
+  it("merges arch, playbook and config into one spec", () => {
+    expect(spec.arch).toBe("threathunt");
     expect(spec.hypotheses).toHaveLength(2);
-    expect(spec.model).toBe("openai/gpt-4o");
     expect(spec.tools.map((tool) => tool.id)).toEqual(["duckdb_query", "expand"]);
     expect(spec.roles.lead.prompt).toContain("Hunt Lead");
-    expect(spec.roles.worker.prompt).toContain("read-only SQL");
     expect(spec.narrative).toContain("Frothly");
   });
 
-  it("keeps the query tool off the lead and the decision vocabulary off the worker", () => {
+  it("appends playbook directives to the arch prompt rather than replacing it", () => {
+    const base = loadArch(DEFAULT_ARCH);
+    expect(base.roles.worker.prompt).not.toContain("froth.ly");
+    expect(spec.roles.worker.prompt.startsWith(base.roles.worker.prompt)).toBe(true);
+    expect(spec.roles.worker.prompt).toContain("froth.ly");
+    // Worker guidance stays off the lead.
+    expect(spec.roles.lead.prompt).not.toContain("froth.ly");
+  });
+
+  it("keeps the query tool off the lead", () => {
     expect(spec.roles.lead.tools).toEqual(["expand"]);
     expect(spec.roles.worker.tools).toEqual(["duckdb_query"]);
-
-    const lead = spec.roles.lead.output_schema as { properties: Record<string, { enum?: string[] }> };
-    expect(lead["properties"]["action"]!.enum).toContain("CONCLUDE");
-    const worker = spec.roles.worker.output_schema as { properties: Record<string, unknown> };
-    expect(Object.keys(worker["properties"])).toEqual(["results", "ips_to_check"]);
   });
 
-  it("rejects a role naming a tool the spec never declared", () => {
-    expect(() => parseSpec("roles:\n  worker:\n    tools: [nope]\n")).toThrow(/undeclared tool/);
+  it("rejects a key that belongs to a different layer", () => {
+    expect(() => parseArch("hypotheses: [one]\n")).toThrow(/do not belong in a arch file/);
+    expect(() => parsePlaybook("model: openai/gpt-4o\n")).toThrow(/do not belong in a playbook file/);
+    expect(() => parsePlaybook("roles:\n  lead: {}\n")).toThrow(/do not belong in a playbook file/);
   });
 
-  it("rejects an unknown role", () => {
-    expect(() => parseSpec("roles:\n  auditor: {}\n")).toThrow(/unknown role/);
+  it("rejects an arch role that needs a tool the config never declared", () => {
+    expect(() => buildSpec({ prompt: "q", archPath: "tests/fixtures/bad-tool.yaml" })).toThrow(
+      /config does not declare/,
+    );
+  });
+});
+
+describe("decision vocabulary", () => {
+  it("lets an arch narrow it", () => {
+    const narrowed = parseArch(arch(LEAD + WORKER));
+    const properties = narrowed.roles.lead.output_schema["properties"] as Record<string, { enum: string[] }>;
+    expect(properties["action"]!.enum).toEqual(["INVESTIGATE", "CONCLUDE"]);
+  });
+
+  it("refuses to let an arch widen it", () => {
+    const widened = LEAD.replace("CONCLUDE]", "CONCLUDE, ESCALATE]");
+    expect(() => parseArch(arch(widened + WORKER))).toThrow(/cannot run: ESCALATE/);
+  });
+
+  it("ships an arch that declares exactly what the controller implements", () => {
+    const properties = loadArch(DEFAULT_ARCH).roles.lead.output_schema["properties"] as Record<
+      string,
+      { enum: string[] }
+    >;
+    expect(properties["action"]!.enum).toEqual([...DECISION_ACTIONS]);
+  });
+
+  it("rejects a role with no prompt, and an unknown role", () => {
+    expect(() => parseArch(arch("  lead: {}\n" + WORKER))).toThrow(/roles.lead needs a prompt/);
+    expect(() => parseArch(arch(LEAD + WORKER + "  auditor: {}\n"))).toThrow(/unknown role/);
   });
 });
 
