@@ -172,6 +172,7 @@ class Settings(BaseSettings):
     daemon_pagerduty_enabled: bool = False
     daemon_threat_hunt_enabled: bool = True
     daemon_threat_hunt_interval: int = 86400
+    threatfox_poll_interval: int = 3600
     daemon_cleanup_retention_days: int = 90
     daemon_metrics_enabled: bool = True
     daemon_health_host: str = "localhost"
