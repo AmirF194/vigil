@@ -129,10 +129,38 @@ journaled on the hunt event, so a resumed hunt resurfaces exactly what an
 uninterrupted one would and a replay is exact — fold the events up to any
 decision, rebuild, and you get the digest that decision was made against.
 
-The entity graph itself is a fold over the entities stored on each record. There
-is no second copy to drift, and because extraction is stored at capture rather
-than recomputed, tightening the pattern later cannot rewrite the graph a past
-decision was made against.
+## The entity graph
+
+A fold over the entities stored on each record, behind an `EntityGraph` port that
+answers adjacency and a reverse entity→evidence index. There is no second copy to
+drift, and because extraction happens once at capture rather than on every read,
+tightening a pattern later cannot rewrite the graph a past decision was made
+against.
+
+**Values are typed by the key they arrive under, not by their shape.** DuckDB
+returns `{src_ip, dest_host, process, user}`, and the key already says what the
+value is — which is the only thing that can tell `kernel32.dll` from `froth.ly`.
+Prose in a summary still falls back to patterns, with the suffix checked against
+the real IANA TLD list and defanged indicators (`45.77.53[.]176`, `hxxp://`)
+normalized first, since that is how intel writes them.
+
+Types are closed: `ip`, `domain`, `host`, `url`, `email`, `hash`, `arn`,
+`aws_key`, `user`, `process`. A seed entity from `--id` is parsed into the same
+namespace, so a hunt can pivot onto its own target.
+
+## PIVOT and DEEPEN
+
+The hunt has a **focus** — an entity and a hypothesis — derived from the last
+decision that named one, falling back to the seed. `DEEPEN` must keep both;
+`PIVOT` must change at least one. The controller enforces that, so the two verbs
+cannot collapse into a preference the lead states and nothing checks, and an
+entity no evidence mentions is refused the same way an unknown worker id is.
+
+A PIVOT puts its target on the frontier as an entity-scoped lead, and the worker
+that takes it is told which entity it is about. A DEEPEN dispatches with the focus
+intact. The digest shows the focus and its graph neighbours under
+`Where a pivot could go`, so a PIVOT names something the evidence has seen rather
+than inventing a value.
 
 ## EXPAND
 
@@ -233,7 +261,8 @@ the digest rules, and both are already data.
 | `ai/loop.ts` | the controller: read → decide → dispatch → persist |
 | `ai/ledger.ts` | append-only JSONL and its projection |
 | `ai/digest.ts` | ledger → what the lead sees: salience floor, resurfacing, compression, contrarian quota |
-| `ai/entities.ts` | extraction at capture, and the entity graph as a fold |
+| `ai/entities.ts` | key-aware extraction at capture, and the entity graph behind its port |
+| `ai/tlds.ts` | the vendored IANA TLD set |
 | `ai/llm.ts` | `input()`, `output_schema()`, `llm_output()`, and the two role implementations |
 | `ai/limiter.ts` | RPM/TPM buckets, concurrency gate, jittered backoff |
 | `ai/spec.ts` | the three YAML layers, their merge, and the worker registry |

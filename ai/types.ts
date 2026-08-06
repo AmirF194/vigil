@@ -69,8 +69,25 @@ export interface Budgets {
 
 export const DEFAULT_BUDGETS: Budgets = { max_iterations: 20, max_cost_usd: 25.0 };
 
+// Closed, so a typo in an extraction key pattern cannot invent a type, and a
+// seed entity lands in the same namespace as everything the graph extracts.
+export const ENTITY_TYPES = [
+  "ip",
+  "domain",
+  "host",
+  "url",
+  "email",
+  "hash",
+  "arn",
+  "aws_key",
+  "user",
+  "process",
+] as const;
+
+export type EntityType = (typeof ENTITY_TYPES)[number];
+
 export interface Entity {
-  type: string;
+  type: EntityType;
   value: string;
 }
 
@@ -118,6 +135,8 @@ export interface OpenQuestion {
   question_id: string;
   question: string;
   status: "open" | "closed";
+  // The entity this lead is about, so a worker taking it is told what to look at.
+  entity_key: string | null;
   spawning_evidence_id: string | null;
 }
 
@@ -165,8 +184,17 @@ export interface Decision {
   stated_confidence?: number | null;
   evidence_citations?: string[];
   target_hypothesis_id?: string | null;
+  // An entity key the graph already knows. With target_hypothesis_id it is the
+  // focus, which is what makes DEEPEN and PIVOT distinguishable.
+  target_entity?: string | null;
   worker_agent_id?: string | null;
   query_intent?: string;
+}
+
+// What the hunt is currently looking at. Derived from the decisions, never stored.
+export interface Focus {
+  entity: string | null;
+  hypothesis: string | null;
 }
 
 export interface DecisionResult {
@@ -201,7 +229,7 @@ export interface EvidenceView {
 }
 
 export interface EntityView {
-  type: string;
+  type: EntityType;
   value: string;
   count: number;
   first_evidence_id: string;
@@ -225,6 +253,10 @@ export interface Digest {
   // What the hunt has touched. PIVOT changes the entity, DEEPEN keeps it, so the
   // lead cannot tell the two apart without seeing them.
   entities: EntityView[];
+  focus: Focus;
+  // Entities adjacent to the focus in the graph, so a PIVOT names something the
+  // evidence has actually seen rather than inventing a value.
+  pivot_candidates: EntityView[];
   // Routine records the window dropped. Named rather than discarded, so the lead
   // knows they exist and can EXPAND one.
   omitted: { count: number; evidence_ids: string[] };

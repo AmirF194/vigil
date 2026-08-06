@@ -114,6 +114,8 @@ describe("digest rendering", () => {
       ],
       weakens: { "h-1": [] },
       entities: [],
+      focus: { entity: null, hypothesis: null },
+      pivot_candidates: [],
       omitted: { count: 0, evidence_ids: [] },
       expansions: [],
       open_questions: [],

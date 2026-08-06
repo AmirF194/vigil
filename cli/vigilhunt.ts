@@ -64,18 +64,22 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
   return ["y", "yes"].includes(answer.trim().toLowerCase());
 }
 
-// Carries observables and a payload rather than a bare sentence, so --scripted
-// exercises entity extraction, the graph and EXPAND rather than skipping them.
-const SCRIPTED_EVIDENCE = {
-  source_system: "scripted",
-  summary: "scripted: 10.0.0.5 reached cdn.example.com and 45.77.53.176, no telemetry was queried",
-  payload: { rows: [{ src: "10.0.0.5", dest: "45.77.53.176", connections: 412 }] },
-  salience: "routine" as const,
-  why_notable: "",
-  provenance: "scripted",
-  attacker_influenceable: false,
-  instruction_like: false,
-};
+// Carries observables and a payload rather than a bare sentence, and couples them
+// to the hunt's own seed, so --scripted exercises extraction, the graph, pivot
+// candidates and EXPAND rather than skipping all of them.
+function scriptedEvidence(spec: HuntSpec) {
+  const seed = (spec.scope["entity"] as Entity | undefined)?.value ?? "10.0.0.5";
+  return {
+    source_system: "scripted",
+    summary: `scripted: ${seed} reached cdn.example.com and 45.77.53.176, no telemetry was queried`,
+    payload: { rows: [{ src_ip: seed, dest_ip: "45.77.53.176", dest_host: "cdn.example.com", connections: 412 }] },
+    salience: "routine" as const,
+    why_notable: "",
+    provenance: "scripted",
+    attacker_influenceable: false,
+    instruction_like: false,
+  };
+}
 
 // Investigate for the whole run rather than concluding at once, so --scripted
 // exercises dispatch, steering and resume instead of just the terminal path.
@@ -124,7 +128,7 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
     ? new HuntController(
         ledger,
         new ScriptedDecisionProvider(scriptedRun(Number(values.iterations))),
-        new ScriptedWorkerDispatcher([SCRIPTED_EVIDENCE]),
+        new ScriptedWorkerDispatcher([scriptedEvidence(spec)]),
         spec.dispatch,
         spec.digest,
       )

@@ -1,6 +1,6 @@
 import { join } from "node:path";
-import { buildDigest } from "./digest.js";
-import { entitiesOf } from "./entities.js";
+import { buildDigest, focusOf } from "./digest.js";
+import { buildEntityGraph, entitiesOf, key } from "./entities.js";
 import { drain } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
 import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
@@ -15,6 +15,7 @@ import {
   type Digest,
   type DispatchRequest,
   type DispatchResult,
+  type Entity,
   type Expansion,
   type HuntOutcome,
   type IterationResult,
@@ -56,15 +57,46 @@ export function validateDecision(decision: Decision, projection: Projection): vo
     throw new InvalidDecision(`no such worker ${agentId}; the registry declares ${Object.keys(workers).sort().join(", ")}`);
   }
 
-  if (!ACTIONS_REQUIRING_CITATION.has(decision.action)) return;
-
-  const citations = decision.evidence_citations ?? [];
-  if (citations.length === 0) {
-    throw new InvalidDecision(`${decision.action} must cite the evidence it rests on`);
+  // Citations before focus: a decision resting on evidence that does not exist
+  // is wrong about the data, which is worth saying before it is wrong about a verb.
+  if (ACTIONS_REQUIRING_CITATION.has(decision.action)) {
+    const citations = decision.evidence_citations ?? [];
+    if (citations.length === 0) {
+      throw new InvalidDecision(`${decision.action} must cite the evidence it rests on`);
+    }
+    const unknown = citations.filter((id) => !projection.evidence.has(id));
+    if (unknown.length > 0) {
+      throw new InvalidDecision(`${decision.action} cites unknown evidence: ${unknown.join(", ")}`);
+    }
   }
-  const unknown = citations.filter((id) => !projection.evidence.has(id));
-  if (unknown.length > 0) {
-    throw new InvalidDecision(`${decision.action} cites unknown evidence: ${unknown.join(", ")}`);
+  validateFocus(decision, projection);
+}
+
+// DEEPEN keeps the current entity and hypothesis; PIVOT changes at least one.
+// Without the graph the rule is unenforceable, and the two verbs collapse into
+// a preference the lead states and nothing checks.
+function validateFocus(decision: Decision, projection: Projection): void {
+  const graph = buildEntityGraph([...projection.evidence.values()], projection.hunt.scope["entity"] as Entity);
+  const target = decision.target_entity;
+
+  if (target !== undefined && target !== null && graph.node(target) === undefined) {
+    const known = graph.nodes().map((node) => key(node.entity)).sort();
+    throw new InvalidDecision(
+      `no evidence mentions ${target}; the graph knows ${known.slice(0, 8).join(", ") || "nothing yet"}`,
+    );
+  }
+  if (decision.action !== "DEEPEN" && decision.action !== "PIVOT") return;
+
+  const focus = focusOf(projection);
+  const held =
+    (target ?? focus.entity) === focus.entity &&
+    (decision.target_hypothesis_id ?? focus.hypothesis) === focus.hypothesis;
+
+  if (decision.action === "DEEPEN" && !held) {
+    throw new InvalidDecision("DEEPEN must keep the current entity and hypothesis; changing one is a PIVOT");
+  }
+  if (decision.action === "PIVOT" && held) {
+    throw new InvalidDecision("PIVOT must change the entity or the hypothesis; keeping both is a DEEPEN");
   }
 }
 
@@ -261,6 +293,7 @@ export class HuntController {
           question_id: newId("q", 4),
           question: directive.text,
           status: "open",
+          entity_key: null,
           spawning_evidence_id: null,
         },
       });
@@ -307,8 +340,16 @@ export class HuntController {
   // One worker per open lead, capped. Serial is simply max_workers of 1, so
   // there is no second code path for it.
   private fanOut(decision: Decision): FanOutTarget[] {
+    const held = decision.target_entity ?? focusOf(this.ledger.projection).entity;
+    const scoped = (text: string, entityKey: string | null) =>
+      entityKey === null ? text : `${text} [entity ${entityKey}]`;
+
     const fallback: FanOutTarget[] = [
-      { focus: "", hypothesisId: decision.target_hypothesis_id ?? null, questionId: null },
+      {
+        focus: scoped("", held ?? null).trim(),
+        hypothesisId: decision.target_hypothesis_id ?? null,
+        questionId: null,
+      },
     ];
     if (this.policy.max_workers === 1) return fallback;
 
@@ -318,7 +359,9 @@ export class HuntController {
         ? [...projection.questions.values()]
             .filter((question) => question.status === "open")
             .map((question) => ({
-              focus: question.question,
+              // A lead carries the entity it is about, so the worker is told what
+              // to look at rather than inferring it from prose.
+              focus: scoped(question.question, question.entity_key),
               hypothesisId: null,
               questionId: question.question_id,
             }))
@@ -333,8 +376,31 @@ export class HuntController {
     return targets.length === 0 ? fallback : targets.slice(0, this.policy.max_workers);
   }
 
+  // PIVOT is a move of attention, not a query: it puts its new target on the
+  // frontier and lets the next INVESTIGATE pick it up from there.
+  private pivot(decision: Decision): void {
+    const target = decision.target_entity ?? decision.target_hypothesis_id ?? "";
+    this.ledger.append({
+      kind: "question",
+      question: {
+        question_id: newId("q", 4),
+        question: decision.query_intent || `pursue ${target}: ${decision.rationale}`,
+        status: "open",
+        entity_key: decision.target_entity ?? null,
+        spawning_evidence_id: decision.evidence_citations?.[0] ?? null,
+      },
+    });
+  }
+
+  // DEEPEN dispatches like INVESTIGATE; validateFocus has already established
+  // that it kept the focus, so the only difference is what the worker is told.
   private async runDispatches(iteration: number, decision: Decision): Promise<DispatchResult[]> {
-    if (decision.action !== "INVESTIGATE" || this.dispatcher === undefined) return [];
+    if (decision.action === "PIVOT") {
+      this.pivot(decision);
+      return [];
+    }
+    const dispatches = decision.action === "INVESTIGATE" || decision.action === "DEEPEN";
+    if (!dispatches || this.dispatcher === undefined) return [];
     const dispatcher = this.dispatcher;
 
     const targets = this.fanOut(decision);
@@ -500,6 +566,7 @@ export class HuntController {
           question_id: newId("q", 4),
           question: sanitizeQuestion(question),
           status: "open",
+          entity_key: null,
           spawning_evidence_id: null,
         },
       });

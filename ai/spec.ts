@@ -3,7 +3,7 @@ import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { DEFAULT_LEASE_TTL_MS } from "./lease.js";
-import { DECISION_ACTIONS, DEFAULT_BUDGETS, type Budgets, type Entity } from "./types.js";
+import { DECISION_ACTIONS, DEFAULT_BUDGETS, ENTITY_TYPES, type Budgets, type Entity, type EntityType } from "./types.js";
 
 export class SpecError extends Error {}
 
@@ -29,6 +29,7 @@ export interface DigestPolicy {
   graph_warmup: number;
   contrarian_max: number;
   entity_window: number;
+  pivot_candidates: number;
 }
 
 export interface Runtime {
@@ -142,6 +143,7 @@ export const DEFAULT_DIGEST: DigestPolicy = {
   graph_warmup: 20,
   contrarian_max: 3,
   entity_window: 15,
+  pivot_candidates: 5,
 };
 
 // Resolved against the package rather than the cwd: arch and config ship with
@@ -230,6 +232,7 @@ const DIGEST_MINIMA: Record<keyof DigestPolicy, number> = {
   graph_warmup: 1,
   contrarian_max: 1,
   entity_window: 1,
+  pivot_candidates: 1,
 };
 
 function parseDigest(raw: unknown): DigestPolicy {
@@ -395,12 +398,20 @@ export const loadArch = (path: string): ArchSpec => load(path, parseArch, "arch"
 export const loadPlaybook = (path: string): Playbook => load(path, parsePlaybook, "playbook");
 export const loadConfig = (path: string): Config => load(path, parseConfig, "config");
 
-// Typed rather than assumed-an-IP: the same seed slot carries hosts, identities and hashes.
+// Typed rather than assumed-an-IP: the same seed slot carries hosts, identities
+// and hashes. The type must be one the graph also uses, or a hunt could not
+// pivot onto its own seed.
 export function parseEntity(raw: string): Entity {
-  if (isIP(raw) !== 0) return { type: "ip", value: raw };
+  if (isIP(raw) !== 0) return { type: "ip", value: raw.toLowerCase() };
+
   const separator = raw.indexOf(":");
-  if (separator < 0) return { type: "identifier", value: raw };
-  return { type: raw.slice(0, separator), value: raw.slice(separator + 1) };
+  if (separator < 0) return { type: "host", value: raw.toLowerCase() };
+
+  const type = raw.slice(0, separator).toLowerCase();
+  if (!(ENTITY_TYPES as readonly string[]).includes(type)) {
+    throw new SpecError(`unknown entity type ${type}; expected any of ${[...ENTITY_TYPES].sort().join(", ")}`);
+  }
+  return { type: type as EntityType, value: raw.slice(separator + 1).toLowerCase() };
 }
 
 const EMPTY_PLAYBOOK: Playbook = {

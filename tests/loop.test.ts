@@ -46,7 +46,7 @@ describe("ledger", () => {
     const before = readFileSync(ledger.path, "utf8");
     ledger.append({
       kind: "question",
-      question: { question_id: newId("q", 4), question: "which host?", status: "open", spawning_evidence_id: null },
+      question: { question_id: newId("q", 4), question: "which host?", status: "open", entity_key: null, spawning_evidence_id: null },
     });
     const after = readFileSync(ledger.path, "utf8");
 
@@ -246,7 +246,7 @@ describe("fan-out", () => {
     for (const question of questions) {
       ledger.append({
         kind: "question",
-        question: { question_id: newId("q", 4), question, status: "open", spawning_evidence_id: null },
+        question: { question_id: newId("q", 4), question, status: "open", entity_key: null, spawning_evidence_id: null },
       });
     }
     return ledger;

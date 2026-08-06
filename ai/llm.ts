@@ -75,7 +75,18 @@ export function renderDigest(digest: Digest): string {
     lines.push(
       "",
       "## Entities seen",
+      `Currently looking at: ${digest.focus.entity ?? "nothing in particular"}${digest.focus.hypothesis === null ? "" : ` on ${digest.focus.hypothesis}`}.`,
+      "DEEPEN keeps both; PIVOT must change at least one, naming target_entity.",
       ...digest.entities.map((e) => `- ${e.type} ${e.value} (${e.count} record(s), first ${e.first_evidence_id})`),
+    );
+  }
+
+  if (digest.pivot_candidates.length > 0) {
+    lines.push(
+      "",
+      "## Where a pivot could go",
+      "Entities the current focus co-occurs with, most frequent first.",
+      ...digest.pivot_candidates.map((e) => `- ${e.type}:${e.value} (${e.count} record(s))`),
     );
   }
 

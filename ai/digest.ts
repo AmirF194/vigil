@@ -1,4 +1,4 @@
-import { entityGraph, hasRarePairing, introducedRecurring, type GraphView } from "./entities.js";
+import { buildEntityGraph, key, type EntityGraph, type EntityNode } from "./entities.js";
 import type { Projection } from "./ledger.js";
 import { DEFAULT_DIGEST, type DigestPolicy } from "./spec.js";
 import type {
@@ -7,6 +7,7 @@ import type {
   EntityView,
   EvidenceRecord,
   EvidenceView,
+  Focus,
   Salience,
 } from "./types.js";
 
@@ -83,12 +84,47 @@ function view(record: EvidenceRecord, salience: Salience): EvidenceView {
   };
 }
 
-function entityViews(graph: GraphView, limit: number): EntityView[] {
-  return [...graph.nodes.values()]
+function toView(node: EntityNode): EntityView {
+  return { ...node.entity, count: node.count, first_evidence_id: node.first_evidence_id };
+}
+
+function entityViews(graph: EntityGraph, limit: number): EntityView[] {
+  return graph
+    .nodes()
     .filter((node) => node.count > 0)
     .sort((a, b) => (b.count === a.count ? a.entity.value.localeCompare(b.entity.value) : b.count - a.count))
     .slice(0, limit)
-    .map((node) => ({ ...node.entity, count: node.count, first_evidence_id: node.first_evidence_id }));
+    .map(toView);
+}
+
+// The focus is whatever the last decision to name one chose, falling back to the
+// hunt's own seed: a hunt starts out looking at its target. Derived rather than
+// stored, so resume needs nothing new and a replay lands on the same focus.
+//
+// The controller validates DEEPEN and PIVOT against this same value. Measuring
+// against anything else would reject a DEEPEN that held exactly the entity the
+// digest said the hunt was looking at.
+export function focusOf(projection: Projection): Focus {
+  const seed = projection.hunt.scope["entity"] as Entity | undefined;
+  return projection.decisions.reduce<Focus>(
+    (focus, record) => ({
+      entity: record.decision.target_entity ?? focus.entity,
+      hypothesis: record.decision.target_hypothesis_id ?? focus.hypothesis,
+    }),
+    { entity: seed === undefined ? null : key(seed), hypothesis: null },
+  );
+}
+
+// Where a PIVOT could go: entities the focus actually co-occurs with, so the
+// lead names something the evidence has seen rather than inventing a value.
+function pivotCandidates(graph: EntityGraph, focus: Focus, limit: number): EntityView[] {
+  if (focus.entity === null) return [];
+  return graph
+    .neighbours(focus.entity)
+    .map((neighbour) => graph.node(neighbour.key))
+    .filter((node): node is EntityNode => node !== undefined)
+    .slice(0, limit)
+    .map(toView);
 }
 
 export function buildDigest(projection: Projection, iteration: number, policy: DigestPolicy = DEFAULT_DIGEST): Digest {
@@ -107,7 +143,8 @@ export function buildDigest(projection: Projection, iteration: number, policy: D
     a.captured_at === b.captured_at ? a.evidence_id.localeCompare(b.evidence_id) : a.captured_at.localeCompare(b.captured_at),
   );
 
-  const graph = entityGraph(ordered, hunt.scope["entity"] as Entity | undefined);
+  const graph = buildEntityGraph(ordered, hunt.scope["entity"] as Entity | undefined);
+  const focus = focusOf(projection);
   // Below the warmup every entity is first-seen and every pairing has count one,
   // so both graph rules would fire on everything and promote the whole ledger.
   // Nothing is lost by waiting: the window is still showing every record.
@@ -119,8 +156,8 @@ export function buildDigest(projection: Projection, iteration: number, policy: D
       record.evidence_id,
       salienceFloor(record, {
         contradictsActive: weakensActive.has(record.evidence_id),
-        firstSeen: warm && introducedRecurring(record, graph),
-        rarePairing: warm && hasRarePairing(record, graph, policy.rare_pairing_max),
+        firstSeen: warm && graph.introducedRecurring(record),
+        rarePairing: warm && graph.hasRarePairing(record, policy.rare_pairing_max),
       }),
     );
   }
@@ -185,6 +222,8 @@ export function buildDigest(projection: Projection, iteration: number, policy: D
     recent_evidence: recent,
     weakens,
     entities: entityViews(graph, policy.entity_window),
+    focus,
+    pivot_candidates: pivotCandidates(graph, focus, policy.pivot_candidates),
     omitted: { count: omitted.length, evidence_ids: omitted.map((record) => record.evidence_id) },
     expansions: [],
     open_questions: [...projection.questions.values()]

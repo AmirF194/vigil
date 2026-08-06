@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { buildDigest, salienceFloor } from "../ai/digest.js";
-import { entitiesOf, entityGraph, extract } from "../ai/entities.js";
+import { buildEntityGraph, entitiesOf, fromText } from "../ai/entities.js";
 import { renderDigest } from "../ai/llm.js";
 import { HuntController, MAX_EXPANSIONS, startHunt } from "../ai/loop.js";
 import { Ledger, newId } from "../ai/ledger.js";
@@ -219,7 +219,7 @@ describe("resurfacing", () => {
 
 describe("entity graph", () => {
   it("extracts addresses, domains and hashes, and rejects impostors", () => {
-    const found = extract("999.1.2.3 hit evil.example.com from 10.0.0.5, sha256 " + "a".repeat(64));
+    const found = fromText("999.1.2.3 hit evil.example.com from 10.0.0.5, sha256 " + "a".repeat(64));
     expect(found.map((e) => e.value)).toContain("10.0.0.5");
     expect(found.map((e) => e.value)).toContain("evil.example.com");
     expect(found.map((e) => e.value)).toContain("a".repeat(64));
@@ -229,12 +229,12 @@ describe("entity graph", () => {
   it("counts co-occurrence and remembers who mentioned an entity first", () => {
     const first = record({ summary: "10.0.0.5 to 45.77.53.176" });
     const second = record({ summary: "10.0.0.5 to 45.77.53.176 again" });
-    const graph = entityGraph([...withEvidence(ledgerFor(), [first, second]).projection.evidence.values()]);
+    const graph = buildEntityGraph([...withEvidence(ledgerFor(), [first, second]).projection.evidence.values()]);
 
-    expect(graph.nodes.get("ip:10.0.0.5")!.count).toBe(2);
-    expect(graph.nodes.get("ip:10.0.0.5")!.first_evidence_id).toBe(first.evidence_id);
-    expect(graph.nodes.get("ip:10.0.0.5")!.pairs.get("ip:45.77.53.176")).toBe(2);
-    expect(graph.introduced.get(second.evidence_id)).toEqual([]);
+    expect(graph.node("ip:10.0.0.5")!.count).toBe(2);
+    expect(graph.node("ip:10.0.0.5")!.first_evidence_id).toBe(first.evidence_id);
+    expect(graph.node("ip:10.0.0.5")!.pairs.get("ip:45.77.53.176")).toBe(2);
+    expect(graph.introduced(second.evidence_id)).toEqual([]);
   });
 
   it("never reports the hunt's own seed entity as first-seen", () => {
@@ -242,14 +242,105 @@ describe("entity graph", () => {
     const mention = record({ summary: "traffic to 45.77.53.176" });
     withEvidence(ledger, [mention]);
 
-    const graph = entityGraph([...ledger.projection.evidence.values()], { type: "ip", value: "45.77.53.176" });
-    expect(graph.introduced.get(mention.evidence_id)).toEqual([]);
+    const graph = buildEntityGraph([...ledger.projection.evidence.values()], { type: "ip", value: "45.77.53.176" });
+    expect(graph.introduced(mention.evidence_id)).toEqual([]);
   });
 
   it("is compute-on-read, so a reopened ledger yields the same graph", () => {
     const ledger = withEvidence(ledgerFor(), filler(10));
-    const keysOf = (l: Ledger) => [...entityGraph([...l.projection.evidence.values()]).nodes.keys()].sort();
+    const keysOf = (l: Ledger) => buildEntityGraph([...l.projection.evidence.values()]).nodes().map((n) => `:`).sort();
     expect(keysOf(Ledger.open(ledger.path))).toEqual(keysOf(ledger));
+  });
+});
+
+describe("focus, PIVOT and DEEPEN", () => {
+  const seeded: WorkerEvidence = {
+    source_system: "duckdb",
+    summary: "10.0.0.5 reached 45.77.53.176 and cdn.example.com",
+    payload: {},
+    salience: "notable",
+    why_notable: "regular interval",
+    provenance: "worker",
+    attacker_influenceable: false,
+    instruction_like: false,
+  };
+
+  // A hunt with one record, so the graph knows exactly three entities.
+  async function hunted(): Promise<Ledger> {
+    const ledger = ledgerFor("10.0.0.5");
+    await new HuntController(
+      ledger,
+      new ScriptedDecisionProvider([{ action: "INVESTIGATE", rationale: "look", query_intent: "baseline" }]),
+      new ScriptedWorkerDispatcher([seeded]),
+    ).advanceIteration();
+    return ledger;
+  }
+
+  async function decide(ledger: Ledger, decision: Decision) {
+    return new HuntController(ledger, new ScriptedDecisionProvider([decision, decision, decision])).advanceIteration();
+  }
+
+  it("takes the seed as the focus until a decision names one", async () => {
+    const digest = buildDigest((await hunted()).projection, 2, WARM);
+    expect(digest.focus.entity).toBe("ip:10.0.0.5");
+  });
+
+  it("refuses an entity no evidence mentions", async () => {
+    const ledger = await hunted();
+    await expect(decide(ledger, { action: "DEEPEN", rationale: "go on", target_entity: "ip:203.0.113.9" })).rejects
+      .toThrow(/no evidence mentions ip:203\.0\.113\.9/);
+  });
+
+  it("refuses a DEEPEN that moves the entity, and a PIVOT that moves nothing", async () => {
+    const ledger = await hunted();
+    const cited = { evidence_citations: [[...ledger.projection.evidence.keys()][0]!] };
+
+    await expect(
+      decide(ledger, { action: "DEEPEN", rationale: "same thing", target_entity: "ip:45.77.53.176" }),
+    ).rejects.toThrow(/changing one is a PIVOT/);
+    await expect(
+      decide(ledger, { action: "PIVOT", rationale: "new thing", target_entity: "ip:10.0.0.5", ...cited }),
+    ).rejects.toThrow(/keeping both is a DEEPEN/);
+  });
+
+  it("puts a valid PIVOT's target on the frontier as an entity-scoped lead", async () => {
+    const ledger = await hunted();
+    const cited = [...ledger.projection.evidence.keys()][0]!;
+    await decide(ledger, {
+      action: "PIVOT",
+      rationale: "the callback destination is the better thread",
+      target_entity: "ip:45.77.53.176",
+      evidence_citations: [cited],
+    });
+
+    const lead = [...ledger.projection.questions.values()].find((q) => q.entity_key === "ip:45.77.53.176");
+    expect(lead?.status).toBe("open");
+    expect(lead?.spawning_evidence_id).toBe(cited);
+    // The focus follows the pivot, so the next DEEPEN is measured against it.
+    expect(buildDigest(ledger.projection, 3, WARM).focus.entity).toBe("ip:45.77.53.176");
+  });
+
+  it("dispatches a valid DEEPEN with the focus intact", async () => {
+    const ledger = await hunted();
+    const dispatcher = new ScriptedWorkerDispatcher([seeded]);
+    await new HuntController(
+      ledger,
+      new ScriptedDecisionProvider([{ action: "DEEPEN", rationale: "one layer down", target_entity: "ip:10.0.0.5" }]),
+      dispatcher,
+    ).advanceIteration();
+
+    const dispatched = dispatcher.requests.at(-1)!;
+    expect(dispatched.focus).toContain("ip:10.0.0.5");
+  });
+
+  it("offers the focus's neighbours as pivot candidates, and not the focus", async () => {
+    const digest = buildDigest((await hunted()).projection, 2, WARM);
+    const candidates = digest.pivot_candidates.map((e) => `${e.type}:${e.value}`);
+
+    expect(candidates).toContain("ip:45.77.53.176");
+    expect(candidates).toContain("domain:cdn.example.com");
+    expect(candidates).not.toContain("ip:10.0.0.5");
+    expect(renderDigest(digest)).toContain("## Where a pivot could go");
   });
 });
 
