@@ -22,6 +22,13 @@ export interface DispatchPolicy {
 
 export interface DigestPolicy {
   evidence_window: number;
+  // Routine records resampled per iteration so the window's tail is not lost.
+  resurface: number;
+  rare_pairing_max: number;
+  // Evidence records before the entity rules activate; below it everything is new.
+  graph_warmup: number;
+  contrarian_max: number;
+  entity_window: number;
 }
 
 export interface Runtime {
@@ -128,7 +135,14 @@ export const DEFAULT_RUNTIME: Runtime = {
 };
 
 export const DEFAULT_DISPATCH: DispatchPolicy = { mode: "serial", fan_out_over: "questions", max_workers: 1 };
-export const DEFAULT_DIGEST: DigestPolicy = { evidence_window: 25 };
+export const DEFAULT_DIGEST: DigestPolicy = {
+  evidence_window: 25,
+  resurface: 3,
+  rare_pairing_max: 1,
+  graph_warmup: 20,
+  contrarian_max: 3,
+  entity_window: 15,
+};
 
 // Resolved against the package rather than the cwd: arch and config ship with
 // the tool, so a hunt run from any directory finds the same ones.
@@ -207,10 +221,24 @@ function parseDispatch(raw: unknown): DispatchPolicy {
   return policy.mode === "serial" ? { ...policy, max_workers: 1 } : policy;
 }
 
+// resurface and rare_pairing_max may be zero, which disables them; the rest size
+// a window and a zero-width window shows nothing.
+const DIGEST_MINIMA: Record<keyof DigestPolicy, number> = {
+  evidence_window: 1,
+  resurface: 0,
+  rare_pairing_max: 0,
+  graph_warmup: 1,
+  contrarian_max: 1,
+  entity_window: 1,
+};
+
 function parseDigest(raw: unknown): DigestPolicy {
   const policy = { ...DEFAULT_DIGEST, ...asRecord(raw, "digest") } as DigestPolicy;
-  if (!Number.isInteger(policy.evidence_window) || policy.evidence_window < 1) {
-    throw new SpecError(`digest.evidence_window must be a positive integer, got ${String(policy.evidence_window)}`);
+  for (const [field, minimum] of Object.entries(DIGEST_MINIMA)) {
+    const value = policy[field as keyof DigestPolicy];
+    if (!Number.isInteger(value) || value < minimum) {
+      throw new SpecError(`digest.${field} must be an integer >= ${minimum}, got ${String(value)}`);
+    }
   }
   return policy;
 }

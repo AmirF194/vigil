@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { buildDigest } from "./digest.js";
+import { entitiesOf } from "./entities.js";
 import { drain } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
 import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
@@ -14,6 +15,7 @@ import {
   type Digest,
   type DispatchRequest,
   type DispatchResult,
+  type Expansion,
   type HuntOutcome,
   type IterationResult,
 } from "./types.js";
@@ -23,6 +25,13 @@ export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
 // One emission plus two re-asks. Bounded because a Hunt Lead that cannot obey
 // the vocabulary will not learn to on the tenth try, and every ask costs money.
 export const MAX_DECISION_ATTEMPTS = 3;
+
+// EXPAND does not advance the iteration, so only this stops a lead reading forever.
+export const MAX_EXPANSIONS = 3;
+
+// Total characters of raw payload one expansion may add. Rounds are bounded
+// already; without this the context is bounded only by how many ids are named.
+const EXPANSION_BUDGET = 12_000;
 
 export class HuntAlreadyTerminal extends Error {}
 export class InvalidDecision extends Error {}
@@ -79,6 +88,7 @@ export function startHunt(spec: HuntSpec, dir: string): Ledger {
     hunt_id: huntId,
     name: spec.name,
     spec,
+    seed: newId("seed", 8),
     status: "active",
     outcome: null,
     iteration: 0,
@@ -135,7 +145,7 @@ export class HuntController {
 
     const projection = this.ledger.projection;
     const iteration = projection.hunt.iteration + 1;
-    const digest = buildDigest(projection, iteration, this.digestPolicy.evidence_window);
+    const digest = buildDigest(projection, iteration, this.digestPolicy);
 
     const { presented, result } = await this.decide(digest, projection);
 
@@ -159,8 +169,10 @@ export class HuntController {
     // cost-per-verdict and lets a hunt overrun max_cost_usd.
     let spent = 0;
     let presented = digest;
+    let attempts = 0;
+    let expansions = 0;
 
-    for (let attempt = 0; attempt < MAX_DECISION_ATTEMPTS; attempt += 1) {
+    while (attempts < MAX_DECISION_ATTEMPTS) {
       const result = await this.provider.decide(presented);
       rejected.push(...(result.rejected_attempts ?? []));
       spent += result.cost_usd;
@@ -169,8 +181,25 @@ export class HuntController {
         validateDecision(result.decision, projection);
       } catch (error) {
         if (!(error instanceof InvalidDecision)) throw error;
+        attempts += 1;
         rejected.push(error.message);
         presented = withRejection(presented, error.message);
+        continue;
+      }
+
+      // EXPAND is a read, not a move: it buys raw payloads and asks again without
+      // advancing the iteration. Cost still accrues, so it is not free, only
+      // free of the iteration budget.
+      if (result.decision.action === "EXPAND") {
+        if (expansions < MAX_EXPANSIONS) {
+          expansions += 1;
+          presented = this.expand(presented, result.decision.evidence_citations ?? []);
+          continue;
+        }
+        attempts += 1;
+        const exhausted = `all ${MAX_EXPANSIONS} expansions are used; decide on what you have`;
+        rejected.push(exhausted);
+        presented = withRejection(presented, exhausted);
         continue;
       }
 
@@ -194,6 +223,29 @@ export class HuntController {
       `the Hunt Lead emitted nothing valid in ${MAX_DECISION_ATTEMPTS} attempts ` +
         `($${spent.toFixed(4)} spent): ${rejected.join(" | ")}`,
     );
+  }
+
+  // Whole records are dropped at the budget rather than one being cut mid-JSON,
+  // and what was dropped is named so the lead can ask for less next time.
+  private expand(digest: Digest, ids: readonly string[]): Digest {
+    const expansions: Expansion[] = [];
+    const dropped: string[] = [];
+    let budget = EXPANSION_BUDGET;
+
+    for (const evidenceId of ids) {
+      const record = this.ledger.projection.evidence.get(evidenceId);
+      if (record === undefined) continue;
+      const payload = JSON.stringify(record.payload, null, 2);
+      if (payload.length > budget) {
+        dropped.push(evidenceId);
+        continue;
+      }
+      budget -= payload.length;
+      expansions.push({ evidence_id: evidenceId, payload });
+    }
+
+    const notes = dropped.length === 0 ? digest.notes : [...digest.notes, `Too large to expand: ${dropped.join(", ")}.`];
+    return { ...digest, expansions: [...digest.expansions, ...expansions], notes };
   }
 
   // Returns true when a directive ended the hunt. A lead becomes a real lead; a
@@ -433,6 +485,7 @@ export class HuntController {
           evidence_id: evidenceId,
           dispatch_id: result.dispatch_id,
           iteration,
+          entities: entitiesOf(record),
           captured_at: new Date().toISOString(),
         },
       });

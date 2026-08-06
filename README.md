@@ -104,6 +104,49 @@ Workers append evidence; only the controller mutates state. Unresolved
 hypotheses close as `inconclusive`, never `disproven` — the hunt stopped
 looking, which is not the same as having cleared them.
 
+## The digest
+
+What the lead sees is lossy but never silently so. A **promote-only salience
+floor** may raise a worker's own tag and never lower it: sanitizer-flagged or
+attacker-influenceable, contradicts an active hypothesis, first sighting of an
+entity that went on to recur, or a rare pairing of two familiar entities. Only a
+human demotes.
+
+Promotion is protection — **only `routine` is ever compressed.** Anomalous and
+notable records survive verbatim at any window size, so raising a mis-tagged
+record is what keeps it readable.
+
+Two rules take the entity graph as input, and both stay dormant below
+`digest.graph_warmup`: early on, every entity is new and every pairing has count
+one, so they would promote the whole ledger and rank nothing. They also ignore
+values seen exactly once — telemetry is mostly one-off addresses, and a rule that
+fires on nearly every record says nothing.
+
+Routine records that fall out of the window are **named, not dropped**: the
+`Compressed` block lists their ids, and a small seeded sample is resurfaced each
+turn, weighted toward records the lead has never been shown. The seed is
+journaled on the hunt event, so a resumed hunt resurfaces exactly what an
+uninterrupted one would and a replay is exact — fold the events up to any
+decision, rebuild, and you get the digest that decision was made against.
+
+The entity graph itself is a fold over the entities stored on each record. There
+is no second copy to drift, and because extraction is stored at capture rather
+than recomputed, tightening the pattern later cannot rewrite the graph a past
+decision was made against.
+
+## EXPAND
+
+`EXPAND` cites evidence ids, returns their raw payloads, and **does not consume an
+iteration** — it re-asks the lead with more in front of it, bounded, with the cost
+still charged against `max_cost_usd`. It is how a record named in the `Compressed`
+block gets read again. The inline `expand` tool is cheaper when the lead is
+mid-thought; the action is the portable path, since tool calling is exactly what
+the gateway fallback downgrades away from.
+
+Payloads are attacker-controlled, so they render inside `<vigil:evidence>` like
+all evidence, and the total is capped per expansion — whole records are dropped at
+the boundary and named, rather than one being cut mid-JSON.
+
 ```bash
 jq -r 'select(.kind=="evidence") | .evidence.summary' runs/hunt-*.jsonl
 ```
@@ -189,7 +232,8 @@ the digest rules, and both are already data.
 |---|---|
 | `ai/loop.ts` | the controller: read → decide → dispatch → persist |
 | `ai/ledger.ts` | append-only JSONL and its projection |
-| `ai/digest.ts` | ledger → what the lead sees, with the salience floor and contrarian quota |
+| `ai/digest.ts` | ledger → what the lead sees: salience floor, resurfacing, compression, contrarian quota |
+| `ai/entities.ts` | extraction at capture, and the entity graph as a fold |
 | `ai/llm.ts` | `input()`, `output_schema()`, `llm_output()`, and the two role implementations |
 | `ai/limiter.ts` | RPM/TPM buckets, concurrency gate, jittered backoff |
 | `ai/spec.ts` | the three YAML layers, their merge, and the worker registry |

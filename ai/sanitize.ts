@@ -45,20 +45,31 @@ export function sanitizeQuestion(text: string): string {
   return scrub(text, QUESTION_CAP).replace(/\s+/g, " ").trim();
 }
 
+// The payload reaches the lead verbatim, through both the expand tool and the
+// EXPAND action, so its content is scrubbed and not merely capped. Scrubbing the
+// serialized form keeps the JSON valid: stringify has already escaped every
+// control character, and the delimiter replacement introduces no quotes.
+function scrubPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const text = scrub(JSON.stringify(payload ?? {}), PAYLOAD_CAP);
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { truncated: text };
+  }
+}
+
 // Worker output is model text derived from attacker-controlled telemetry. The
 // controller applies this to every dispatcher's records, so no implementation
 // can opt out of it.
 export function sanitize(record: WorkerEvidence): WorkerEvidence {
   const summary = scrub(record.summary, SUMMARY_CAP);
   const why = scrub(record.why_notable, WHY_CAP);
-  const payload = JSON.stringify(record.payload ?? {});
 
   return {
     ...record,
     summary,
     why_notable: why,
-    // expand hands the payload to the lead verbatim, so it is capped too.
-    payload: payload.length <= PAYLOAD_CAP ? record.payload : { truncated: clamp(payload, PAYLOAD_CAP) },
+    payload: scrubPayload(record.payload),
     instruction_like: record.instruction_like || looksLikeInstruction(`${summary}\n${why}`),
   };
 }

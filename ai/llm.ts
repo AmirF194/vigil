@@ -69,6 +69,16 @@ export function renderDigest(digest: Digest): string {
     );
   }
 
+  // PIVOT changes the entity and DEEPEN keeps it, so the boundary between them
+  // is undecidable without seeing what the hunt has actually touched.
+  if (digest.entities.length > 0) {
+    lines.push(
+      "",
+      "## Entities seen",
+      ...digest.entities.map((e) => `- ${e.type} ${e.value} (${e.count} record(s), first ${e.first_evidence_id})`),
+    );
+  }
+
   lines.push("", "## Evidence");
   for (const record of digest.recent_evidence) {
     lines.push(
@@ -77,6 +87,29 @@ export function renderDigest(digest: Digest): string {
       record.why_notable ? `why notable: ${record.why_notable}` : "",
       "</vigil:evidence>",
     );
+  }
+
+  // Named rather than discarded: the lead can see what compression cost it and
+  // EXPAND anything the summary line makes it want.
+  if (digest.omitted.count > 0) {
+    lines.push(
+      "",
+      "## Compressed",
+      `${digest.omitted.count} routine record(s) are not shown: ${digest.omitted.evidence_ids.join(", ")}.`,
+      "EXPAND any of these ids to read it in full.",
+    );
+  }
+
+  // Raw telemetry, so delimited exactly like the summaries it came from.
+  if (digest.expansions.length > 0) {
+    lines.push("", "## Expanded payloads");
+    for (const expansion of digest.expansions) {
+      lines.push(
+        `<vigil:evidence id="${expansion.evidence_id}" source="raw payload" salience="expanded">`,
+        expansion.payload,
+        "</vigil:evidence>",
+      );
+    }
   }
 
   if (digest.notes.length > 0) lines.push("", "## Notes", ...digest.notes.map((n) => `- ${n}`));

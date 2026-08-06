@@ -64,10 +64,12 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
   return ["y", "yes"].includes(answer.trim().toLowerCase());
 }
 
+// Carries observables and a payload rather than a bare sentence, so --scripted
+// exercises entity extraction, the graph and EXPAND rather than skipping them.
 const SCRIPTED_EVIDENCE = {
   source_system: "scripted",
-  summary: "scripted evidence, no telemetry was queried",
-  payload: {},
+  summary: "scripted: 10.0.0.5 reached cdn.example.com and 45.77.53.176, no telemetry was queried",
+  payload: { rows: [{ src: "10.0.0.5", dest: "45.77.53.176", connections: 412 }] },
   salience: "routine" as const,
   why_notable: "",
   provenance: "scripted",

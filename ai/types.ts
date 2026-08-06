@@ -26,11 +26,13 @@ export const DECISION_ACTIONS = [
   "HANDOFF_IR",
 ] as const satisfies readonly DecisionAction[];
 
-// These rest on a judgement about existing evidence, so an uncited one is unauditable.
+// These rest on a judgement about existing evidence, so an uncited one is
+// unauditable. EXPAND is here for a different reason: it names what to read.
 export const ACTIONS_REQUIRING_CITATION: ReadonlySet<DecisionAction> = new Set([
   "ABANDON",
   "VALIDATE",
   "PIVOT",
+  "EXPAND",
 ]);
 
 export type HuntStatus = "pending_approval" | "active" | "terminal";
@@ -90,6 +92,8 @@ export interface HuntState {
   // Resolved once at hunt start: resume needs no YAML, and editing an arch file
   // mid-run cannot silently change what a hunt in flight was told.
   spec: HuntSpec;
+  // Journaled so stochastic resurfacing replays exactly, on resume and on audit.
+  seed: string;
   status: HuntStatus;
   outcome: HuntOutcome | null;
   iteration: number;
@@ -130,6 +134,9 @@ export interface EvidenceRecord {
   // Set when an adversary could have written the value; an ABANDON must not rest on it alone.
   attacker_influenceable: boolean;
   instruction_like: boolean;
+  // Extracted once at capture and stored, so tightening the pattern later cannot
+  // rewrite the graph a past decision was made against.
+  entities: Entity[];
   captured_at: string;
 }
 
@@ -193,6 +200,19 @@ export interface EvidenceView {
   instruction_like: boolean;
 }
 
+export interface EntityView {
+  type: string;
+  value: string;
+  count: number;
+  first_evidence_id: string;
+}
+
+// A raw payload the lead asked for by id. Rendered delimited, like all evidence.
+export interface Expansion {
+  evidence_id: string;
+  payload: string;
+}
+
 export interface Digest {
   hunt_id: string;
   hunt_name: string;
@@ -202,6 +222,13 @@ export interface Digest {
   recent_evidence: EvidenceView[];
   // Strongest counter-evidence per active hypothesis; one-sidedness is itself a finding.
   weakens: Record<string, EvidenceView[]>;
+  // What the hunt has touched. PIVOT changes the entity, DEEPEN keeps it, so the
+  // lead cannot tell the two apart without seeing them.
+  entities: EntityView[];
+  // Routine records the window dropped. Named rather than discarded, so the lead
+  // knows they exist and can EXPAND one.
+  omitted: { count: number; evidence_ids: string[] };
+  expansions: Expansion[];
   open_questions: string[];
   budget_remaining: { iterations: number; cost_usd: number };
   // Operator instructions. Unlike evidence, these are direction.
@@ -221,10 +248,11 @@ export interface DispatchRequest {
 }
 
 // supports/weakens name the hypotheses this record bears on; the controller
-// turns them into links, so a worker still never writes state itself.
+// turns them into links, so a worker still never writes state itself. entities
+// are extracted rather than declared, for the same reason.
 export type WorkerEvidence = Omit<
   EvidenceRecord,
-  "evidence_id" | "dispatch_id" | "iteration" | "captured_at"
+  "evidence_id" | "dispatch_id" | "iteration" | "entities" | "captured_at"
 > & { supports?: string[]; weakens?: string[] };
 
 export interface DispatchResult {

@@ -1,6 +1,10 @@
+import { entityGraph, hasRarePairing, introducedRecurring, type GraphView } from "./entities.js";
 import type { Projection } from "./ledger.js";
+import { DEFAULT_DIGEST, type DigestPolicy } from "./spec.js";
 import type {
   Digest,
+  Entity,
+  EntityView,
   EvidenceRecord,
   EvidenceView,
   Salience,
@@ -9,23 +13,63 @@ import type {
 export const DEFAULT_EVIDENCE_WINDOW = 25;
 const DIRECTIVE_WINDOW = 5;
 
+// How much likelier an unshown record is to be resurfaced than one the lead has
+// already seen. Weighted rather than exclusive: a record seen once, long ago,
+// is still worth re-reading.
+const UNSEEN_WEIGHT = 4;
+
 const RANK: Record<Salience, number> = { routine: 0, notable: 1, anomalous: 2 };
 
 function raise(current: Salience, floor: Salience): Salience {
   return RANK[floor] > RANK[current] ? floor : current;
 }
 
+export interface FloorContext {
+  contradictsActive: boolean;
+  firstSeen: boolean;
+  rarePairing: boolean;
+}
+
 // Deterministic floor over the model's own salience claim. Code may promote;
 // only a human may demote, so a single mis-tag cannot silence a record forever.
-export function salienceFloor(
-  record: EvidenceRecord,
-  contradictsActive: boolean,
-): Salience {
+export function salienceFloor(record: EvidenceRecord, context: FloorContext): Salience {
   let salience = record.salience;
   if (record.instruction_like || record.attacker_influenceable) salience = raise(salience, "notable");
-  if (contradictsActive) salience = raise(salience, "notable");
+  if (context.contradictsActive) salience = raise(salience, "notable");
+  if (context.firstSeen || context.rarePairing) salience = raise(salience, "notable");
   if (record.provenance === "tool_failure") salience = raise(salience, "anomalous");
   return salience;
+}
+
+function hash32(text: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
+  }
+  return hash >>> 0;
+}
+
+// mulberry32. Math.random cannot be journaled, and a digest that cannot be
+// reproduced from the ledger is not an audit trail.
+function rng(seed: string): () => number {
+  let state = hash32(seed);
+  return () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Efraimidis-Spirakis: one key per candidate, keep the top k. Weighted sampling
+// without replacement in a single pass, and exact for a given seed.
+function sample(candidates: readonly EvidenceRecord[], k: number, next: () => number, seen: ReadonlySet<string>): EvidenceRecord[] {
+  if (k < 1 || candidates.length === 0) return [];
+  return candidates
+    .map((record) => ({ record, key: next() ** (1 / (seen.has(record.evidence_id) ? 1 : UNSEEN_WEIGHT)) }))
+    .sort((a, b) => b.key - a.key)
+    .slice(0, k)
+    .map((entry) => entry.record);
 }
 
 function view(record: EvidenceRecord, salience: Salience): EvidenceView {
@@ -39,11 +83,15 @@ function view(record: EvidenceRecord, salience: Salience): EvidenceView {
   };
 }
 
-export function buildDigest(
-  projection: Projection,
-  iteration: number,
-  evidenceWindow = DEFAULT_EVIDENCE_WINDOW,
-): Digest {
+function entityViews(graph: GraphView, limit: number): EntityView[] {
+  return [...graph.nodes.values()]
+    .filter((node) => node.count > 0)
+    .sort((a, b) => (b.count === a.count ? a.entity.value.localeCompare(b.entity.value) : b.count - a.count))
+    .slice(0, limit)
+    .map((node) => ({ ...node.entity, count: node.count, first_evidence_id: node.first_evidence_id }));
+}
+
+export function buildDigest(projection: Projection, iteration: number, policy: DigestPolicy = DEFAULT_DIGEST): Digest {
   const { hunt } = projection;
 
   const activeHypotheses = new Set(
@@ -55,32 +103,60 @@ export function buildDigest(
       .map((link) => link.evidence_id),
   );
 
-  const salience = new Map<string, Salience>();
-  for (const record of projection.evidence.values()) {
-    salience.set(record.evidence_id, salienceFloor(record, weakensActive.has(record.evidence_id)));
-  }
-
   const ordered = [...projection.evidence.values()].sort((a, b) =>
     a.captured_at === b.captured_at ? a.evidence_id.localeCompare(b.evidence_id) : a.captured_at.localeCompare(b.captured_at),
   );
 
-  // Anomalous records are kept whatever the window; only routine ones fall off the end.
-  const anomalous = ordered.filter((record) => salience.get(record.evidence_id) === "anomalous");
-  const tail = ordered.slice(-evidenceWindow);
-  const selected = ordered.filter((record) => anomalous.includes(record) || tail.includes(record));
+  const graph = entityGraph(ordered, hunt.scope["entity"] as Entity | undefined);
+  // Below the warmup every entity is first-seen and every pairing has count one,
+  // so both graph rules would fire on everything and promote the whole ledger.
+  // Nothing is lost by waiting: the window is still showing every record.
+  const warm = ordered.length >= policy.graph_warmup;
 
+  const salience = new Map<string, Salience>();
+  for (const record of ordered) {
+    salience.set(
+      record.evidence_id,
+      salienceFloor(record, {
+        contradictsActive: weakensActive.has(record.evidence_id),
+        firstSeen: warm && introducedRecurring(record, graph),
+        rarePairing: warm && hasRarePairing(record, graph, policy.rare_pairing_max),
+      }),
+    );
+  }
+
+  // Only routine may be compressed. Promotion is therefore protection: raising a
+  // mis-tagged record to notable is what keeps it out of the rollup.
+  const kept = new Set(
+    ordered.filter((record) => salience.get(record.evidence_id) !== "routine").map((r) => r.evidence_id),
+  );
+  for (const record of ordered.slice(-policy.evidence_window)) kept.add(record.evidence_id);
+
+  const seen = new Set(
+    projection.decisions.flatMap((decision) =>
+      decision.digest_presented.recent_evidence.map((record) => record.evidence_id),
+    ),
+  );
+  const candidates = ordered.filter((record) => !kept.has(record.evidence_id));
+  for (const record of sample(candidates, policy.resurface, rng(`${hunt.seed}:${iteration}`), seen)) {
+    kept.add(record.evidence_id);
+  }
+
+  const selected = ordered.filter((record) => kept.has(record.evidence_id));
+  const omitted = ordered.filter((record) => !kept.has(record.evidence_id));
   const recent = selected.map((record) => view(record, salience.get(record.evidence_id) ?? record.salience));
 
   // A query over the links, not new data: the Hunt Lead never sees a hypothesis
-  // without its counter-case.
+  // without its counter-case, strongest first.
   const weakens: Record<string, EvidenceView[]> = {};
   for (const hypothesisId of activeHypotheses) {
-    const against = projection.links
+    weakens[hypothesisId] = projection.links
       .filter((link) => link.relation === "weakens" && link.hypothesis_id === hypothesisId)
       .map((link) => projection.evidence.get(link.evidence_id))
       .filter((record): record is EvidenceRecord => record !== undefined)
-      .map((record) => view(record, salience.get(record.evidence_id) ?? record.salience));
-    weakens[hypothesisId] = against;
+      .map((record) => view(record, salience.get(record.evidence_id) ?? record.salience))
+      .sort((a, b) => RANK[b.salience] - RANK[a.salience])
+      .slice(0, policy.contrarian_max);
   }
 
   const notes: string[] = [];
@@ -108,6 +184,9 @@ export function buildDigest(
     })),
     recent_evidence: recent,
     weakens,
+    entities: entityViews(graph, policy.entity_window),
+    omitted: { count: omitted.length, evidence_ids: omitted.map((record) => record.evidence_id) },
+    expansions: [],
     open_questions: [...projection.questions.values()]
       .filter((q) => q.status === "open")
       .map((q) => q.question),

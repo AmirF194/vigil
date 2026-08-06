@@ -336,6 +336,7 @@ describe("digest", () => {
         provenance: "worker",
         attacker_influenceable: false,
         instruction_like: false,
+        entities: [],
         captured_at: new Date().toISOString(),
       },
     });
