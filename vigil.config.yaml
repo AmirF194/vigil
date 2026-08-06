@@ -23,3 +23,8 @@ tools:
     memory_limit: 2GB
   - id: expand
     kind: expand
+  # Indexed once at hunt start. A local export path works too; THREATFOX_API_KEY
+  # is sent when set, which the public recent export does not require.
+  - id: intel_lookup
+    kind: threatfox
+    feed: https://threatfox.abuse.ch/export/json/recent/

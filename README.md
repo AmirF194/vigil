@@ -76,7 +76,7 @@ wrong one is a load error, so there is no precedence chain to reason about.
 
 | file | owns | authored by |
 |---|---|---|
-| `arch/threathunt.yaml` | roles, their prompts and output schemas, `dispatch`, `digest` | operator |
+| `arch/threathunt.yaml` | the lead, the worker registry, their prompts and output schemas, `dispatch`, `digest` | operator |
 | `frothly.yaml` (`--workflow`) | hypotheses, ATT&CK mapping, data domains, scope, `directives`, narrative | uploadable |
 | `vigil.config.yaml` | `model`, `rates`, `budgets`, `runtime`, `tools` | operator |
 
@@ -108,16 +108,60 @@ looking, which is not the same as having cleared them.
 jq -r 'select(.kind=="evidence") | .evidence.summary' runs/hunt-*.jsonl
 ```
 
+## Workers
+
+`roles.workers` in the arch **is** the agent-ID registry: its keys are the ids the
+lead may name in `worker_agent_id`, and a decision naming anything else is
+rejected before a worker runs. The roster the lead reads is generated from that
+map, so a prompt cannot drift from the specialists that exist.
+
+| agent id | tools | for |
+|---|---|---|
+| `threat_hunter` | `duckdb_query` | broad behavioural hunting across every domain |
+| `network_analyst` | `duckdb_query` | traffic shape — intervals, jitter, volume asymmetry, DNS, HTTP |
+| `threat_intel` | `intel_lookup` | reputation and attribution for observables; no SQL |
+
+A fourth specialist is a YAML block — a description, a prompt, a tool scope. If it
+needed a change under `ai/`, the arch layer would have failed. `roles.workers_preamble`
+carries the discipline they share, and a playbook's `directives.workers` carries what
+they all need to know about one dataset.
+
 ## Tools
 
-The lead gets `expand` (retrieve a raw evidence payload) and the worker gets
-`duckdb_query` — the query tool is deliberately not on the lead. The arch names
-tool ids; the config says what they point at, and a role naming a tool the config
-never declared fails at load.
+The lead gets `expand` (retrieve a raw evidence payload) and the query tools stay
+off it. The arch names tool ids; the config says what they point at, and a role
+naming a tool the config never declared fails at load — so swapping the substrate
+is a config entry and a factory, never a controller change.
 
 The DuckDB tool is read-only, rejects anything that is not a single `SELECT`/
 `WITH`, caps rows and wall time, and caches identical queries so parallel
 workers chasing adjacent leads do not re-run them.
+
+`intel_lookup` indexes the ThreatFox feed once at hunt start and answers from
+memory, so lookups cost no network and a hunt stays replayable. Point `feed` at a
+local export or a URL — the public recent export needs no key, and where one is
+wanted it comes from `THREATFOX_API_KEY`, never from the committed config. An
+unreachable feed surfaces as a visibility gap on the calls that need it rather
+than failing a hunt that may never ask for intel.
+
+BOTSv3 is from 2018 and ThreatFox is a rolling recent window, so the live feed
+will not match that dataset; point `feed` at a seeded local export to exercise
+the worker against it.
+
+## The evidence boundary
+
+Worker output is model text derived from attacker-controlled telemetry, so the
+controller sanitizes every record before it reaches the ledger — in
+`persistDispatch`, not in a dispatcher, so no implementation can skip it. Control
+characters are stripped, `<vigil:` sequences are neutralized so nothing can close
+the delimiters that contain it, fields are capped with the truncation marked, and
+instruction-like text is flagged. Worker-raised questions render as bare markdown,
+so they are additionally collapsed to one line.
+
+Flagging feeds machinery that already exists: the salience floor raises a flagged
+record to `notable`, and the digest tells the lead that telemetry content is data.
+Operator directives are the deliberate exception — authenticated, and never
+sanitized, because they are direction.
 
 ## Topology
 
@@ -148,10 +192,12 @@ the digest rules, and both are already data.
 | `ai/digest.ts` | ledger → what the lead sees, with the salience floor and contrarian quota |
 | `ai/llm.ts` | `input()`, `output_schema()`, `llm_output()`, and the two role implementations |
 | `ai/limiter.ts` | RPM/TPM buckets, concurrency gate, jittered backoff |
-| `ai/spec.ts` | the three YAML layers and their merge |
+| `ai/spec.ts` | the three YAML layers, their merge, and the worker registry |
+| `ai/sanitize.ts` | the worker evidence boundary |
 | `ai/lease.ts` | per-hunt lockfile so one process advances a ledger |
 | `ai/inbox.ts` | the operator directive queue |
 | `tools/duckdb.ts` | read-only SQL over the telemetry |
+| `tools/threatfox.ts` | the indicator feed behind `intel_lookup` |
 
 The dataset used by `frothly.yaml` is Splunk BOTSv3 converted to DuckDB
 (1.94M events). Point `tools[].database` wherever yours lives; the DuckDB tests

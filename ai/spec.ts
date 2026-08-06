@@ -32,22 +32,32 @@ export interface Runtime {
   lease_ttl_ms: number;
 }
 
+export const TOOL_KINDS = new Set(["duckdb", "expand", "threatfox"]);
+
 export interface ToolSpec {
   id: string;
-  kind: "duckdb" | "expand";
+  kind: string;
   [key: string]: unknown;
 }
 
 // One LLM role: what it is told, what shape it must answer in, what it may call.
+// description is the one line the Hunt Lead reads when choosing a worker.
 export interface RoleSpec {
   prompt: string;
+  description: string;
   output_schema: Record<string, unknown>;
   tools: string[];
 }
 
-export type RoleName = "lead" | "worker";
-export const ROLE_NAMES = ["lead", "worker"] as const satisfies readonly RoleName[];
-export type Roles = Record<RoleName, RoleSpec>;
+// The agent-ID registry: worker keys are the ids the lead may name, so adding a
+// specialist is a YAML block rather than a change here.
+export interface Roles {
+  lead: RoleSpec;
+  workers: Record<string, RoleSpec>;
+}
+
+// Reserved directive key: prose every worker needs, such as what the dataset is.
+export const ALL_WORKERS = "workers";
 
 // The loop's shape: what the roles are told, what they must answer in, how an
 // iteration fans out. Operator-authored and never uploaded.
@@ -65,7 +75,7 @@ export interface Playbook {
   attack_techniques: string[];
   data_domains: string[];
   scope: Record<string, unknown>;
-  directives: Partial<Record<RoleName, string>>;
+  directives: Record<string, string>;
   narrative: string;
 }
 
@@ -219,7 +229,7 @@ function assertVocabulary(schema: Record<string, unknown>): void {
   }
 }
 
-function parseRole(raw: unknown, name: RoleName): RoleSpec {
+function parseRole(raw: unknown, name: string): RoleSpec {
   const record = asRecord(raw, `roles.${name}`);
   const prompt = str(record["prompt"]);
   if (prompt.trim() === "") throw new SpecError(`roles.${name} needs a prompt`);
@@ -227,21 +237,42 @@ function parseRole(raw: unknown, name: RoleName): RoleSpec {
 
   return {
     prompt,
+    description: str(record["description"]),
     output_schema: asRecord(record["output_schema"], `roles.${name}.output_schema`),
     tools: strings(record["tools"], `roles.${name}.tools`),
   };
 }
 
+// preamble is the discipline every specialist shares, so the arch states it once
+// instead of repeating it per worker.
+function parseWorkers(raw: unknown, preamble: string): Record<string, RoleSpec> {
+  const record = asRecord(raw, "roles.workers");
+  if (Object.keys(record).length === 0) throw new SpecError("roles.workers must declare at least one worker");
+
+  return Object.fromEntries(
+    Object.entries(record).map(([id, value]) => {
+      const role = parseRole(value, `workers.${id}`);
+      // Without it the generated roster is blank and the lead chooses on the id alone.
+      if (role.description.trim() === "") throw new SpecError(`roles.workers.${id} needs a description`);
+      return [id, preamble ? { ...role, prompt: `${preamble}\n\n${role.prompt}` } : role];
+    }),
+  );
+}
+
+const ROLE_GROUPS = new Set(["lead", ALL_WORKERS, "workers_preamble"]);
+
 function parseRoles(raw: unknown): Roles {
   const record = asRecord(raw, "roles");
-  const unknown = Object.keys(record).filter((key) => !(ROLE_NAMES as readonly string[]).includes(key));
+  const unknown = Object.keys(record).filter((key) => !ROLE_GROUPS.has(key));
   if (unknown.length > 0) {
-    throw new SpecError(`unknown role(s): ${unknown.sort().join(", ")}; expected ${ROLE_NAMES.join(", ")}`);
+    throw new SpecError(
+      `unknown role group(s): ${unknown.sort().join(", ")}; expected any of ${[...ROLE_GROUPS].sort().join(", ")}`,
+    );
   }
 
-  const roles = { lead: parseRole(record["lead"], "lead"), worker: parseRole(record["worker"], "worker") };
-  assertVocabulary(roles.lead.output_schema);
-  return roles;
+  const lead = parseRole(record["lead"], "lead");
+  assertVocabulary(lead.output_schema);
+  return { lead, workers: parseWorkers(record[ALL_WORKERS], str(record["workers_preamble"]).trim()) };
 }
 
 export function parseArch(text: string): ArchSpec {
@@ -254,12 +285,10 @@ export function parseArch(text: string): ArchSpec {
   };
 }
 
-function parseDirectives(raw: unknown): Partial<Record<RoleName, string>> {
+// Names are checked against the arch's registry in applyDirectives, not here: a
+// playbook is read without knowing which arch it will run under.
+function parseDirectives(raw: unknown): Record<string, string> {
   const record = asRecord(raw, "directives");
-  const unknown = Object.keys(record).filter((key) => !(ROLE_NAMES as readonly string[]).includes(key));
-  if (unknown.length > 0) {
-    throw new SpecError(`directives name unknown role(s): ${unknown.sort().join(", ")}`);
-  }
   return Object.fromEntries(Object.entries(record).map(([role, value]) => [role, String(value)]));
 }
 
@@ -304,8 +333,10 @@ function parseTools(raw: unknown): ToolSpec[] {
     const id = tool["id"];
     const kind = tool["kind"];
     if (typeof id !== "string") throw new SpecError(`tools[${index}] needs a string id`);
-    if (kind !== "duckdb" && kind !== "expand") {
-      throw new SpecError(`tools[${index}] has unknown kind ${String(kind)}; expected duckdb or expand`);
+    if (typeof kind !== "string" || !TOOL_KINDS.has(kind)) {
+      throw new SpecError(
+        `tools[${index}] has unknown kind ${String(kind)}; expected any of ${[...TOOL_KINDS].sort().join(", ")}`,
+      );
     }
     return { ...tool, id, kind } as ToolSpec;
   });
@@ -354,19 +385,47 @@ const EMPTY_PLAYBOOK: Playbook = {
   narrative: "",
 };
 
+function extend(role: RoleSpec, name: string, additions: (string | undefined)[], declared: Set<string>): RoleSpec {
+  const missing = role.tools.filter((id) => !declared.has(id));
+  if (missing.length > 0) {
+    throw new SpecError(`arch role ${name} needs tool(s) the config does not declare: ${missing.join(", ")}`);
+  }
+  const prompt = [role.prompt, ...additions.filter((text) => text)].join("\n\n");
+  return prompt === role.prompt ? role : { ...role, prompt };
+}
+
 // Playbook prose layers onto the arch prompt rather than replacing it: the
 // playbook says what this dataset is, the arch says how to reason about any of them.
-function applyDirectives(roles: Roles, directives: Partial<Record<RoleName, string>>, declared: Set<string>): Roles {
-  const applied = ROLE_NAMES.map((name) => {
-    const role = roles[name];
-    const missing = role.tools.filter((id) => !declared.has(id));
-    if (missing.length > 0) {
-      throw new SpecError(`arch role ${name} needs tool(s) the config does not declare: ${missing.join(", ")}`);
-    }
-    const directive = directives[name];
-    return [name, directive ? { ...role, prompt: `${role.prompt}\n\n${directive}` } : role];
-  });
-  return Object.fromEntries(applied) as Roles;
+function applyDirectives(roles: Roles, directives: Record<string, string>, declared: Set<string>): Roles {
+  const known = new Set(["lead", ALL_WORKERS, ...Object.keys(roles.workers)]);
+  const unknown = Object.keys(directives).filter((key) => !known.has(key));
+  if (unknown.length > 0) {
+    throw new SpecError(
+      `directives name unknown role(s): ${unknown.sort().join(", ")}; expected any of ${[...known].sort().join(", ")}`,
+    );
+  }
+
+  // Dataset facts belong to every worker, so the reserved key lands on all of
+  // them before any per-worker prose.
+  const shared = directives[ALL_WORKERS];
+  const workers = Object.entries(roles.workers).map(([id, role]) => [
+    id,
+    extend(role, id, [shared, directives[id]], declared),
+  ]);
+  return {
+    lead: extend(roles.lead, "lead", [directives["lead"]], declared),
+    workers: Object.fromEntries(workers) as Record<string, RoleSpec>,
+  };
+}
+
+// Generated from the registry rather than written into the prompt, so the roster
+// the lead reads cannot drift from the workers that actually exist.
+function roster(workers: Record<string, RoleSpec>): string {
+  return [
+    "## Workers you may dispatch",
+    "Name exactly one of these in worker_agent_id when you INVESTIGATE.",
+    ...Object.entries(workers).map(([id, role]) => `- ${id} — ${role.description}`),
+  ].join("\n");
 }
 
 // The one place the three layers and the flags converge.
@@ -397,10 +456,12 @@ export function buildSpec(options: {
     if (name.length > 60) name = `${name.slice(0, 57)}...`;
   }
 
+  const roles = applyDirectives(arch.roles, playbook.directives, new Set(config.tools.map((tool) => tool.id)));
+
   return {
     ...config,
     arch: arch.name,
-    roles: applyDirectives(arch.roles, playbook.directives, new Set(config.tools.map((tool) => tool.id))),
+    roles: { ...roles, lead: { ...roles.lead, prompt: `${roles.lead.prompt}\n\n${roster(roles.workers)}` } },
     dispatch: arch.dispatch,
     digest: arch.digest,
     name,

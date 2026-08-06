@@ -319,26 +319,25 @@ interface WorkerOutput {
 }
 
 export class LlmWorkerDispatcher implements WorkerDispatcher {
-  private readonly role: RoleSpec;
-  private readonly tools: Tool[];
-
   constructor(
     private readonly spec: HuntSpec,
-    tools: readonly Tool[] = [],
+    private readonly tools: readonly Tool[] = [],
     private readonly limiter: Limiter = createLimiter(spec),
     private readonly client: OpenAI = createClient(),
-  ) {
-    this.role = spec.roles.worker;
-    this.tools = toolsFor(this.role, tools);
-  }
+  ) {}
 
+  // Resolved per request, not in the constructor: which specialist runs is the
+  // Hunt Lead's decision, and each one carries its own prompt and tool scope.
   async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+    const role = this.spec.roles.workers[request.agent_id];
+    if (role === undefined) throw new LlmError(`no such worker ${request.agent_id}`);
+
     const result = await llm_output<WorkerOutput>({
       client: this.client,
       model: this.spec.model,
-      messages: input(this.role, renderDispatch(request, this.spec.narrative)),
-      schema: output_schema(this.role),
-      tools: this.tools,
+      messages: input(role, renderDispatch(request, this.spec.narrative)),
+      schema: output_schema(role),
+      tools: toolsFor(role, this.tools),
       limiter: this.limiter,
       rates: this.spec.rates,
     });

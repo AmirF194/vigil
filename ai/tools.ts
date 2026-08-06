@@ -1,6 +1,7 @@
 import type { Ledger } from "./ledger.js";
 import type { HuntSpec } from "./spec.js";
 import { createDuckDBTool } from "../tools/duckdb.js";
+import { createThreatFoxTool } from "../tools/threatfox.js";
 
 export interface Tool {
   id: string;
@@ -43,6 +44,7 @@ export async function buildTools(spec: HuntSpec, ledger: Ledger): Promise<Tool[]
   for (const config of spec.tools) {
     if (config.kind === "duckdb") tools.push(await createDuckDBTool(config));
     if (config.kind === "expand") tools.push(createExpandTool(config.id, ledger));
+    if (config.kind === "threatfox") tools.push(await createThreatFoxTool(config));
   }
   return tools;
 }

@@ -17,7 +17,8 @@ directives:
     results, and AWS CloudTrail. The trail is deliberately multi-domain, so a
     finding in one domain should be pivoted into another rather than confirmed
     only where it was found.
-  worker: |
+  # Dataset facts belong to every specialist, not to one of them.
+  workers: |
     Start from the mapped views (net_flow, dns, http, win_events, endpoint,
     cloud) and fall back to the lossless events table when no view covers the
     sourcetype. Internal space is 192.168.0.0/16 and 172.16.0.0/12; the internal

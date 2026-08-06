@@ -9,7 +9,7 @@ function arch(roles: string): string {
   return `name: t\nroles:\n${roles}`;
 }
 const LEAD = `  lead:\n    prompt: decide\n    output_schema:\n      properties:\n        action: { enum: [INVESTIGATE, CONCLUDE] }\n`;
-const WORKER = `  worker:\n    prompt: query\n    output_schema: { type: object }\n`;
+const WORKER = `  workers:\n    threat_hunter:\n      description: queries things\n      prompt: query\n      output_schema: { type: object }\n`;
 
 describe("the three layers", () => {
   const spec = buildSpec({ workflowPath: "frothly.yaml" });
@@ -17,23 +17,29 @@ describe("the three layers", () => {
   it("merges arch, playbook and config into one spec", () => {
     expect(spec.arch).toBe("threathunt");
     expect(spec.hypotheses).toHaveLength(2);
-    expect(spec.tools.map((tool) => tool.id)).toEqual(["duckdb_query", "expand"]);
+    expect(spec.tools.map((tool) => tool.id)).toEqual(["duckdb_query", "expand", "intel_lookup"]);
     expect(spec.roles.lead.prompt).toContain("Hunt Lead");
     expect(spec.narrative).toContain("Frothly");
   });
 
   it("appends playbook directives to the arch prompt rather than replacing it", () => {
     const base = loadArch(DEFAULT_ARCH);
-    expect(base.roles.worker.prompt).not.toContain("froth.ly");
-    expect(spec.roles.worker.prompt.startsWith(base.roles.worker.prompt)).toBe(true);
-    expect(spec.roles.worker.prompt).toContain("froth.ly");
+    const worker = base.roles.workers["threat_hunter"]!;
+    expect(worker.prompt).not.toContain("froth.ly");
+    expect(spec.roles.workers["threat_hunter"]!.prompt.startsWith(worker.prompt)).toBe(true);
+    expect(spec.roles.workers["threat_hunter"]!.prompt).toContain("froth.ly");
     // Worker guidance stays off the lead.
     expect(spec.roles.lead.prompt).not.toContain("froth.ly");
   });
 
-  it("keeps the query tool off the lead", () => {
+  it("gives the reserved workers directive to every specialist, not just one", () => {
+    for (const role of Object.values(spec.roles.workers)) expect(role.prompt).toContain("froth.ly");
+  });
+
+  it("keeps the query tool off the lead and off threat intel", () => {
     expect(spec.roles.lead.tools).toEqual(["expand"]);
-    expect(spec.roles.worker.tools).toEqual(["duckdb_query"]);
+    expect(spec.roles.workers["network_analyst"]!.tools).toEqual(["duckdb_query"]);
+    expect(spec.roles.workers["threat_intel"]!.tools).toEqual(["intel_lookup"]);
   });
 
   it("rejects a key that belongs to a different layer", () => {

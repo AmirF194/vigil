@@ -5,7 +5,9 @@ roles:
     output_schema:
       properties:
         action: { enum: [INVESTIGATE, CONCLUDE] }
-  worker:
-    prompt: query
-    output_schema: { type: object }
-    tools: [splunk_search]
+  workers:
+    threat_hunter:
+      description: queries things
+      prompt: query
+      output_schema: { type: object }
+      tools: [splunk_search]

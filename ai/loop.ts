@@ -3,6 +3,7 @@ import { buildDigest } from "./digest.js";
 import { drain } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
 import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
+import { sanitize, sanitizeQuestion } from "./sanitize.js";
 import { DEFAULT_DIGEST, DEFAULT_DISPATCH, type DigestPolicy, type DispatchPolicy, type HuntSpec } from "./spec.js";
 import {
   ACTIONS_REQUIRING_CITATION,
@@ -33,11 +34,19 @@ interface FanOutTarget {
 }
 
 // The controller rejects anything outside the closed vocabulary, so the Hunt
-// Lead cannot widen its own action space by emitting a new verb.
+// Lead cannot widen its own action space by emitting a new verb or a worker
+// the registry never declared.
 export function validateDecision(decision: Decision, projection: Projection): void {
   if (!DECISION_ACTIONS.includes(decision.action)) {
     throw new InvalidDecision(`unknown action ${String(decision.action)}`);
   }
+
+  const workers = projection.hunt.spec.roles.workers;
+  const agentId = decision.worker_agent_id;
+  if (agentId !== undefined && agentId !== null && !(agentId in workers)) {
+    throw new InvalidDecision(`no such worker ${agentId}; the registry declares ${Object.keys(workers).sort().join(", ")}`);
+  }
+
   if (!ACTIONS_REQUIRING_CITATION.has(decision.action)) return;
 
   const citations = decision.evidence_citations ?? [];
@@ -378,16 +387,24 @@ export class HuntController {
     };
   }
 
+  // A link to a hypothesis the worker invented would corrupt the contrarian
+  // quota, so only ids the ledger already knows are linked.
+  private link(evidenceId: string, supports?: string[], weakens?: string[]): void {
+    const known = this.ledger.projection.hypotheses;
+    for (const [relation, ids] of [["supports", supports], ["weakens", weakens]] as const) {
+      for (const hypothesisId of ids ?? []) {
+        if (!known.has(hypothesisId)) continue;
+        this.ledger.append({ kind: "link", link: { evidence_id: evidenceId, hypothesis_id: hypothesisId, relation } });
+      }
+    }
+  }
+
   private persistDispatch(iteration: number, result: DispatchResult): number {
     // Idempotency on dispatch_id: a retried dispatch re-delivers the same
-    // evidence, and appending it twice would inflate corroboration counts.
-    const already = [...this.ledger.projection.evidence.values()].some(
-      (record) => record.dispatch_id === result.dispatch_id,
-    );
-    if (already) {
-      this.ledger.patch("dispatch", result.dispatch_id, { status: "complete" });
-      return 0;
-    }
+    // evidence, and appending it twice would inflate corroboration counts. Keyed
+    // on the dispatch row rather than a scan for its evidence, so a dispatch that
+    // legitimately found nothing is still settled exactly once.
+    if (this.ledger.projection.dispatches.get(result.dispatch_id)?.status !== "pending") return 0;
 
     // A failed worker is evidence about visibility, not a lost turn.
     const records = result.failed
@@ -405,8 +422,9 @@ export class HuntController {
         ]
       : result.evidence;
 
-    const known = this.ledger.projection.hypotheses;
-    for (const { supports, weakens, ...record } of records) {
+    // Sanitized here rather than in the dispatcher, so no WorkerDispatcher can
+    // put unescaped text into the digest by omitting the step.
+    for (const { supports, weakens, ...record } of records.map(sanitize)) {
       const evidenceId = newId("ev");
       this.ledger.append({
         kind: "evidence",
@@ -419,17 +437,7 @@ export class HuntController {
         },
       });
 
-      // A link to a hypothesis the worker invented would corrupt the contrarian
-      // quota, so only ids the ledger already knows are linked.
-      for (const [relation, ids] of [["supports", supports], ["weakens", weakens]] as const) {
-        for (const hypothesisId of ids ?? []) {
-          if (!known.has(hypothesisId)) continue;
-          this.ledger.append({
-            kind: "link",
-            link: { evidence_id: evidenceId, hypothesis_id: hypothesisId, relation },
-          });
-        }
-      }
+      this.link(evidenceId, supports, weakens);
     }
 
     for (const question of result.questions ?? []) {
@@ -437,7 +445,7 @@ export class HuntController {
         kind: "question",
         question: {
           question_id: newId("q", 4),
-          question,
+          question: sanitizeQuestion(question),
           status: "open",
           spawning_evidence_id: null,
         },
