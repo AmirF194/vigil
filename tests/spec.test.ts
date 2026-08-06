@@ -17,7 +17,7 @@ describe("the three layers", () => {
   it("merges arch, playbook and config into one spec", () => {
     expect(spec.arch).toBe("threathunt");
     expect(spec.hypotheses).toHaveLength(2);
-    expect(spec.tools.map((tool) => tool.id)).toEqual(["duckdb_query", "expand", "intel_lookup"]);
+    expect(spec.tools.map((tool) => tool.id)).toEqual(["duckdb_query", "expand", "intel_lookup", "web_intel"]);
     expect(spec.roles.lead.prompt).toContain("Hunt Lead");
     expect(spec.narrative).toContain("Frothly");
   });
@@ -39,7 +39,7 @@ describe("the three layers", () => {
   it("keeps the query tool off the lead and off threat intel", () => {
     expect(spec.roles.lead.tools).toEqual(["expand"]);
     expect(spec.roles.workers["network_analyst"]!.tools).toEqual(["duckdb_query"]);
-    expect(spec.roles.workers["threat_intel"]!.tools).toEqual(["intel_lookup"]);
+    expect(spec.roles.workers["threat_intel"]!.tools).toEqual(["intel_lookup", "web_intel"]);
   });
 
   it("rejects a key that belongs to a different layer", () => {

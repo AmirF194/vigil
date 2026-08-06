@@ -131,13 +131,19 @@ export interface Hypothesis {
   resolution_reason: string | null;
 }
 
+// A lead on the frontier. The three provenance fields are facts of capture and
+// are stored; everything the priority score derives from them is computed on read.
 export interface OpenQuestion {
   question_id: string;
   question: string;
   status: "open" | "closed";
   // The entity this lead is about, so a worker taking it is told what to look at.
   entity_key: string | null;
+  // Set when a decision cited one record; a worker's follow-up names its dispatch
+  // instead, because attributing it to a single record would be invented provenance.
   spawning_evidence_id: string | null;
+  spawning_dispatch_id: string | null;
+  spawned_iteration: number;
 }
 
 export interface EvidenceRecord {
@@ -303,6 +309,8 @@ export interface IterationResult {
   decision_id: string;
   cost_usd: number;
   evidence_appended: number;
+  // Records the controller enriched in on its own, spending no decision on them.
+  enriched: number;
   hunt_status: HuntStatus;
   hunt_outcome: HuntOutcome | null;
   note: string;

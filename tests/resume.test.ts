@@ -78,7 +78,7 @@ describe("reap", () => {
     const questionId = newId("q", 4);
     ledger.append({
       kind: "question",
-      question: { question_id: questionId, question: "check 10.0.0.1", status: "open", entity_key: null, spawning_evidence_id: null },
+      question: { question_id: questionId, question: "check 10.0.0.1", status: "open", entity_key: null, spawning_evidence_id: null, spawning_dispatch_id: null, spawned_iteration: 1 },
     });
     ledger.patch("question", questionId, { status: "closed" });
     ledger.append({

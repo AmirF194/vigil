@@ -2,6 +2,7 @@
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline/promises";
 import { HuntController, resumeHunt, startHunt } from "../ai/loop.js";
+import { createEnricher } from "../ai/enrich.js";
 import { LlmDecisionProvider, LlmWorkerDispatcher } from "../ai/llm.js";
 import { Lease } from "../ai/lease.js";
 import { steer } from "../ai/inbox.js";
@@ -66,19 +67,44 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
 
 // Carries observables and a payload rather than a bare sentence, and couples them
 // to the hunt's own seed, so --scripted exercises extraction, the graph, pivot
-// candidates and EXPAND rather than skipping all of them.
+// candidates, EXPAND and the enrichment chains rather than skipping any of them.
 function scriptedEvidence(spec: HuntSpec) {
   const seed = (spec.scope["entity"] as Entity | undefined)?.value ?? "10.0.0.5";
   return {
     source_system: "scripted",
     summary: `scripted: ${seed} reached cdn.example.com and 45.77.53.176, no telemetry was queried`,
-    payload: { rows: [{ src_ip: seed, dest_ip: "45.77.53.176", dest_host: "cdn.example.com", connections: 412 }] },
+    payload: {
+      rows: [
+        { src_ip: seed, dest_ip: "45.77.53.176", dest_host: "cdn.example.com", process: "powershell.exe", connections: 412 },
+      ],
+    },
     salience: "routine" as const,
     why_notable: "",
     provenance: "scripted",
     attacker_influenceable: false,
     instruction_like: false,
   };
+}
+
+// Answers every chain the config declares, so --scripted exercises the depth
+// bound, the once-per-entity rule and the value guard without a database.
+function scriptedEnricher(spec: HuntSpec) {
+  const chains = spec.enrichment.chains;
+  if (chains.length === 0) return undefined;
+
+  return async (entity: Entity) =>
+    chains
+      .filter((chain) => chain.on === entity.type)
+      .map((chain) => ({
+        source_system: chain.id,
+        summary: `${chain.id} on ${entity.type}:${entity.value}: scripted, no query was run`,
+        payload: { chain: chain.id, entity: `${entity.type}:${entity.value}`, result: "scripted" },
+        salience: "routine" as const,
+        why_notable: `deterministic ${chain.id} enrichment; no one chose to run it`,
+        provenance: `enrichment:${chain.id}`,
+        attacker_influenceable: true,
+        instruction_like: false,
+      }));
 }
 
 // Investigate for the whole run rather than concluding at once, so --scripted
@@ -131,6 +157,7 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
         new ScriptedWorkerDispatcher([scriptedEvidence(spec)]),
         spec.dispatch,
         spec.digest,
+        scriptedEnricher(spec),
       )
     : new HuntController(
         ledger,
@@ -138,6 +165,7 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
         new LlmWorkerDispatcher(spec, tools),
         spec.dispatch,
         spec.digest,
+        createEnricher(spec, tools),
       );
 
   const reaped = controller.reap();
@@ -152,8 +180,9 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
     for (let turn = 0; turn < Number(values.iterations); turn += 1) {
       const result = await controller.advanceIteration();
       const outcome = result.hunt_outcome === null ? "" : ` (${result.hunt_outcome})`;
+      const enriched = result.enriched === 0 ? "" : ` enriched+${result.enriched}`;
       console.log(
-        `  [${result.iteration}] ${result.action.padEnd(12)} evidence+${result.evidence_appended}` +
+        `  [${result.iteration}] ${result.action.padEnd(12)} evidence+${result.evidence_appended}${enriched}` +
           `  $${result.cost_usd.toFixed(4)}  ${result.hunt_status}${outcome}`,
       );
       if (result.hunt_status === "terminal") break;

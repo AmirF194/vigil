@@ -78,10 +78,10 @@ wrong one is a load error, so there is no precedence chain to reason about.
 |---|---|---|
 | `arch/threathunt.yaml` | the lead, the worker registry, their prompts and output schemas, `dispatch`, `digest` | operator |
 | `frothly.yaml` (`--workflow`) | hypotheses, ATT&CK mapping, data domains, scope, `directives`, narrative | uploadable |
-| `vigil.config.yaml` | `model`, `rates`, `budgets`, `runtime`, `tools` | operator |
+| `vigil.config.yaml` | `model`, `rates`, `budgets`, `runtime`, `tools`, `enrichment` | operator |
 
 The playbook is the only layer meant to be handed around, and it deliberately
-cannot declare a schema, a tool, a model, or a budget. Its `directives` are
+cannot declare a schema, a tool, a model, a budget, or an enrichment chain. Its `directives` are
 appended per role to the arch prompt rather than replacing it: the arch says how
 to reason about any dataset, the playbook says what this one is.
 
@@ -162,6 +162,53 @@ intact. The digest shows the focus and its graph neighbours under
 `Where a pivot could go`, so a PIVOT names something the evidence has seen rather
 than inventing a value.
 
+## The frontier
+
+Open leads are ranked, not queued. The priority score is a fold over the ledger —
+novelty against the execution log (no closed lead covered the same entity), how
+many live hypotheses the spawning evidence bears on, that evidence's salience, and
+how recently the lead was raised. `fanOut` takes the top `max_workers` and the
+digest lists them in the same order, so the lead reads the frontier the workers
+will actually take.
+
+The score is never stored. A written-down score is stale the moment the next
+dispatch lands; what is stored on each lead is only what was true when it was
+raised — its entity, the dispatch or record that spawned it, and the iteration.
+
+## ABANDON
+
+Dropping a branch is the decision an adversary most wants the hunt to make, and
+the evidence it would rest on is exactly what an adversary can write. So an
+`ABANDON` must name the hypothesis or entity it is dropping, and **at least one
+record it cites must be neither attacker-influenceable nor instruction-like** —
+a feed label, a page, a process name and every auto-enriched record are all
+attacker-nameable, so none of them can clear a branch alone. A rejection goes back
+to the lead through the same bounded re-ask as any other invalid decision.
+
+What survives is `parked` with the reason and the citations on it, never
+`disproven`: the hunt stopped looking, which is not a clearing. Naming an entity
+takes its leads off the frontier instead.
+
+## Enrichment chains
+
+Some follow-ups have a fixed shape — seeing a process always warrants asking what
+launched it and who signed it. Those are declared in the config as read-only
+queries the controller runs itself, with no model in the loop, so they **cost no
+iteration**. Each round enriches only the entities the previous round introduced,
+bounded by `max_depth` and `max_entities`, and an entity is never enriched twice
+even across a resume.
+
+Results append through the same path as worker evidence — sanitized, entities
+extracted, `provenance: enrichment:<chain>` — which is also the log. They are
+marked attacker-influenceable, because they are raw telemetry, so an enriched
+signing cert can never on its own carry an ABANDON.
+
+The placeholder is interpolated into SQL, so the value is escaped as a string
+literal and values carrying a quote character of the other kind are skipped
+rather than templated. `assertReadOnly` refuses a second statement independently.
+Chains live in the config and not the playbook: nothing uploadable may hand the
+controller a query it runs unsupervised.
+
 ## EXPAND
 
 `EXPAND` cites evidence ids, returns their raw payloads, and **does not consume an
@@ -219,6 +266,14 @@ BOTSv3 is from 2018 and ThreatFox is a rolling recent window, so the live feed
 will not match that dataset; point `feed` at a seeded local export to exercise
 the worker against it.
 
+`web_intel` searches published reporting through Firecrawl, for context an
+indicator feed cannot give. It is the most injection-prone input the hunt takes —
+unlike telemetry this is prose an author wrote to be read as instruction, and it
+reaches a worker before any evidence sanitizing runs — so results are scrubbed and
+capped at the tool boundary and rendered inside `<vigil:web>` with the data-not-
+direction reminder. `FIRECRAWL_API_KEY` comes from the environment; without it the
+tool builds and fails per call as a gap.
+
 ## The evidence boundary
 
 Worker output is model text derived from attacker-controlled telemetry, so the
@@ -260,17 +315,19 @@ the digest rules, and both are already data.
 |---|---|
 | `ai/loop.ts` | the controller: read → decide → dispatch → persist |
 | `ai/ledger.ts` | append-only JSONL and its projection |
-| `ai/digest.ts` | ledger → what the lead sees: salience floor, resurfacing, compression, contrarian quota |
+| `ai/digest.ts` | ledger → what the lead sees: salience floor, resurfacing, compression, contrarian quota, frontier ranking |
 | `ai/entities.ts` | key-aware extraction at capture, and the entity graph behind its port |
 | `ai/tlds.ts` | the vendored IANA TLD set |
 | `ai/llm.ts` | `input()`, `output_schema()`, `llm_output()`, and the two role implementations |
 | `ai/limiter.ts` | RPM/TPM buckets, concurrency gate, jittered backoff |
 | `ai/spec.ts` | the three YAML layers, their merge, and the worker registry |
+| `ai/enrich.ts` | the declared chains: value escaping, templating, one call per entity |
 | `ai/sanitize.ts` | the worker evidence boundary |
 | `ai/lease.ts` | per-hunt lockfile so one process advances a ledger |
 | `ai/inbox.ts` | the operator directive queue |
 | `tools/duckdb.ts` | read-only SQL over the telemetry |
 | `tools/threatfox.ts` | the indicator feed behind `intel_lookup` |
+| `tools/firecrawl.ts` | published reporting behind `web_intel`, scrubbed at the boundary |
 
 The dataset used by `frothly.yaml` is Splunk BOTSv3 converted to DuckDB
 (1.94M events). Point `tools[].database` wherever yours lives; the DuckDB tests

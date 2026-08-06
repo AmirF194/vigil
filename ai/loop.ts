@@ -1,11 +1,18 @@
 import { join } from "node:path";
-import { buildDigest, focusOf } from "./digest.js";
+import { buildDigest, focusOf, rankFrontier } from "./digest.js";
 import { buildEntityGraph, entitiesOf, key } from "./entities.js";
 import { drain } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
-import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
+import type { DecisionProvider, Enricher, WorkerDispatcher } from "./ports.js";
 import { sanitize, sanitizeQuestion } from "./sanitize.js";
-import { DEFAULT_DIGEST, DEFAULT_DISPATCH, type DigestPolicy, type DispatchPolicy, type HuntSpec } from "./spec.js";
+import {
+  DEFAULT_DIGEST,
+  DEFAULT_DISPATCH,
+  DEFAULT_ENRICHMENT,
+  type DigestPolicy,
+  type DispatchPolicy,
+  type HuntSpec,
+} from "./spec.js";
 import {
   ACTIONS_REQUIRING_CITATION,
   DECISION_ACTIONS,
@@ -16,9 +23,12 @@ import {
   type DispatchRequest,
   type DispatchResult,
   type Entity,
+  type EvidenceRecord,
   type Expansion,
   type HuntOutcome,
   type IterationResult,
+  type OpenQuestion,
+  type WorkerEvidence,
 } from "./types.js";
 
 export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
@@ -57,6 +67,11 @@ export function validateDecision(decision: Decision, projection: Projection): vo
     throw new InvalidDecision(`no such worker ${agentId}; the registry declares ${Object.keys(workers).sort().join(", ")}`);
   }
 
+  const hypothesisId = decision.target_hypothesis_id;
+  if (hypothesisId !== undefined && hypothesisId !== null && !projection.hypotheses.has(hypothesisId)) {
+    throw new InvalidDecision(`no such hypothesis ${hypothesisId}`);
+  }
+
   // Citations before focus: a decision resting on evidence that does not exist
   // is wrong about the data, which is worth saying before it is wrong about a verb.
   if (ACTIONS_REQUIRING_CITATION.has(decision.action)) {
@@ -70,6 +85,26 @@ export function validateDecision(decision: Decision, projection: Projection): vo
     }
   }
   validateFocus(decision, projection);
+  if (decision.action === "ABANDON") validateAbandon(decision, projection);
+}
+
+// Dropping a branch is the one decision an adversary most wants the hunt to make,
+// and the evidence it would rest on is exactly what an adversary can write. So a
+// branch may not be abandoned on attacker-authored grounds alone.
+function validateAbandon(decision: Decision, projection: Projection): void {
+  if (!decision.target_hypothesis_id && !decision.target_entity) {
+    throw new InvalidDecision("ABANDON must name the hypothesis or entity it is dropping");
+  }
+
+  const cited = (decision.evidence_citations ?? [])
+    .map((id) => projection.evidence.get(id))
+    .filter((record): record is EvidenceRecord => record !== undefined);
+
+  if (!cited.some((record) => !record.attacker_influenceable && !record.instruction_like)) {
+    throw new InvalidDecision(
+      "every record ABANDON cites is attacker-influenceable; cite at least one whose content an adversary could not have authored",
+    );
+  }
 }
 
 // DEEPEN keeps the current entity and hypothesis; PIVOT changes at least one.
@@ -164,7 +199,14 @@ export class HuntController {
     private readonly dispatcher?: WorkerDispatcher | undefined,
     private readonly policy: DispatchPolicy = DEFAULT_DISPATCH,
     private readonly digestPolicy: DigestPolicy = DEFAULT_DIGEST,
+    private readonly enricher?: Enricher | undefined,
   ) {}
+
+  // Read from the journaled spec rather than passed in: the chains a hunt runs
+  // were fixed when it started, and resume must not pick up an edited config.
+  private get enrichment() {
+    return this.ledger.projection.hunt.spec.enrichment ?? DEFAULT_ENRICHMENT;
+  }
 
   async advanceIteration(): Promise<IterationResult> {
     if (this.ledger.projection.hunt.status === "terminal") {
@@ -182,7 +224,7 @@ export class HuntController {
     const { presented, result } = await this.decide(digest, projection);
 
     const dispatchResults = await this.runDispatches(iteration, result.decision);
-    return this.write(iteration, presented, result, dispatchResults);
+    return await this.write(iteration, presented, result, dispatchResults);
   }
 
   // A rejection is a correctable mistake, not a lost iteration: the Hunt Lead is
@@ -287,16 +329,7 @@ export class HuntController {
     for (const directive of drain(this.ledger)) {
       if (directive.kind === "abort") abort = true;
       if (directive.kind !== "lead") continue;
-      this.ledger.append({
-        kind: "question",
-        question: {
-          question_id: newId("q", 4),
-          question: directive.text,
-          status: "open",
-          entity_key: null,
-          spawning_evidence_id: null,
-        },
-      });
+      this.raise(directive.text, { spawned_iteration: this.ledger.projection.hunt.iteration + 1 });
     }
     if (abort) this.terminate("aborted");
     return abort;
@@ -311,6 +344,7 @@ export class HuntController {
       decision_id: "",
       cost_usd: 0,
       evidence_appended: 0,
+      enriched: 0,
       hunt_status: hunt.status,
       hunt_outcome: hunt.outcome,
       note: "aborted by operator directive",
@@ -356,8 +390,7 @@ export class HuntController {
     const projection = this.ledger.projection;
     const targets: FanOutTarget[] =
       this.policy.fan_out_over === "questions"
-        ? [...projection.questions.values()]
-            .filter((question) => question.status === "open")
+        ? rankFrontier(projection, projection.hunt.iteration + 1)
             .map((question) => ({
               // A lead carries the entity it is about, so the worker is told what
               // to look at rather than inferring it from prose.
@@ -376,27 +409,60 @@ export class HuntController {
     return targets.length === 0 ? fallback : targets.slice(0, this.policy.max_workers);
   }
 
-  // PIVOT is a move of attention, not a query: it puts its new target on the
-  // frontier and lets the next INVESTIGATE pick it up from there.
-  private pivot(decision: Decision): void {
-    const target = decision.target_entity ?? decision.target_hypothesis_id ?? "";
+  // One appender for every lead, so the priority features are always populated:
+  // a lead with no provenance is a lead the frontier cannot rank.
+  private raise(question: string, provenance: Partial<Omit<OpenQuestion, "question_id" | "question" | "status">>): void {
     this.ledger.append({
       kind: "question",
       question: {
         question_id: newId("q", 4),
-        question: decision.query_intent || `pursue ${target}: ${decision.rationale}`,
+        question,
         status: "open",
-        entity_key: decision.target_entity ?? null,
-        spawning_evidence_id: decision.evidence_citations?.[0] ?? null,
+        entity_key: null,
+        spawning_evidence_id: null,
+        spawning_dispatch_id: null,
+        spawned_iteration: 0,
+        ...provenance,
       },
     });
+  }
+
+  // PIVOT is a move of attention, not a query: it puts its new target on the
+  // frontier and lets the next INVESTIGATE pick it up from there.
+  private pivot(iteration: number, decision: Decision): void {
+    const target = decision.target_entity ?? decision.target_hypothesis_id ?? "";
+    this.raise(decision.query_intent || `pursue ${target}: ${decision.rationale}`, {
+      entity_key: decision.target_entity ?? null,
+      spawning_evidence_id: decision.evidence_citations?.[0] ?? null,
+      spawned_iteration: iteration,
+    });
+  }
+
+  // Parked rather than disproven: the hunt stopped looking, which is not the same
+  // as having cleared the branch. validateAbandon has already established that
+  // the grounds are not attacker-authored alone.
+  private abandon(decision: Decision): void {
+    const reason = `abandoned at the Hunt Lead's decision: ${decision.rationale} [${(decision.evidence_citations ?? []).join(", ")}]`;
+    if (decision.target_hypothesis_id) {
+      this.ledger.patch("hypothesis", decision.target_hypothesis_id, { status: "parked", resolution_reason: reason });
+    }
+
+    for (const question of this.ledger.projection.questions.values()) {
+      if (question.status === "open" && question.entity_key !== null && question.entity_key === decision.target_entity) {
+        this.ledger.patch("question", question.question_id, { status: "closed" });
+      }
+    }
   }
 
   // DEEPEN dispatches like INVESTIGATE; validateFocus has already established
   // that it kept the focus, so the only difference is what the worker is told.
   private async runDispatches(iteration: number, decision: Decision): Promise<DispatchResult[]> {
     if (decision.action === "PIVOT") {
-      this.pivot(decision);
+      this.pivot(iteration, decision);
+      return [];
+    }
+    if (decision.action === "ABANDON") {
+      this.abandon(decision);
       return [];
     }
     const dispatches = decision.action === "INVESTIGATE" || decision.action === "DEEPEN";
@@ -454,12 +520,12 @@ export class HuntController {
     );
   }
 
-  private write(
+  private async write(
     iteration: number,
     digest: Digest,
     result: DecisionResult,
     dispatchResults: readonly DispatchResult[],
-  ): IterationResult {
+  ): Promise<IterationResult> {
     const decisionId = newId("dec");
     this.ledger.append({
       kind: "decision",
@@ -478,10 +544,8 @@ export class HuntController {
       cost_usd: Number((hunt.cost_usd + result.cost_usd).toFixed(6)),
     });
 
-    const appended = dispatchResults.reduce(
-      (total, dispatchResult) => total + this.persistDispatch(iteration, dispatchResult),
-      0,
-    );
+    const appended = dispatchResults.flatMap((dispatchResult) => this.persistDispatch(iteration, dispatchResult));
+    const enriched = await this.enrich(iteration, appended.flatMap((record) => record.entities));
 
     let note = "";
     if (result.decision.action === "CONCLUDE") {
@@ -498,7 +562,8 @@ export class HuntController {
       action: result.decision.action,
       decision_id: decisionId,
       cost_usd: result.cost_usd,
-      evidence_appended: appended,
+      evidence_appended: appended.length,
+      enriched,
       hunt_status: final.status,
       hunt_outcome: final.outcome,
       note,
@@ -517,12 +582,69 @@ export class HuntController {
     }
   }
 
-  private persistDispatch(iteration: number, result: DispatchResult): number {
+  // Shared by workers and by enrichment, so no evidence source can reach the
+  // ledger without sanitize() and entity extraction.
+  private appendEvidence(
+    records: readonly WorkerEvidence[],
+    iteration: number,
+    dispatchId: string | null,
+  ): EvidenceRecord[] {
+    return records.map(sanitize).map(({ supports, weakens, ...record }) => {
+      const evidenceId = newId("ev");
+      const stored: EvidenceRecord = {
+        ...record,
+        evidence_id: evidenceId,
+        dispatch_id: dispatchId,
+        iteration,
+        entities: entitiesOf(record),
+        captured_at: new Date().toISOString(),
+      };
+      this.ledger.append({ kind: "evidence", evidence: stored });
+      this.link(evidenceId, supports, weakens);
+      return stored;
+    });
+  }
+
+  // Read-only follow-up on the entities this iteration introduced. Deterministic,
+  // so it costs no decision — only rounds, breadth and the once-per-entity rule
+  // bound it. Dedup is on the entity alone because the enricher runs every chain
+  // that applies to one, so an enriched entity has had all of its chains run.
+  private async enrich(iteration: number, seed: readonly Entity[]): Promise<number> {
+    const enricher = this.enricher;
+    if (enricher === undefined) return 0;
+    const { max_depth, max_entities } = this.enrichment;
+
+    let frontier = seed;
+    let total = 0;
+
+    for (let depth = 0; depth < max_depth && frontier.length > 0; depth += 1) {
+      const done = this.enrichedEntities();
+      const fresh = new Map(frontier.map((entity) => [key(entity), entity] as const));
+      const pending = [...fresh].filter(([id]) => !done.has(id)).slice(0, max_entities);
+      if (pending.length === 0) break;
+
+      const records = (await Promise.all(pending.map(([, entity]) => enricher(entity)))).flat();
+      const appended = this.appendEvidence(records, iteration, null);
+      total += appended.length;
+      frontier = appended.flatMap((record) => record.entities);
+    }
+    return total;
+  }
+
+  private enrichedEntities(): Set<string> {
+    const done = new Set<string>();
+    for (const record of this.ledger.projection.evidence.values()) {
+      if (record.provenance.startsWith("enrichment:")) done.add(String(record.payload["entity"] ?? ""));
+    }
+    return done;
+  }
+
+  private persistDispatch(iteration: number, result: DispatchResult): EvidenceRecord[] {
     // Idempotency on dispatch_id: a retried dispatch re-delivers the same
     // evidence, and appending it twice would inflate corroboration counts. Keyed
     // on the dispatch row rather than a scan for its evidence, so a dispatch that
     // legitimately found nothing is still settled exactly once.
-    if (this.ledger.projection.dispatches.get(result.dispatch_id)?.status !== "pending") return 0;
+    if (this.ledger.projection.dispatches.get(result.dispatch_id)?.status !== "pending") return [];
 
     // A failed worker is evidence about visibility, not a lost turn.
     const records = result.failed
@@ -540,35 +662,12 @@ export class HuntController {
         ]
       : result.evidence;
 
-    // Sanitized here rather than in the dispatcher, so no WorkerDispatcher can
-    // put unescaped text into the digest by omitting the step.
-    for (const { supports, weakens, ...record } of records.map(sanitize)) {
-      const evidenceId = newId("ev");
-      this.ledger.append({
-        kind: "evidence",
-        evidence: {
-          ...record,
-          evidence_id: evidenceId,
-          dispatch_id: result.dispatch_id,
-          iteration,
-          entities: entitiesOf(record),
-          captured_at: new Date().toISOString(),
-        },
-      });
-
-      this.link(evidenceId, supports, weakens);
-    }
+    const appended = this.appendEvidence(records, iteration, result.dispatch_id);
 
     for (const question of result.questions ?? []) {
-      this.ledger.append({
-        kind: "question",
-        question: {
-          question_id: newId("q", 4),
-          question: sanitizeQuestion(question),
-          status: "open",
-          entity_key: null,
-          spawning_evidence_id: null,
-        },
+      this.raise(sanitizeQuestion(question), {
+        spawning_dispatch_id: result.dispatch_id,
+        spawned_iteration: iteration,
       });
     }
 
@@ -576,7 +675,9 @@ export class HuntController {
       status: result.failed ? "failed" : "complete",
       failure_reason: result.failed ? result.failure_reason : null,
     });
-    return result.failed ? 0 : records.length;
+    // A gap record is a fact about visibility, not a finding, so it counts as
+    // neither evidence appended nor something worth enriching.
+    return result.failed ? [] : appended;
   }
 
   // Unresolved hypotheses become inconclusive, never disproven: the hunt

@@ -40,7 +40,25 @@ export interface Runtime {
   lease_ttl_ms: number;
 }
 
-export const TOOL_KINDS = new Set(["duckdb", "expand", "threatfox"]);
+export const TOOL_KINDS = new Set(["duckdb", "expand", "threatfox", "firecrawl"]);
+
+// A read-only follow-up with a fixed shape: seeing this entity type always
+// warrants this query, so the controller runs it without spending a decision.
+export interface EnrichmentChain {
+  id: string;
+  on: EntityType;
+  tool: string;
+  query: string;
+}
+
+export interface EnrichmentPolicy {
+  // Rounds within one iteration; round n enriches what round n-1 introduced.
+  max_depth: number;
+  max_entities: number;
+  chains: EnrichmentChain[];
+}
+
+export const DEFAULT_ENRICHMENT: EnrichmentPolicy = { max_depth: 1, max_entities: 8, chains: [] };
 
 export interface ToolSpec {
   id: string;
@@ -101,6 +119,10 @@ export interface Config {
   budgets: Budgets;
   runtime: Runtime;
   tools: ToolSpec[];
+  // Here rather than in the arch because a chain's SQL is a fact about this
+  // deployment's schema, and because a playbook is uploadable: nothing uploaded
+  // may hand the controller a query it runs with no model in the loop.
+  enrichment: EnrichmentPolicy;
 }
 
 export interface HuntSpec extends Config, Omit<Playbook, "directives"> {
@@ -122,7 +144,7 @@ const PLAYBOOK_KEYS = new Set([
   "directives",
   "narrative",
 ]);
-const CONFIG_KEYS = new Set(["model", "rates", "budgets", "runtime", "tools"]);
+const CONFIG_KEYS = new Set(["model", "rates", "budgets", "runtime", "tools", "enrichment"]);
 
 export const DEFAULT_MODEL = "openai/gpt-4o";
 export const DEFAULT_ARCH = packaged("arch/threathunt.yaml");
@@ -373,6 +395,46 @@ function parseTools(raw: unknown): ToolSpec[] {
   });
 }
 
+// The placeholder is required rather than optional: a chain without one runs the
+// same query for every entity, which is a hunt-wide query masquerading as a lookup.
+function parseChain(raw: unknown, index: number, declared: Set<string>): EnrichmentChain {
+  const record = asRecord(raw, `enrichment.chains[${index}]`);
+  const chain = { id: str(record["id"]), on: str(record["on"]), tool: str(record["tool"]), query: str(record["query"]) };
+
+  for (const [field, value] of Object.entries(chain)) {
+    if (value.trim() === "") throw new SpecError(`enrichment.chains[${index}] needs a ${field}`);
+  }
+  if (!(ENTITY_TYPES as readonly string[]).includes(chain.on)) {
+    throw new SpecError(`enrichment.chains[${index}].on is ${chain.on}; expected any of ${[...ENTITY_TYPES].sort().join(", ")}`);
+  }
+  if (!declared.has(chain.tool)) {
+    throw new SpecError(`enrichment.chains[${index}] names tool ${chain.tool}, which this config does not declare`);
+  }
+  if (!chain.query.includes("{{value}}")) {
+    throw new SpecError(`enrichment.chains[${index}].query must interpolate {{value}}`);
+  }
+  return { ...chain, on: chain.on as EntityType };
+}
+
+function parseEnrichment(raw: unknown, declared: Set<string>): EnrichmentPolicy {
+  const record = asRecord(raw, "enrichment");
+  const policy = { ...DEFAULT_ENRICHMENT, ...record } as EnrichmentPolicy;
+
+  for (const field of ["max_depth", "max_entities"] as const) {
+    if (!Number.isInteger(policy[field]) || policy[field] < 1) {
+      throw new SpecError(`enrichment.${field} must be a positive integer, got ${String(policy[field])}`);
+    }
+  }
+  if (record["chains"] !== undefined && !Array.isArray(record["chains"])) {
+    throw new SpecError("enrichment.chains must be a list");
+  }
+  const chains = (record["chains"] as unknown[] | undefined ?? []).map((entry, index) => parseChain(entry, index, declared));
+
+  const duplicate = chains.find((chain, index) => chains.findIndex((other) => other.id === chain.id) !== index);
+  if (duplicate !== undefined) throw new SpecError(`enrichment declares chain ${duplicate.id} twice`);
+  return { ...policy, chains };
+}
+
 function parseRates(raw: unknown, model: string): Rates {
   const record = asRecord(raw, "rates");
   const rates = { input: Number(record["input"]), output: Number(record["output"]) };
@@ -385,12 +447,14 @@ function parseRates(raw: unknown, model: string): Rates {
 export function parseConfig(text: string): Config {
   const [front] = layer(text, CONFIG_KEYS, "config");
   const model = str(front["model"]) || DEFAULT_MODEL;
+  const tools = parseTools(front["tools"]);
   return {
     model,
     rates: parseRates(front["rates"], model),
     budgets: parseBudgets(front["budgets"]),
     runtime: parseRuntime(front["runtime"]),
-    tools: parseTools(front["tools"]),
+    tools,
+    enrichment: parseEnrichment(front["enrichment"], new Set(tools.map((tool) => tool.id))),
   };
 }
 

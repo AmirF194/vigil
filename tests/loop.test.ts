@@ -46,7 +46,7 @@ describe("ledger", () => {
     const before = readFileSync(ledger.path, "utf8");
     ledger.append({
       kind: "question",
-      question: { question_id: newId("q", 4), question: "which host?", status: "open", entity_key: null, spawning_evidence_id: null },
+      question: { question_id: newId("q", 4), question: "which host?", status: "open", entity_key: null, spawning_evidence_id: null, spawning_dispatch_id: null, spawned_iteration: 1 },
     });
     const after = readFileSync(ledger.path, "utf8");
 
@@ -241,12 +241,14 @@ describe("fan-out", () => {
     }
   }
 
+  // Ordered ids, because these leads are identical in every priority feature and
+  // the frontier breaks that tie on the id.
   function withQuestions(questions: string[]): Ledger {
     const ledger = ledgerFor();
-    for (const question of questions) {
+    for (const [index, question] of questions.entries()) {
       ledger.append({
         kind: "question",
-        question: { question_id: newId("q", 4), question, status: "open", entity_key: null, spawning_evidence_id: null },
+        question: { question_id: `q-${index}`, question, status: "open", entity_key: null, spawning_evidence_id: null, spawning_dispatch_id: null, spawned_iteration: 1 },
       });
     }
     return ledger;

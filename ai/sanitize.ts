@@ -32,7 +32,9 @@ function clamp(text: string, cap: number): string {
   return text.length <= cap ? text : `${text.slice(0, cap)} [truncated ${text.length - cap} chars]`;
 }
 
-function scrub(text: string, cap: number): string {
+// Exported for the tool boundary: retrieved web content reaches a worker's
+// context before any of this runs on the evidence it emits.
+export function scrub(text: string, cap: number): string {
   // Control characters other than tab and newline render as nothing, which is
   // exactly what makes them useful for hiding text from a human reviewer.
   const stripped = text.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");

@@ -28,3 +28,28 @@ tools:
   - id: intel_lookup
     kind: threatfox
     feed: https://threatfox.abuse.ch/export/json/recent/
+  # Published reporting on an observable. FIRECRAWL_API_KEY comes from the
+  # environment; without it the tool builds and fails per call as a gap.
+  - id: web_intel
+    kind: firecrawl
+    limit: 3
+
+# Lookups with a fixed shape, run by the controller with no model in the loop, so
+# they cost no iteration. Here rather than in the arch because the SQL is a fact
+# about this deployment's schema, and because nothing uploadable may declare one.
+enrichment:
+  max_depth: 2
+  max_entities: 8
+  chains:
+    - id: process_lineage
+      on: process
+      tool: duckdb_query
+      # Sysmon lineage lives in the raw XML; win_events maps only Image to a column.
+      query: |
+        SELECT regexp_extract(_raw, 'Name=''ParentImage''>([^<]*)', 1) AS parent_process,
+               regexp_extract(_raw, 'Name=''Company''>([^<]*)', 1) AS signer,
+               regexp_extract(_raw, 'Name=''Hashes''>([^<]*)', 1) AS hashes,
+               count(*) AS starts, count(DISTINCT computer) AS hosts
+        FROM win_events
+        WHERE event_code = 1 AND lower(process) = lower('{{value}}')
+        GROUP BY 1, 2, 3 ORDER BY starts DESC LIMIT 5

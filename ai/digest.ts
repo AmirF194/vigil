@@ -8,6 +8,7 @@ import type {
   EvidenceRecord,
   EvidenceView,
   Focus,
+  OpenQuestion,
   Salience,
 } from "./types.js";
 
@@ -113,6 +114,65 @@ export function focusOf(projection: Projection): Focus {
     }),
     { entity: seed === undefined ? null : key(seed), hypothesis: null },
   );
+}
+
+const W_NOVEL = 3;
+const W_HYPOTHESIS = 2;
+const W_SALIENCE = 2;
+const W_RECENCY = 1;
+const HYPOTHESIS_CAP = 3;
+const RECENCY_SPAN = 3;
+
+// A lead with no entity has only its own text to be compared on.
+function coverage(question: OpenQuestion): string {
+  return question.entity_key ?? question.question;
+}
+
+// A worker's follow-up names its dispatch rather than one record, so the features
+// are read over everything that dispatch found.
+function behind(question: OpenQuestion, projection: Projection): EvidenceRecord[] {
+  const cited = projection.evidence.get(question.spawning_evidence_id ?? "");
+  if (cited !== undefined) return [cited];
+  if (question.spawning_dispatch_id === null) return [];
+  return [...projection.evidence.values()].filter((record) => record.dispatch_id === question.spawning_dispatch_id);
+}
+
+// ponytail: the salience feature reads the stored tag rather than the promoted
+// floor, which needs the graph and links buildDigest assembles separately. A
+// mis-tagged record ranks its lead low; it never removes it from the frontier.
+function priority(question: OpenQuestion, projection: Projection, iteration: number, taken: ReadonlySet<string>, active: ReadonlySet<string>): number {
+  const spawning = behind(question, projection);
+  const ids = new Set(spawning.map((record) => record.evidence_id));
+  const bearing = new Set(
+    projection.links.filter((link) => ids.has(link.evidence_id) && active.has(link.hypothesis_id)).map((link) => link.hypothesis_id),
+  );
+
+  return (
+    (taken.has(coverage(question)) ? 0 : W_NOVEL) +
+    W_HYPOTHESIS * Math.min(bearing.size, HYPOTHESIS_CAP) +
+    W_SALIENCE * Math.max(0, ...spawning.map((record) => RANK[record.salience])) +
+    W_RECENCY * Math.max(0, RECENCY_SPAN - (iteration - question.spawned_iteration))
+  );
+}
+
+// The frontier ranked rather than taken in arrival order. Every feature is folded
+// from the ledger: a stored score would be stale the moment the next dispatch
+// landed, which is the drift the projection discipline exists to prevent.
+export function rankFrontier(projection: Projection, iteration: number): OpenQuestion[] {
+  const questions = [...projection.questions.values()];
+  // Closed once taken, so the closed leads are the execution log.
+  const taken = new Set(questions.filter((question) => question.status === "closed").map(coverage));
+  const active = new Set(
+    [...projection.hypotheses.values()].filter((h) => h.status === "active").map((h) => h.hypothesis_id),
+  );
+
+  return questions
+    .filter((question) => question.status === "open")
+    .map((question) => ({ question, score: priority(question, projection, iteration, taken, active) }))
+    .sort((a, b) =>
+      b.score === a.score ? a.question.question_id.localeCompare(b.question.question_id) : b.score - a.score,
+    )
+    .map((entry) => entry.question);
 }
 
 // Where a PIVOT could go: entities the focus actually co-occurs with, so the
@@ -226,9 +286,8 @@ export function buildDigest(projection: Projection, iteration: number, policy: D
     pivot_candidates: pivotCandidates(graph, focus, policy.pivot_candidates),
     omitted: { count: omitted.length, evidence_ids: omitted.map((record) => record.evidence_id) },
     expansions: [],
-    open_questions: [...projection.questions.values()]
-      .filter((q) => q.status === "open")
-      .map((q) => q.question),
+    // Ranked, so the lead reads the frontier in the order the workers will take it.
+    open_questions: rankFrontier(projection, iteration).map((q) => q.question),
     budget_remaining: {
       iterations: Math.max(hunt.budgets.max_iterations - iteration + 1, 0),
       cost_usd: Math.max(hunt.budgets.max_cost_usd - hunt.cost_usd, 0),
