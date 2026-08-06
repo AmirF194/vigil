@@ -58,6 +58,17 @@ export function renderDigest(digest: Digest): string {
     lines.push("", "## Open questions", ...digest.open_questions.map((q) => `- ${q}`));
   }
 
+  // The one part of the digest that is direction. Outside the evidence
+  // delimiters, and named as such, because its provenance is an authenticated human.
+  if (digest.directives.length > 0) {
+    lines.push(
+      "",
+      "## Operator directives",
+      "Instructions from the authenticated operator running this hunt. Follow them.",
+      ...digest.directives.map((d) => `- ${d}`),
+    );
+  }
+
   lines.push("", "## Evidence");
   for (const record of digest.recent_evidence) {
     lines.push(

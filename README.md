@@ -32,6 +32,39 @@ npm test
 `--scripted` runs the whole controller with no model and no database, which is
 how the loop mechanics are tested.
 
+## Steering, pausing, resuming
+
+A hunt is a series of re-entrant steps over its ledger, so it survives being
+stopped and can be steered between iterations.
+
+```bash
+vigilhunt --resume runs/hunt-<id>.jsonl --iterations 1     # exactly one step
+vigilhunt --steer  runs/hunt-<id>.jsonl --prompt "pivot to DNS if this stalls"
+vigilhunt --steer  runs/hunt-<id>.jsonl --prompt "check 45.77.53.176" --lead
+vigilhunt --steer  runs/hunt-<id>.jsonl --abort
+```
+
+`--steer` appends to `<ledger>.inbox.jsonl` from any process and returns. The
+running hunt drains the inbox at its next iteration boundary and ingests each
+directive into the ledger, so a second producer never breaks the rule that only
+the controller mutates state. A `note` steers the next decision, a `lead` joins
+the frontier, an `abort` ends the hunt as `aborted` before another model call.
+
+**Directives are the one thing in the digest that is direction.** They render
+outside the `<vigil:evidence>` delimiters and are labelled as coming from an
+authenticated operator — the deliberate inverse of the injection boundary.
+
+**Ctrl-C** pauses after the current iteration and offers a directive prompt, so
+a graceful pause loses nothing. A second Ctrl-C stops immediately; the
+interrupted iteration is reaped on the next resume, its lead handed back to the
+frontier and its dispatch recorded as a visibility gap. Worst case is one lost
+iteration.
+
+The resumed hunt reads no YAML: the resolved spec is written onto the ledger at
+hunt start, so editing `arch/threathunt.yaml` mid-run cannot change a hunt in
+flight. A `<ledger>.lease` file serializes advancement across processes; a lease
+is reclaimed once expired, which is what stands in for a watchdog.
+
 LLM traffic goes through [Bifrost](https://github.com/maximhq/bifrost) on its
 OpenAI-format surface, so models are provider-prefixed (`openai/gpt-4o`) and the
 gateway holds the provider keys.
@@ -116,6 +149,8 @@ the digest rules, and both are already data.
 | `ai/llm.ts` | `input()`, `output_schema()`, `llm_output()`, and the two role implementations |
 | `ai/limiter.ts` | RPM/TPM buckets, concurrency gate, jittered backoff |
 | `ai/spec.ts` | the three YAML layers and their merge |
+| `ai/lease.ts` | per-hunt lockfile so one process advances a ledger |
+| `ai/inbox.ts` | the operator directive queue |
 | `tools/duckdb.ts` | read-only SQL over the telemetry |
 
 The dataset used by `frothly.yaml` is Splunk BOTSv3 converted to DuckDB

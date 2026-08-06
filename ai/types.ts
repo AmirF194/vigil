@@ -1,3 +1,6 @@
+// Type-only, so the cycle with spec.ts is erased at compile time.
+import type { HuntSpec } from "./spec.js";
+
 export const SCHEMA_VERSION = 1;
 
 export type DecisionAction =
@@ -69,11 +72,24 @@ export interface Entity {
   value: string;
 }
 
+// Human input, and the one thing in the ledger that is direction rather than
+// data. Applied by the controller at an iteration boundary, never written as state.
+export type DirectiveKind = "note" | "lead" | "abort";
+
+export interface Directive {
+  directive_id: string;
+  actor: string;
+  kind: DirectiveKind;
+  text: string;
+  created_at: string;
+}
+
 export interface HuntState {
   hunt_id: string;
   name: string;
-  // Which architecture produced these decisions; the digest and vocabulary depend on it.
-  arch: string;
+  // Resolved once at hunt start: resume needs no YAML, and editing an arch file
+  // mid-run cannot silently change what a hunt in flight was told.
+  spec: HuntSpec;
   status: HuntStatus;
   outcome: HuntOutcome | null;
   iteration: number;
@@ -130,6 +146,8 @@ export interface DispatchRecord {
   status: "pending" | "complete" | "failed";
   query_intent: string;
   target_hypothesis_id: string | null;
+  // The lead this dispatch took, so an interrupted one can hand it back.
+  question_id: string | null;
   failure_reason: string | null;
 }
 
@@ -186,6 +204,8 @@ export interface Digest {
   weakens: Record<string, EvidenceView[]>;
   open_questions: string[];
   budget_remaining: { iterations: number; cost_usd: number };
+  // Operator instructions. Unlike evidence, these are direction.
+  directives: string[];
   notes: string[];
 }
 

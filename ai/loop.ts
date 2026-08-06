@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { buildDigest } from "./digest.js";
+import { drain } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
 import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
 import { DEFAULT_DIGEST, DEFAULT_DISPATCH, type DigestPolicy, type DispatchPolicy, type HuntSpec } from "./spec.js";
@@ -51,7 +52,7 @@ export function startHunt(spec: HuntSpec, dir: string): Ledger {
   const ledger = Ledger.create(join(dir, `${huntId}.jsonl`), {
     hunt_id: huntId,
     name: spec.name,
-    arch: spec.arch,
+    spec,
     status: "active",
     outcome: null,
     iteration: 0,
@@ -79,6 +80,15 @@ export function startHunt(spec: HuntSpec, dir: string): Ledger {
   return ledger;
 }
 
+// The ledger is the resume point: the spec came with it, so nothing is re-read
+// from disk and a mid-run edit to an arch file cannot change a hunt in flight.
+export function resumeHunt(path: string): { ledger: Ledger; spec: HuntSpec } {
+  const ledger = Ledger.open(path);
+  const { hunt } = ledger.projection;
+  if (hunt.status === "terminal") throw new HuntAlreadyTerminal(`${hunt.hunt_id} already ended as ${hunt.outcome}`);
+  return { ledger, spec: hunt.spec };
+}
+
 export class HuntController {
   constructor(
     private readonly ledger: Ledger,
@@ -89,11 +99,15 @@ export class HuntController {
   ) {}
 
   async advanceIteration(): Promise<IterationResult> {
-    const projection = this.ledger.projection;
-    if (projection.hunt.status === "terminal") {
-      throw new HuntAlreadyTerminal(`${projection.hunt.hunt_id} already ended as ${projection.hunt.outcome}`);
+    if (this.ledger.projection.hunt.status === "terminal") {
+      const hunt = this.ledger.projection.hunt;
+      throw new HuntAlreadyTerminal(`${hunt.hunt_id} already ended as ${hunt.outcome}`);
     }
 
+    // Human input is integrated at the boundary, before anything is decided on it.
+    if (this.applyDirectives()) return this.aborted();
+
+    const projection = this.ledger.projection;
     const iteration = projection.hunt.iteration + 1;
     const digest = buildDigest(projection, iteration, this.digestPolicy.evidence_window);
 
@@ -102,6 +116,62 @@ export class HuntController {
 
     const dispatchResults = await this.runDispatches(iteration, result.decision);
     return this.write(iteration, digest, result, dispatchResults);
+  }
+
+  // Returns true when a directive ended the hunt. A lead becomes a real lead; a
+  // note only reaches the digest, so it steers without mutating anything.
+  private applyDirectives(): boolean {
+    let abort = false;
+    for (const directive of drain(this.ledger)) {
+      if (directive.kind === "abort") abort = true;
+      if (directive.kind !== "lead") continue;
+      this.ledger.append({
+        kind: "question",
+        question: {
+          question_id: newId("q", 4),
+          question: directive.text,
+          status: "open",
+          spawning_evidence_id: null,
+        },
+      });
+    }
+    if (abort) this.terminate("aborted");
+    return abort;
+  }
+
+  private aborted(): IterationResult {
+    const hunt = this.ledger.projection.hunt;
+    return {
+      hunt_id: hunt.hunt_id,
+      iteration: hunt.iteration,
+      action: "CONCLUDE",
+      decision_id: "",
+      cost_usd: 0,
+      evidence_appended: 0,
+      hunt_status: hunt.status,
+      hunt_outcome: hunt.outcome,
+      note: "aborted by operator directive",
+    };
+  }
+
+  // A crash between journaling a dispatch and recording its result leaves a lead
+  // closed but unanswered. Reaping hands it back and records the gap.
+  reap(): number {
+    const stale = [...this.ledger.projection.dispatches.values()].filter(
+      (dispatch) => dispatch.status === "pending",
+    );
+    for (const dispatch of stale) {
+      this.persistDispatch(dispatch.iteration, {
+        dispatch_id: dispatch.dispatch_id,
+        evidence: [],
+        failed: true,
+        failure_reason: "interrupted before the worker returned",
+      });
+      if (dispatch.question_id !== null) {
+        this.ledger.patch("question", dispatch.question_id, { status: "open" });
+      }
+    }
+    return stale.length;
   }
 
   // One worker per open lead, capped. Serial is simply max_workers of 1, so
@@ -150,13 +220,11 @@ export class HuntController {
 
     // Closed once taken, not once answered: a lead left open would be re-issued
     // every iteration, and a failed one is already recorded as a visibility gap.
-    for (const { questionId } of targets) {
+    // Written before the workers run, so an interrupted dispatch leaves a pending
+    // row that reap() can hand its lead back from.
+    for (const [index, request] of requests.entries()) {
+      const questionId = targets[index]?.questionId ?? null;
       if (questionId !== null) this.ledger.patch("question", questionId, { status: "closed" });
-    }
-
-    // Written before the workers run, so a crash mid-dispatch leaves pending
-    // rows rather than no trace at all.
-    for (const request of requests) {
       this.ledger.append({
         kind: "dispatch",
         dispatch: {
@@ -166,6 +234,7 @@ export class HuntController {
           status: "pending",
           query_intent: request.focus ? `${request.query_intent} — ${request.focus}` : request.query_intent,
           target_hypothesis_id: request.target_hypothesis_id,
+          question_id: questionId,
           failure_reason: null,
         },
       });

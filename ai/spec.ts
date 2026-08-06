@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
+import { DEFAULT_LEASE_TTL_MS } from "./lease.js";
 import { DECISION_ACTIONS, DEFAULT_BUDGETS, type Budgets, type Entity } from "./types.js";
 
 export class SpecError extends Error {}
@@ -27,6 +28,8 @@ export interface Runtime {
   concurrency: number;
   rate_limit: RateLimit;
   retry_attempts: number;
+  // Must exceed a single iteration's wall time, or a live hunt loses its own lease.
+  lease_ttl_ms: number;
 }
 
 export interface ToolSpec {
@@ -111,6 +114,7 @@ export const DEFAULT_RUNTIME: Runtime = {
   concurrency: 4,
   rate_limit: { rpm: 60, tpm: 200_000 },
   retry_attempts: 3,
+  lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
 };
 
 export const DEFAULT_DISPATCH: DispatchPolicy = { mode: "serial", fan_out_over: "questions", max_workers: 1 };

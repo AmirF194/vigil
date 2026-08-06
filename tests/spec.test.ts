@@ -109,6 +109,7 @@ describe("digest rendering", () => {
       weakens: { "h-1": [] },
       open_questions: [],
       budget_remaining: { iterations: 5, cost_usd: 1 },
+      directives: ["alice: pivot to DNS if this stalls"],
       notes: [],
     };
 
@@ -116,5 +117,10 @@ describe("digest rendering", () => {
     expect(rendered).toContain('<vigil:evidence id="ev-1"');
     expect(rendered).toContain("</vigil:evidence>");
     expect(rendered).toContain("nothing yet weakens this");
+
+    // Operator directives are direction; evidence is data. They must not share a block.
+    const directives = rendered.indexOf("## Operator directives");
+    expect(directives).toBeGreaterThan(-1);
+    expect(directives).toBeLessThan(rendered.indexOf("<vigil:evidence"));
   });
 });

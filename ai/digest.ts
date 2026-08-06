@@ -7,6 +7,7 @@ import type {
 } from "./types.js";
 
 export const DEFAULT_EVIDENCE_WINDOW = 25;
+const DIRECTIVE_WINDOW = 5;
 
 const RANK: Record<Salience, number> = { routine: 0, notable: 1, anomalous: 2 };
 
@@ -114,6 +115,10 @@ export function buildDigest(
       iterations: Math.max(hunt.budgets.max_iterations - iteration + 1, 0),
       cost_usd: Math.max(hunt.budgets.max_cost_usd - hunt.cost_usd, 0),
     },
+    directives: projection.directives
+      .filter((directive) => directive.kind === "note")
+      .slice(-DIRECTIVE_WINDOW)
+      .map((directive) => `${directive.actor}: ${directive.text}`),
     notes,
   };
 }

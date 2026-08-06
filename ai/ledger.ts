@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import {
   SCHEMA_VERSION,
   type DecisionRecord,
+  type Directive,
   type DispatchRecord,
   type EvidenceLink,
   type EvidenceRecord,
@@ -22,6 +23,7 @@ export type LedgerBody =
   | { kind: "link"; link: EvidenceLink }
   | { kind: "dispatch"; dispatch: DispatchRecord }
   | { kind: "decision"; decision: DecisionRecord }
+  | { kind: "directive"; directive: Directive }
   | { kind: "patch"; target: PatchTarget; id: string; fields: Record<string, unknown> };
 
 export type LedgerEvent = LedgerBody & {
@@ -38,6 +40,7 @@ export interface Projection {
   links: EvidenceLink[];
   dispatches: Map<string, DispatchRecord>;
   decisions: DecisionRecord[];
+  directives: Directive[];
 }
 
 export function newId(prefix: string, bytes = 6): string {
@@ -112,6 +115,7 @@ export function fold(events: readonly LedgerEvent[]): Projection {
     links: [],
     dispatches: new Map(),
     decisions: [],
+    directives: [],
   };
 
   for (const event of events.slice(1)) {
@@ -135,6 +139,9 @@ export function fold(events: readonly LedgerEvent[]): Projection {
         break;
       case "decision":
         view.decisions.push(structuredClone(event.decision));
+        break;
+      case "directive":
+        view.directives.push(structuredClone(event.directive));
         break;
       case "patch":
         applyPatch(view, event);
