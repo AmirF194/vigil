@@ -1,0 +1,28 @@
+{
+  "name": "vigil-ai-loop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Generalized YAML-driven agent loop with an append-only ledger, routed via Bifrost",
+  "bin": {
+    "vigilhunt": "cli/vigilhunt.ts"
+  },
+  "scripts": {
+    "hunt": "tsx cli/vigilhunt.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.5-r.3",
+    "ajv": "^8.17.1",
+    "openai": "^4.77.0",
+    "p-limit": "^6.2.0",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

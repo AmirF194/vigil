@@ -1,0 +1,289 @@
+import { join } from "node:path";
+import { buildDigest } from "./digest.js";
+import { Ledger, newId, type Projection } from "./ledger.js";
+import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
+import type { HuntSpec } from "./spec.js";
+import {
+  ACTIONS_REQUIRING_CITATION,
+  DECISION_ACTIONS,
+  OUTCOME_PRECEDENCE,
+  type Decision,
+  type DecisionResult,
+  type Digest,
+  type DispatchRequest,
+  type DispatchResult,
+  type HuntOutcome,
+  type IterationResult,
+} from "./types.js";
+
+export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
+
+export class HuntAlreadyTerminal extends Error {}
+export class InvalidDecision extends Error {}
+
+// The controller rejects anything outside the closed vocabulary, so the Hunt
+// Lead cannot widen its own action space by emitting a new verb.
+export function validateDecision(decision: Decision, projection: Projection): void {
+  if (!DECISION_ACTIONS.includes(decision.action)) {
+    throw new InvalidDecision(`unknown action ${String(decision.action)}`);
+  }
+  if (!ACTIONS_REQUIRING_CITATION.has(decision.action)) return;
+
+  const citations = decision.evidence_citations ?? [];
+  if (citations.length === 0) {
+    throw new InvalidDecision(`${decision.action} must cite the evidence it rests on`);
+  }
+  const unknown = citations.filter((id) => !projection.evidence.has(id));
+  if (unknown.length > 0) {
+    throw new InvalidDecision(`${decision.action} cites unknown evidence: ${unknown.join(", ")}`);
+  }
+}
+
+export function startHunt(spec: HuntSpec, dir: string): Ledger {
+  const now = new Date().toISOString();
+  const huntId = newId("hunt");
+  const ledger = Ledger.create(join(dir, `${huntId}.jsonl`), {
+    hunt_id: huntId,
+    name: spec.name,
+    status: "active",
+    outcome: null,
+    iteration: 0,
+    cost_usd: 0,
+    budgets: spec.budgets,
+    scope: spec.scope,
+    narrative: spec.narrative,
+    created_at: now,
+    terminated_at: null,
+  });
+
+  for (const [index, statement] of spec.hypotheses.entries()) {
+    ledger.append({
+      kind: "hypothesis",
+      hypothesis: {
+        hypothesis_id: newId("h", 4),
+        statement,
+        status: "active",
+        attack_technique: spec.attack_techniques[index] ?? null,
+        provenance: "hunt_spec",
+        resolution_reason: null,
+      },
+    });
+  }
+  return ledger;
+}
+
+export class HuntController {
+  constructor(
+    private readonly ledger: Ledger,
+    private readonly provider: DecisionProvider,
+    private readonly dispatcher?: WorkerDispatcher | undefined,
+    private readonly dispatchIdFactory: () => string = () => newId("dsp"),
+  ) {}
+
+  async advanceIteration(): Promise<IterationResult> {
+    const projection = this.ledger.projection;
+    if (projection.hunt.status === "terminal") {
+      throw new HuntAlreadyTerminal(`${projection.hunt.hunt_id} already ended as ${projection.hunt.outcome}`);
+    }
+
+    const iteration = projection.hunt.iteration + 1;
+    const digest = buildDigest(projection, iteration);
+
+    const result = await this.provider.decide(digest);
+    validateDecision(result.decision, projection);
+
+    const dispatchResult = await this.runDispatch(iteration, result.decision);
+    return this.write(iteration, digest, result, dispatchResult);
+  }
+
+  private async runDispatch(
+    iteration: number,
+    decision: Decision,
+  ): Promise<DispatchResult | null> {
+    if (decision.action !== "INVESTIGATE" || this.dispatcher === undefined) return null;
+
+    const request: DispatchRequest = {
+      dispatch_id: this.dispatchIdFactory(),
+      hunt_id: this.ledger.projection.hunt.hunt_id,
+      agent_id: decision.worker_agent_id ?? DEFAULT_WORKER_AGENT_ID,
+      query_intent: decision.query_intent || decision.rationale,
+      target_hypothesis_id: decision.target_hypothesis_id ?? null,
+      scope: this.ledger.projection.hunt.scope,
+    };
+
+    // Written before the worker runs, so a crash mid-dispatch leaves a pending
+    // row rather than no trace at all.
+    this.ledger.append({
+      kind: "dispatch",
+      dispatch: {
+        dispatch_id: request.dispatch_id,
+        iteration,
+        agent_id: request.agent_id,
+        status: "pending",
+        query_intent: request.query_intent,
+        target_hypothesis_id: request.target_hypothesis_id,
+        failure_reason: null,
+      },
+    });
+
+    try {
+      return await this.dispatcher.dispatch(request);
+    } catch (error) {
+      return {
+        dispatch_id: request.dispatch_id,
+        evidence: [],
+        failed: true,
+        failure_reason: (error as Error).message,
+      };
+    }
+  }
+
+  private write(
+    iteration: number,
+    digest: Digest,
+    result: DecisionResult,
+    dispatchResult: DispatchResult | null,
+  ): IterationResult {
+    const decisionId = newId("dec");
+    this.ledger.append({
+      kind: "decision",
+      decision: {
+        ...result,
+        decision_id: decisionId,
+        iteration,
+        digest_presented: digest,
+        created_at: new Date().toISOString(),
+      },
+    });
+
+    const hunt = this.ledger.projection.hunt;
+    this.ledger.patch("hunt", hunt.hunt_id, {
+      iteration,
+      cost_usd: Number((hunt.cost_usd + result.cost_usd).toFixed(6)),
+    });
+
+    const appended = dispatchResult === null ? 0 : this.persistDispatch(iteration, dispatchResult);
+
+    let note = "";
+    if (result.decision.action === "CONCLUDE") {
+      this.terminate("completed");
+    } else if (this.budgetExhausted()) {
+      this.terminate("budget_terminated");
+      note = "budget exhausted";
+    }
+
+    const final = this.ledger.projection.hunt;
+    return {
+      hunt_id: final.hunt_id,
+      iteration,
+      action: result.decision.action,
+      decision_id: decisionId,
+      cost_usd: result.cost_usd,
+      evidence_appended: appended,
+      hunt_status: final.status,
+      hunt_outcome: final.outcome,
+      note,
+    };
+  }
+
+  private persistDispatch(iteration: number, result: DispatchResult): number {
+    // Idempotency on dispatch_id: a retried dispatch re-delivers the same
+    // evidence, and appending it twice would inflate corroboration counts.
+    const already = [...this.ledger.projection.evidence.values()].some(
+      (record) => record.dispatch_id === result.dispatch_id,
+    );
+    if (already) {
+      this.ledger.patch("dispatch", result.dispatch_id, { status: "complete" });
+      return 0;
+    }
+
+    // A failed worker is evidence about visibility, not a lost turn.
+    const records = result.failed
+      ? [
+          {
+            source_system: "dispatcher",
+            summary: `worker failed: ${result.failure_reason}`,
+            payload: {},
+            salience: "routine" as const,
+            why_notable: "a query the hunt wanted could not be run",
+            provenance: "tool_failure",
+            attacker_influenceable: false,
+            instruction_like: false,
+          },
+        ]
+      : result.evidence;
+
+    const known = this.ledger.projection.hypotheses;
+    for (const { supports, weakens, ...record } of records) {
+      const evidenceId = newId("ev");
+      this.ledger.append({
+        kind: "evidence",
+        evidence: {
+          ...record,
+          evidence_id: evidenceId,
+          dispatch_id: result.dispatch_id,
+          iteration,
+          captured_at: new Date().toISOString(),
+        },
+      });
+
+      // A link to a hypothesis the worker invented would corrupt the contrarian
+      // quota, so only ids the ledger already knows are linked.
+      for (const [relation, ids] of [["supports", supports], ["weakens", weakens]] as const) {
+        for (const hypothesisId of ids ?? []) {
+          if (!known.has(hypothesisId)) continue;
+          this.ledger.append({
+            kind: "link",
+            link: { evidence_id: evidenceId, hypothesis_id: hypothesisId, relation },
+          });
+        }
+      }
+    }
+
+    for (const question of result.questions ?? []) {
+      this.ledger.append({
+        kind: "question",
+        question: {
+          question_id: newId("q", 4),
+          question,
+          status: "open",
+          spawning_evidence_id: null,
+        },
+      });
+    }
+
+    this.ledger.patch("dispatch", result.dispatch_id, {
+      status: result.failed ? "failed" : "complete",
+      failure_reason: result.failed ? result.failure_reason : null,
+    });
+    return result.failed ? 0 : records.length;
+  }
+
+  // Unresolved hypotheses become inconclusive, never disproven: the hunt
+  // stopped looking, which is not the same as having cleared them.
+  terminate(outcome: HuntOutcome): void {
+    const hunt = this.ledger.projection.hunt;
+    if (hunt.outcome !== null && OUTCOME_PRECEDENCE[hunt.outcome] >= OUTCOME_PRECEDENCE[outcome]) return;
+
+    for (const hypothesis of this.ledger.projection.hypotheses.values()) {
+      if (hypothesis.status !== "active") continue;
+      this.ledger.patch("hypothesis", hypothesis.hypothesis_id, {
+        status: "inconclusive",
+        resolution_reason: `hunt ended (${outcome}) with the hypothesis unresolved`,
+      });
+    }
+
+    this.ledger.patch("hunt", hunt.hunt_id, {
+      status: "terminal",
+      outcome,
+      terminated_at: new Date().toISOString(),
+    });
+  }
+
+  private budgetExhausted(): boolean {
+    const hunt = this.ledger.projection.hunt;
+    return (
+      hunt.iteration >= hunt.budgets.max_iterations || hunt.cost_usd >= hunt.budgets.max_cost_usd
+    );
+  }
+}
