@@ -46,7 +46,13 @@ describe("ledger", () => {
     const before = readFileSync(ledger.path, "utf8");
     ledger.append({
       kind: "question",
-      question: { question_id: newId("q", 4), question: "which host?", status: "open", spawning_evidence_id: null },
+      question: {
+        question_id: newId("q", 4),
+        question: "which host?",
+        status: "open",
+        spawning_evidence_id: null,
+        hypothesis_id: null,
+      },
     });
     const after = readFileSync(ledger.path, "utf8");
 
@@ -127,6 +133,132 @@ describe("controller", () => {
     expect(() =>
       validateDecision({ action: "ABANDON", rationale: "no", evidence_citations: ["ev-nope"] }, ledger.projection),
     ).toThrow(/unknown evidence/);
+  });
+});
+
+describe("what an iteration costs", () => {
+  it("charges the workers, not only the Hunt Lead", async () => {
+    const ledger = ledgerFor();
+    const result = await new HuntController(
+      ledger,
+      new ScriptedDecisionProvider([INVESTIGATE], 0.05),
+      new ScriptedWorkerDispatcher([], [], 0.2),
+    ).advanceIteration();
+
+    // The workers are the larger share of a real hunt, so a budget that only
+    // sees the lead is not a budget.
+    expect(result.cost_usd).toBeCloseTo(0.25, 10);
+    expect(ledger.projection.hunt.cost_usd).toBeCloseTo(0.25, 10);
+    expect([...ledger.projection.dispatches.values()][0]!.cost_usd).toBeCloseTo(0.2, 10);
+    // The decision record still carries what the decision cost.
+    expect(ledger.projection.decisions[0]!.cost_usd).toBeCloseTo(0.05, 10);
+  });
+
+  it("charges a worker that failed, and records what it ran", async () => {
+    const ledger = ledgerFor();
+    const failing: WorkerDispatcher = {
+      async dispatch(request) {
+        return {
+          dispatch_id: request.dispatch_id,
+          evidence: [],
+          failed: true,
+          failure_reason: "gateway unreachable",
+          cost_usd: 0.11,
+          calls: [{ tool: "duckdb_query", arguments: '{"sql":"select 1"}', result: "1 row(s)" }],
+        };
+      },
+    };
+
+    await new HuntController(ledger, new ScriptedDecisionProvider([INVESTIGATE]), failing).advanceIteration();
+
+    const dispatch = [...ledger.projection.dispatches.values()][0]!;
+    expect(ledger.projection.hunt.cost_usd).toBeCloseTo(0.11, 10);
+    expect(dispatch.status).toBe("failed");
+    expect(dispatch.calls[0]!.result).toBe("1 row(s)");
+  });
+
+  it("keeps the spend of a worker that threw", async () => {
+    const ledger = ledgerFor();
+    const exploding: WorkerDispatcher = {
+      async dispatch() {
+        throw Object.assign(new Error("died mid-loop"), { cost_usd: 0.07 });
+      },
+    };
+
+    await new HuntController(ledger, new ScriptedDecisionProvider([INVESTIGATE]), exploding).advanceIteration();
+    expect(ledger.projection.hunt.cost_usd).toBeCloseTo(0.07, 10);
+  });
+});
+
+describe("dispatch idempotency", () => {
+  // Answers under the dispatch_id it was first given, whatever it is asked
+  // again with: a retry re-delivering the same evidence is the case the
+  // idempotency guard exists for.
+  class Redelivering implements WorkerDispatcher {
+    private first: string | null = null;
+    constructor(private readonly failFirst = false) {}
+
+    async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+      const dispatchId = (this.first ??= request.dispatch_id);
+      const failing = this.failFirst && dispatchId === request.dispatch_id;
+      if (failing) return { dispatch_id: dispatchId, evidence: [], failed: true, failure_reason: "timeout", cost_usd: 0 };
+
+      return {
+        dispatch_id: dispatchId,
+        evidence: [
+          {
+            source_system: "duckdb",
+            summary: "one row",
+            payload: { rows: 1 },
+            salience: "routine",
+            why_notable: "",
+            provenance: "worker",
+            attacker_influenceable: false,
+            instruction_like: false,
+          },
+        ],
+        failed: false,
+        failure_reason: "",
+        cost_usd: 0,
+      };
+    }
+  }
+
+  it("does not duplicate evidence when the same dispatch is delivered twice", async () => {
+    const ledger = ledgerFor();
+    const controller = new HuntController(
+      ledger,
+      new ScriptedDecisionProvider([INVESTIGATE, INVESTIGATE]),
+      new Redelivering(),
+    );
+
+    await controller.advanceIteration();
+    const second = await controller.advanceIteration();
+
+    // Appending it twice would inflate corroboration counts.
+    expect(ledger.projection.evidence.size).toBe(1);
+    expect(second.evidence_appended).toBe(0);
+  });
+
+  it("lets a retry of a failed dispatch still bring something back", async () => {
+    const ledger = ledgerFor();
+    const controller = new HuntController(
+      ledger,
+      new ScriptedDecisionProvider([INVESTIGATE, INVESTIGATE]),
+      new Redelivering(true),
+    );
+
+    await controller.advanceIteration();
+    expect([...ledger.projection.dispatches.values()][0]!.status).toBe("failed");
+
+    // A gap record is not a delivery: a retry must not be mistaken for evidence
+    // already on the record, or a failed dispatch could never be re-run.
+    await controller.advanceIteration();
+    expect([...ledger.projection.evidence.values()].map((entry) => entry.provenance)).toEqual([
+      "tool_failure",
+      "worker",
+    ]);
+    expect([...ledger.projection.dispatches.values()][0]!.status).toBe("complete");
   });
 });
 
@@ -237,6 +369,7 @@ describe("fan-out", () => {
         ],
         failed: false,
         failure_reason: "",
+        cost_usd: 0,
       };
     }
   }
@@ -246,7 +379,13 @@ describe("fan-out", () => {
     for (const question of questions) {
       ledger.append({
         kind: "question",
-        question: { question_id: newId("q", 4), question, status: "open", spawning_evidence_id: null },
+        question: {
+          question_id: newId("q", 4),
+          question,
+          status: "open",
+          spawning_evidence_id: null,
+          hypothesis_id: null,
+        },
       });
     }
     return ledger;

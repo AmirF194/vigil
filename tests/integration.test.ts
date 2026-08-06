@@ -56,9 +56,11 @@ function fakeGateway(hypothesisId: string, bodies: Body[]) {
         content: JSON.stringify({
           results: [
             {
+              source_system: "net_flow",
               summary: "192.168.70.186 beacons to 45.77.53.176:443 with 4.4s jitter over 2641 connections",
               salience: "anomalous",
               why_notable: "fixed-interval outbound to a host with no business relationship",
+              payload: { src_ip: "192.168.70.186", dest_ip: "45.77.53.176", beacons: 2641, jitter: 4.4 },
               supports: [hypothesisId],
             },
           ],
@@ -114,6 +116,18 @@ describe.skipIf(!existsSync(DATABASE))("hunt end to end (stubbed gateway, real e
 
     const evidence = [...ledger.projection.evidence.values()];
     expect(evidence[0]!.salience).toBe("anomalous");
+    // A declared domain, not the worker's name, and the rows behind the claim are
+    // on the record — the critic and expand both read this, not the summary.
+    expect(evidence[0]!.source_system).toBe("net_flow");
+    expect(evidence[0]!.payload["dest_ip"]).toBe("45.77.53.176");
+
+    // The worker's spend and the SQL it ran are on its dispatch row, so the
+    // budget counter sees the largest share of a real hunt's cost.
+    const dispatch = [...ledger.projection.dispatches.values()][0]!;
+    expect(dispatch.cost_usd).toBeGreaterThan(0);
+    expect(dispatch.calls[0]!.tool).toBe("duckdb_query");
+    expect(ledger.projection.hunt.cost_usd).toBeCloseTo(first.cost_usd, 10);
+    expect(first.cost_usd).toBeGreaterThan(ledger.projection.decisions[0]!.cost_usd);
     expect(ledger.projection.links).toEqual([
       { evidence_id: evidence[0]!.evidence_id, hypothesis_id: hypothesisId, relation: "supports" },
     ]);

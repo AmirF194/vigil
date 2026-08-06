@@ -3,7 +3,7 @@ import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { DEFAULT_LEASE_TTL_MS } from "./lease.js";
-import { DECISION_ACTIONS, DEFAULT_BUDGETS, type Budgets, type Entity } from "./types.js";
+import { EXECUTABLE_ACTIONS, DEFAULT_BUDGETS, type Budgets, type Entity } from "./types.js";
 
 export class SpecError extends Error {}
 
@@ -223,14 +223,16 @@ function parseDigest(raw: unknown): DigestPolicy {
 }
 
 // An arch may drop a verb its pipeline has no use for, but a verb the controller
-// cannot execute is a dead end the lead would keep choosing.
+// cannot execute is a dead end the lead would keep choosing: it would be
+// journaled, change nothing, and cost an iteration. Checked against what the
+// controller acts on, not against the vocabulary it can parse.
 function assertVocabulary(schema: Record<string, unknown>): void {
   const properties = asRecord(schema["properties"], "roles.lead.output_schema.properties");
   const declared = asRecord(properties["action"], "roles.lead.output_schema.properties.action")["enum"];
   if (!Array.isArray(declared) || declared.length === 0) {
     throw new SpecError("roles.lead.output_schema needs a non-empty action enum");
   }
-  const invented = declared.map(String).filter((action) => !(DECISION_ACTIONS as readonly string[]).includes(action));
+  const invented = declared.map(String).filter((action) => !(EXECUTABLE_ACTIONS as readonly string[]).includes(action));
   if (invented.length > 0) {
     throw new SpecError(`roles.lead declares action(s) the controller cannot run: ${invented.sort().join(", ")}`);
   }
@@ -408,6 +410,33 @@ function applyDirectives(roles: Roles, directives: Partial<Record<RoleName, stri
   return Object.fromEntries(applied) as Roles;
 }
 
+// Corroboration is counted over source systems, so the worker may not invent
+// one: a hunt that declares its telemetry domains gets them as the closed enum
+// the worker must answer in. Two labels for the same DuckDB file would otherwise
+// buy independence credit the data never earned.
+function narrowSources(roles: Roles, dataDomains: readonly string[]): Roles {
+  if (dataDomains.length === 0) return roles;
+
+  const schema = structuredClone(roles.worker.output_schema);
+  const results = asRecord(
+    asRecord(schema["properties"], "roles.worker.output_schema.properties")["results"],
+    "roles.worker.output_schema.properties.results",
+  );
+  const properties = asRecord(
+    asRecord(results["items"], "roles.worker.output_schema.properties.results.items")["properties"],
+    "roles.worker.output_schema.properties.results.items.properties",
+  );
+  if (properties["source_system"] === undefined) {
+    throw new SpecError(
+      "this playbook declares data_domains, so roles.worker.output_schema must declare " +
+        "results[].source_system for the worker to name the domain each finding came from",
+    );
+  }
+
+  properties["source_system"] = { ...asRecord(properties["source_system"], "source_system"), enum: [...dataDomains] };
+  return { ...roles, worker: { ...roles.worker, output_schema: schema } };
+}
+
 // The one place the three layers and the flags converge.
 export function buildSpec(options: {
   archPath?: string | undefined;
@@ -439,7 +468,10 @@ export function buildSpec(options: {
   return {
     ...config,
     arch: arch.name,
-    roles: applyDirectives(arch.roles, playbook.directives, new Set(config.tools.map((tool) => tool.id))),
+    roles: narrowSources(
+      applyDirectives(arch.roles, playbook.directives, new Set(config.tools.map((tool) => tool.id))),
+      playbook.data_domains,
+    ),
     dispatch: arch.dispatch,
     digest: arch.digest,
     name,

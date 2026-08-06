@@ -4,11 +4,22 @@ import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { Ledger, newId } from "../ai/ledger.js";
 import { HuntController, InvalidDecision, startHunt, validateDecision } from "../ai/loop.js";
-import { ScriptedDecisionProvider, ScriptedDisconfirmationCritic } from "../ai/scripted.js";
+import {
+  ScriptedDecisionProvider,
+  ScriptedDisconfirmationCritic,
+  type ScriptedDecision,
+} from "../ai/scripted.js";
 import { buildSpec, DEFAULT_VERDICTS, loadConfig, parseConfig, type Verdicts } from "../ai/spec.js";
 import { evidenceStrength, isGap, NULL_CHECK_PROVENANCE } from "../ai/strength.js";
 import type { DisconfirmationCritic } from "../ai/ports.js";
-import type { Decision, EvidenceRecord, LinkRelation, NullCheckInput } from "../ai/types.js";
+import type {
+  Decision,
+  Digest,
+  EvidenceRecord,
+  LinkRelation,
+  NullCheckInput,
+  NullCheckResult,
+} from "../ai/types.js";
 
 let dir: string;
 beforeEach(() => {
@@ -52,8 +63,11 @@ function evidenceOn(
 }
 
 // A query the hunt wanted and could not run, recorded the way a failed dispatch
-// records one: the gap is attributed through the dispatch it belonged to.
-function gapOn(ledger: Ledger, hypothesisId: string | null): void {
+// records one: the gap is attributed through the dispatch it belonged to, and
+// keyed by what went unanswered — so each distinct blind spot needs its own
+// intent, and a repeat of one is not a second gap.
+let unanswered = 0;
+function gapOn(ledger: Ledger, hypothesisId: string | null, intent = `question ${(unanswered += 1)}`): void {
   const dispatchId = newId("dsp");
   ledger.append({
     kind: "dispatch",
@@ -62,10 +76,12 @@ function gapOn(ledger: Ledger, hypothesisId: string | null): void {
       iteration: 1,
       agent_id: "threat_hunter",
       status: "failed",
-      query_intent: "characterise the source infrastructure",
+      query_intent: intent,
       target_hypothesis_id: hypothesisId,
       question_id: null,
       failure_reason: "timeout",
+      cost_usd: 0,
+      calls: [],
     },
   });
   ledger.append({
@@ -99,7 +115,7 @@ function validateOn(hypothesisId: string, citations: string[], extra: Partial<De
 
 function controllerFor(
   ledger: Ledger,
-  decisions: Decision[],
+  decisions: ScriptedDecision[],
   critic?: DisconfirmationCritic,
   costPerDecision = 0,
   verdicts: Verdicts = DEFAULT_VERDICTS,
@@ -272,6 +288,69 @@ describe("evidence_strength predicates", () => {
     expect(evidenceStrength(ledger.projection, hypothesisId).open_gaps).toBe(1);
     expect([...ledger.projection.evidence.values()].filter(isGap)).toHaveLength(2);
   });
+
+  it("counts a repeated failure of one query as one gap, not three", () => {
+    const { ledger, hypothesisId } = newLedger();
+    for (let attempt = 0; attempt < 3; attempt += 1) gapOn(ledger, hypothesisId, "the same question");
+
+    // Otherwise a flaky tool blinds a hypothesis it was only slow to answer.
+    expect(evidenceStrength(ledger.projection, hypothesisId).open_gaps).toBe(1);
+  });
+});
+
+describe("the argument has to be current", () => {
+  // Argues one way, then the other, so a second verdict cannot coast on the first.
+  class FlippingCritic implements DisconfirmationCritic {
+    private calls = 0;
+    async argueNull(): Promise<NullCheckResult> {
+      const survives = (this.calls += 1) === 1;
+      return {
+        survives,
+        strongest_benign_explanation: "a monitoring agent polling on a timer",
+        rationale: survives ? "does not account for it" : "accounts for all of it",
+        cost_usd: 0,
+        model_id: "scripted",
+        prompt_version: "scripted/v0",
+      };
+    }
+  }
+
+  it("refuses proven when the latest argument stands, whatever an earlier one said", async () => {
+    const { ledger, hypothesisId } = newLedger();
+    const first = [evidenceOn(ledger, hypothesisId, { source: "cloudtrail" })];
+
+    const controller = controllerFor(
+      ledger,
+      [
+        validateOn(hypothesisId, first),
+        // Cites what exists by then, which is more than the first pass argued over.
+        (digest: Digest) => validateOn(hypothesisId, digest.recent_evidence.map((record) => record.evidence_id)),
+      ],
+      new FlippingCritic(),
+    );
+
+    // Survives, but on one source, so it stays up for a second look.
+    await controller.advanceIteration();
+    evidenceOn(ledger, hypothesisId, { source: "duckdb" });
+    const second = await controller.advanceIteration();
+
+    expect(ledger.projection.hypotheses.get(hypothesisId)!.status).toBe("active");
+    expect(second.note).toMatch(/benign explanation was not ruled out/);
+    expect(evidenceStrength(ledger.projection, hypothesisId).survived_disconfirmation).toBe(false);
+  });
+
+  it("records what the critic was shown, so the verdict can be re-read", async () => {
+    const { ledger, hypothesisId } = newLedger();
+    const citations = [evidenceOn(ledger, hypothesisId, { source: "cloudtrail" })];
+
+    await controllerFor(
+      ledger,
+      [validateOn(hypothesisId, citations)],
+      new ScriptedDisconfirmationCritic(true),
+    ).advanceIteration();
+
+    expect(nullChecks(ledger)[0]!.payload["argued_evidence_ids"]).toEqual(citations);
+  });
 });
 
 describe("gap lock", () => {
@@ -283,7 +362,8 @@ describe("gap lock", () => {
     ];
     for (let gap = 0; gap < DEFAULT_VERDICTS.gap_lock_threshold; gap += 1) gapOn(ledger, hypothesisId);
 
-    // Everything else clears, so only the gaps can be what stopped it.
+    // Everything else clears, so only the gaps can be what stopped it. Three
+    // distinct questions, because a retry of one is one blind spot.
     await controllerFor(
       ledger,
       [validateOn(hypothesisId, citations)],

@@ -33,6 +33,12 @@ export const ACTIONS_REQUIRING_CITATION: ReadonlySet<DecisionAction> = new Set([
   "PIVOT",
 ]);
 
+// What the controller actually does something about. An arch may only declare
+// these: a verb that is merely in the vocabulary would burn an iteration and
+// change nothing, and the Hunt Lead would keep choosing it. Grows as the
+// controller learns a verb, which is the only place this list may change.
+export const EXECUTABLE_ACTIONS = ["INVESTIGATE", "VALIDATE", "CONCLUDE"] as const satisfies readonly DecisionAction[];
+
 export type HuntStatus = "pending_approval" | "active" | "terminal";
 
 export type HuntOutcome =
@@ -128,6 +134,9 @@ export interface OpenQuestion {
   question: string;
   status: "open" | "closed";
   spawning_evidence_id: string | null;
+  // The hypothesis this lead was opened in service of. Without it a lead that
+  // fails is a gap belonging to nothing, and no hypothesis is ever gap-locked.
+  hypothesis_id: string | null;
 }
 
 export interface EvidenceRecord {
@@ -152,6 +161,14 @@ export interface EvidenceLink {
   relation: LinkRelation;
 }
 
+// One tool invocation and what came back, capped. The execution log the audit
+// trail needs: a summary is the worker's account of the data, this is the data.
+export interface ToolCall {
+  tool: string;
+  arguments: string;
+  result: string;
+}
+
 export interface DispatchRecord {
   dispatch_id: string;
   iteration: number;
@@ -162,6 +179,10 @@ export interface DispatchRecord {
   // The lead this dispatch took, so an interrupted one can hand it back.
   question_id: string | null;
   failure_reason: string | null;
+  // What the worker spent and what it ran. Both land on the completion patch,
+  // since the row is journaled before the worker starts.
+  cost_usd: number;
+  calls: ToolCall[];
 }
 
 export interface Decision {
@@ -247,6 +268,10 @@ export interface DispatchResult {
   questions?: string[];
   failed: boolean;
   failure_reason: string;
+  // Required, including on the failure path: a worker that burned tokens and
+  // then died still spent them, and hunt.cost_usd is the budget counter.
+  cost_usd: number;
+  calls?: ToolCall[];
 }
 
 export interface NullCheckEvidence {
@@ -272,6 +297,7 @@ export interface NullCheckResult {
   rationale: string;
   cost_usd: number;
   model_id: string;
+  prompt_version: string;
 }
 
 export interface IterationResult {

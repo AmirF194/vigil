@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildSpec, DEFAULT_ARCH, loadArch, parseArch, parsePlaybook } from "../ai/spec.js";
 import { assertReadOnly, UnsafeQuery } from "../tools/duckdb.js";
 import { renderDigest } from "../ai/llm.js";
-import { DECISION_ACTIONS, type Digest } from "../ai/types.js";
+import { DECISION_ACTIONS, EXECUTABLE_ACTIONS, type Digest } from "../ai/types.js";
 
 // A minimal but valid arch, so a test can vary one thing at a time.
 function arch(roles: string): string {
@@ -61,12 +61,20 @@ describe("decision vocabulary", () => {
     expect(() => parseArch(arch(widened + WORKER))).toThrow(/cannot run: ESCALATE/);
   });
 
+  it("refuses a verb the vocabulary knows but the controller does not act on", () => {
+    // A journaled no-op costs an iteration and moves nothing, so it is refused at
+    // load rather than left for the lead to keep choosing.
+    const parseable = LEAD.replace("CONCLUDE]", "CONCLUDE, DEEPEN]");
+    expect(() => parseArch(arch(parseable + WORKER))).toThrow(/cannot run: DEEPEN/);
+    expect(DECISION_ACTIONS).toContain("DEEPEN");
+  });
+
   it("ships an arch that declares exactly what the controller implements", () => {
     const properties = loadArch(DEFAULT_ARCH).roles.lead.output_schema["properties"] as Record<
       string,
       { enum: string[] }
     >;
-    expect(properties["action"]!.enum).toEqual([...DECISION_ACTIONS]);
+    expect(properties["action"]!.enum).toEqual([...EXECUTABLE_ACTIONS]);
   });
 
   it("rejects a role with no prompt, and an unknown role", () => {

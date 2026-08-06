@@ -56,6 +56,7 @@ export class ScriptedWorkerDispatcher implements WorkerDispatcher {
   constructor(
     private readonly evidence: DispatchResult["evidence"] = [],
     failAgentIds: Iterable<string> = [],
+    private readonly costPerDispatch = 0,
   ) {
     this.failAgentIds = new Set(failAgentIds);
   }
@@ -68,6 +69,8 @@ export class ScriptedWorkerDispatcher implements WorkerDispatcher {
         evidence: [],
         failed: true,
         failure_reason: `scripted failure for ${request.agent_id}`,
+        // A worker that failed still ran, so the scripted one bills like it did.
+        cost_usd: this.costPerDispatch,
       };
     }
     return {
@@ -75,6 +78,7 @@ export class ScriptedWorkerDispatcher implements WorkerDispatcher {
       evidence: structuredClone(this.evidence),
       failed: false,
       failure_reason: "",
+      cost_usd: this.costPerDispatch,
     };
   }
 }
@@ -101,6 +105,7 @@ export class ScriptedDisconfirmationCritic implements DisconfirmationCritic {
         : "the benign explanation accounts for the linked evidence",
       cost_usd: this.costPerCheck,
       model_id: SCRIPTED_MODEL_ID,
+      prompt_version: "scripted/v0",
     };
   }
 }

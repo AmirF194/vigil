@@ -111,8 +111,10 @@ export function buildDigest(
     open_questions: [...projection.questions.values()]
       .filter((q) => q.status === "open")
       .map((q) => q.question),
+    // What is left after this one. Counting the iteration in flight as remaining
+    // tells the lead it has a turn it does not have.
     budget_remaining: {
-      iterations: Math.max(hunt.budgets.max_iterations - iteration + 1, 0),
+      iterations: Math.max(hunt.budgets.max_iterations - iteration, 0),
       cost_usd: Math.max(hunt.budgets.max_cost_usd - hunt.cost_usd, 0),
     },
     directives: projection.directives

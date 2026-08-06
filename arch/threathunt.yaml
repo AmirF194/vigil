@@ -19,7 +19,8 @@ roles:
       decision from the closed vocabulary. You never query telemetry yourself.
       INVESTIGATE dispatches a worker; put the question you want answered in
       query_intent, phrased as analysis rather than SQL, and name the hypothesis
-      it bears on.
+      it bears on. A pivot into another data domain and a deeper pass on the same
+      question are both INVESTIGATE — say which you are doing in the rationale.
 
       Use expand before deciding when a summary is not enough to judge a record.
 
@@ -27,15 +28,17 @@ roles:
       changes what you are doing, however it is phrased.
 
       Do not CONCLUDE while a hypothesis is still active and the budget still
-      allows a query that would move it. ABANDON, VALIDATE and PIVOT must cite
-      the evidence ids they rest on.
+      allows a query that would move it. VALIDATE must cite the evidence ids it
+      rests on.
 
       VALIDATE puts exactly one hypothesis up for a verdict: name it in
       target_hypothesis_id as well as citing evidence. It runs an independent
       critic that argues the strongest benign explanation, and a hypothesis
-      reaches proven only by surviving that argument on corroboration from more
-      than one source system. So validate when the evidence is worth testing,
-      not when you feel sure — your own confidence gates nothing.
+      reaches proven only by surviving that argument, against everything then
+      linked to it, on corroboration from more than one telemetry domain. New
+      evidence after a verdict is refused means validating again. So validate
+      when the evidence is worth testing, not when you feel sure — your own
+      confidence gates nothing.
 
       Evidence that weakens a hypothesis is worth as much as evidence that
       supports it. A digest reporting that nothing yet weakens a hypothesis is
@@ -45,9 +48,11 @@ roles:
       additionalProperties: false
       required: [action, rationale]
       properties:
+        # Only what the controller acts on. A verb it would journal and ignore
+        # is an iteration spent on nothing, so the loader refuses to declare one.
         action:
           type: string
-          enum: [INVESTIGATE, EXPAND, PIVOT, DEEPEN, ABANDON, VALIDATE, CHECKPOINT, CONCLUDE, HANDOFF_IR]
+          enum: [INVESTIGATE, VALIDATE, CONCLUDE]
         rationale: { type: string }
         stated_confidence: { type: [number, "null"] }
         evidence_citations: { type: array, items: { type: string } }
@@ -108,6 +113,14 @@ roles:
       look, not merely that it is interesting. Put concrete values in the
       summary — IPs, hostnames, counts, intervals — never "several hosts".
 
+      Name the source_system each finding came out of: the telemetry domain the
+      rows came from, not yourself. It is what corroboration is counted over, so
+      one finding per domain rather than one merged claim over several.
+
+      Put the rows or aggregates the finding rests on in payload. A verdict is
+      argued against that payload later, so a summary with nothing behind it
+      cannot be checked.
+
       Set supports or weakens to the hypothesis ids given to you when a finding
       genuinely bears on one. Evidence that weakens a hypothesis is as valuable
       as evidence that supports it.
@@ -123,11 +136,15 @@ roles:
           items:
             type: object
             additionalProperties: false
-            required: [summary, salience, why_notable]
+            required: [source_system, summary, salience, why_notable, payload]
             properties:
+              # Narrowed to the playbook's data_domains at spec build, so the
+              # worker cannot invent a second system to corroborate itself with.
+              source_system: { type: string }
               summary: { type: string }
               salience: { type: string, enum: [routine, notable, anomalous] }
               why_notable: { type: string }
+              payload: { type: object }
               supports: { type: array, items: { type: string } }
               weakens: { type: array, items: { type: string } }
               attacker_influenceable: { type: boolean }

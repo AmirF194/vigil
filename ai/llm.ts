@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import { Ajv, type ValidateFunction } from "ajv";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { estimateTokens, Limiter, statusOf } from "./limiter.js";
 import type { DecisionProvider, DisconfirmationCritic, WorkerDispatcher } from "./ports.js";
-import type { HuntSpec, Rates, RoleSpec } from "./spec.js";
+import type { HuntSpec, Rates, RoleName, RoleSpec } from "./spec.js";
 import { toOpenAITools, type Tool } from "./tools.js";
 import type {
   Decision,
@@ -14,12 +15,36 @@ import type {
   NullCheckInput,
   NullCheckResult,
   Salience,
+  ToolCall,
 } from "./types.js";
 
-export const PROMPT_VERSION = "hunt-lead/v1";
 const MAX_TOOL_TURNS = 12;
 
-export class LlmError extends Error {}
+// Enough to hold an aggregate result, not enough for one query to dominate the
+// ledger. Capped at capture, where the worker boundary already normalizes.
+const MAX_PAYLOAD_CHARS = 8_000;
+const MAX_TOOL_RESULT_CHARS = 4_000;
+
+// A snapshot naming "v1" while the prompt underneath it changes is not a
+// snapshot. The hash is over what the role was actually told.
+export function promptVersion(name: RoleName, role: RoleSpec): string {
+  return `${name}/${createHash("sha256").update(role.prompt).digest("hex").slice(0, 12)}`;
+}
+
+// Carries what was spent before it failed: a call that died mid-way still burned
+// tokens, and dropping the number is how a hunt overruns its budget quietly.
+export class LlmError extends Error {
+  constructor(
+    message: string,
+    readonly cost_usd = 0,
+  ) {
+    super(message);
+  }
+}
+
+function truncate(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit)}… [truncated from ${text.length} chars]`;
+}
 
 export function bifrostUrl(): string {
   return (process.env["BIFROST_URL"] ?? "http://localhost:8080").replace(/\/+$/, "");
@@ -41,7 +66,8 @@ export function costOf(rates: Rates, inputTokens: number, outputTokens: number):
 export function renderDigest(digest: Digest): string {
   const lines = [
     `# Hunt ${digest.hunt_id} — ${digest.hunt_name}`,
-    `iteration ${digest.iteration}; ${digest.budget_remaining.iterations} left, $${digest.budget_remaining.cost_usd.toFixed(2)} remaining`,
+    `iteration ${digest.iteration}; ${digest.budget_remaining.iterations} left after this one, ` +
+      `$${digest.budget_remaining.cost_usd.toFixed(2)} remaining`,
     "",
     "## Hypotheses",
     ...digest.hypotheses.map((h) => `- [${h.hypothesis_id}] (${h.status}) ${h.statement}`),
@@ -145,6 +171,9 @@ export interface LlmResult<T> {
   model: string;
   cost_usd: number;
   rejected: string[];
+  // Every tool invocation and what it returned: the raw substrate behind the
+  // role's answer, so the ledger holds the data and not only the prose.
+  calls: ToolCall[];
 }
 
 interface LlmOptions {
@@ -165,12 +194,13 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
   const { client, model, schema, limiter, rates } = options;
   const tools = options.tools ?? [];
   const messages = [...options.messages];
+  const executed: ToolCall[] = [];
   let cost = 0;
 
   const call = async (body: Parameters<typeof client.chat.completions.create>[0]) => {
     const estimate = estimateTokens(JSON.stringify(body));
     const response = await limiter.run(estimate, () => client.chat.completions.create(body));
-    if (!("choices" in response)) throw new LlmError("streaming responses are not supported");
+    if (!("choices" in response)) throw new LlmError("streaming responses are not supported", cost);
     cost += costOf(rates, response.usage?.prompt_tokens ?? 0, response.usage?.completion_tokens ?? 0);
     return response;
   };
@@ -178,7 +208,7 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
   for (let turn = 0; turn < MAX_TOOL_TURNS && tools.length > 0; turn += 1) {
     const response = await call({ model, messages, tools: toOpenAITools(tools) });
     const message = response.choices[0]?.message;
-    if (message === undefined) throw new LlmError("model returned no message");
+    if (message === undefined) throw new LlmError("model returned no message", cost);
 
     const calls = message.tool_calls ?? [];
     if (calls.length === 0) break;
@@ -188,6 +218,11 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
       if (toolCall.type !== "function") continue;
       const tool = tools.find((candidate) => candidate.id === toolCall.function.name);
       const content = await runTool(tool, toolCall.function.arguments);
+      executed.push({
+        tool: toolCall.function.name,
+        arguments: toolCall.function.arguments,
+        result: truncate(content, MAX_TOOL_RESULT_CHARS),
+      });
       messages.push({ role: "tool", tool_call_id: toolCall.id, content });
     }
   }
@@ -202,7 +237,7 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
     ], schema);
     const parsed = tryParse(content);
     if (parsed !== undefined && validate(parsed)) {
-      return { value: parsed as T, model, cost_usd: cost, rejected };
+      return { value: parsed as T, model, cost_usd: cost, rejected, calls: executed };
     }
 
     const reason = parsed === undefined ? "response was not valid JSON" : formatErrors(validate);
@@ -210,18 +245,20 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
     messages.push({ role: "user", content: `That emission was rejected — ${reason}. Emit a valid decision.` });
   }
 
-  throw new LlmError(`model never emitted a valid decision: ${rejected.join(" | ")}`);
+  throw new LlmError(`model never emitted a valid decision: ${rejected.join(" | ")}`, cost);
 }
 
 export const EMIT_TOOL = "emit_decision";
 
 // Not every provider Bifrost fronts honours response_format. A tool whose
 // parameters are the schema works everywhere, so a 400 downgrades to it once
-// and the process remembers rather than probing on every call.
-let emitMode: "schema" | "tool" = "schema";
+// and the process remembers rather than probing on every call. Remembered per
+// model: response_format is a property of the provider behind one model name,
+// not of this process, and one gateway's 400 must not downgrade every other.
+const emitModes = new Map<string, "schema" | "tool">();
 
 export function resetEmitMode(): void {
-  emitMode = "schema";
+  emitModes.clear();
 }
 
 type Call = (body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming) => Promise<OpenAI.Chat.ChatCompletion>;
@@ -232,7 +269,7 @@ async function emitJson(
   messages: ChatCompletionMessageParam[],
   schema: Record<string, unknown>,
 ): Promise<string> {
-  if (emitMode === "schema") {
+  if ((emitModes.get(model) ?? "schema") === "schema") {
     try {
       const response = await call({
         model,
@@ -242,7 +279,7 @@ async function emitJson(
       return response.choices[0]?.message?.content ?? "";
     } catch (error) {
       if (statusOf(error) !== 400) throw error;
-      emitMode = "tool";
+      emitModes.set(model, "tool");
     }
   }
 
@@ -327,7 +364,7 @@ export class LlmDecisionProvider implements DecisionProvider {
     return {
       decision: result.value,
       model_id: result.model,
-      prompt_version: PROMPT_VERSION,
+      prompt_version: promptVersion("lead", this.role),
       cost_usd: result.cost_usd,
       rejected_attempts: result.rejected,
     };
@@ -377,6 +414,7 @@ export class LlmDisconfirmationCritic implements DisconfirmationCritic {
       rationale: result.value.rationale,
       cost_usd: result.cost_usd,
       model_id: result.model,
+      prompt_version: promptVersion("critic", this.role),
     };
   }
 }
@@ -395,14 +433,28 @@ export function criticFor(
 
 interface WorkerOutput {
   results: {
+    // The telemetry plane the finding came out of, not the worker that ran it:
+    // corroboration means two systems agreeing, and one agent querying twice is
+    // one system. Narrowed to the playbook's declared domains at spec build.
+    source_system: string;
     summary: string;
     salience: Salience;
     why_notable: string;
+    // The rows or aggregates the claim rests on. Without it the critic argues
+    // against the worker's prose, which is the framing it exists to escape.
+    payload?: Record<string, unknown>;
     supports?: string[];
     weakens?: string[];
     attacker_influenceable?: boolean;
   }[];
   ips_to_check?: string[];
+}
+
+function cappedPayload(payload: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (payload === undefined) return {};
+  const json = JSON.stringify(payload);
+  if (json.length <= MAX_PAYLOAD_CHARS) return payload;
+  return { truncated: true, preview: truncate(json, MAX_PAYLOAD_CHARS) };
 }
 
 export class LlmWorkerDispatcher implements WorkerDispatcher {
@@ -433,9 +485,9 @@ export class LlmWorkerDispatcher implements WorkerDispatcher {
     return {
       dispatch_id: request.dispatch_id,
       evidence: result.value.results.map((item) => ({
-        source_system: request.agent_id,
+        source_system: item.source_system,
         summary: item.summary,
-        payload: {},
+        payload: cappedPayload(item.payload),
         salience: item.salience,
         why_notable: item.why_notable,
         provenance: "worker",
@@ -447,6 +499,8 @@ export class LlmWorkerDispatcher implements WorkerDispatcher {
       questions: (result.value.ips_to_check ?? []).map((ip) => `check ${ip}`),
       failed: false,
       failure_reason: "",
+      cost_usd: result.cost_usd,
+      calls: result.calls,
     };
   }
 }

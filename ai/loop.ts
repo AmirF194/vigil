@@ -12,7 +12,14 @@ import {
   type HuntSpec,
   type Verdicts,
 } from "./spec.js";
-import { CRITIC_SOURCE_SYSTEM, evidenceStrength, NULL_CHECK_PROVENANCE, unmetPredicates } from "./strength.js";
+import {
+  CRITIC_SOURCE_SYSTEM,
+  evidenceStrength,
+  isGap,
+  NULL_CHECK_PROVENANCE,
+  UNDECLARED_SOURCE,
+  unmetPredicates,
+} from "./strength.js";
 import {
   ACTIONS_REQUIRING_CITATION,
   DECISION_ACTIONS,
@@ -22,12 +29,14 @@ import {
   type Digest,
   type DispatchRequest,
   type DispatchResult,
+  type EvidenceRecord,
   type HuntOutcome,
   type Hypothesis,
   type IterationResult,
   type NullCheckEvidence,
   type NullCheckInput,
   type NullCheckResult,
+  type WorkerEvidence,
 } from "./types.js";
 
 export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
@@ -46,13 +55,25 @@ interface FanOutTarget {
 }
 
 // Either the critic ran, or it did not and the hunt is owed the reason: silence
-// must never read the same as a hypothesis that withstood the argument.
+// must never read the same as a hypothesis that withstood the argument. The cost
+// stands apart from the result because a critic that failed still spent.
 interface NullCheckAttempt {
   result: NullCheckResult | null;
   blocked: string;
+  cost_usd: number;
+  // Exactly what the critic was shown. A later verdict must not rest on an
+  // argument that never saw half the evidence now on the record.
+  argued: string[];
 }
 
-const NO_NULL_CHECK: NullCheckAttempt = { result: null, blocked: "" };
+const NO_NULL_CHECK: NullCheckAttempt = { result: null, blocked: "", cost_usd: 0, argued: [] };
+
+// A call that died mid-way still spent. Duck-typed rather than reaching into the
+// LLM module, so the controller stays free of it.
+function spentBefore(error: unknown): number {
+  const cost = (error as { cost_usd?: unknown }).cost_usd;
+  return typeof cost === "number" ? cost : 0;
+}
 
 // The controller rejects anything outside the closed vocabulary, so the Hunt
 // Lead cannot widen its own action space by emitting a new verb.
@@ -255,6 +276,9 @@ export class HuntController {
           question: directive.text,
           status: "open",
           spawning_evidence_id: null,
+          // An operator lead names no hypothesis; whatever it turns up links
+          // through the worker, not through the lead it arrived on.
+          hypothesis_id: null,
         },
       });
     }
@@ -289,6 +313,8 @@ export class HuntController {
         evidence: [],
         failed: true,
         failure_reason: "interrupted before the worker returned",
+        // Whatever the interrupted worker spent went with it; nothing is known.
+        cost_usd: 0,
       });
       if (dispatch.question_id !== null) {
         this.ledger.patch("question", dispatch.question_id, { status: "open" });
@@ -312,7 +338,9 @@ export class HuntController {
             .filter((question) => question.status === "open")
             .map((question) => ({
               focus: question.question,
-              hypothesisId: null,
+              // The lead carries its hypothesis, so a fanned-out worker that
+              // fails leaves a gap attributed to what it was serving.
+              hypothesisId: question.hypothesis_id,
               questionId: question.question_id,
             }))
         : [...projection.hypotheses.values()]
@@ -359,6 +387,8 @@ export class HuntController {
           target_hypothesis_id: request.target_hypothesis_id,
           question_id: questionId,
           failure_reason: null,
+          cost_usd: 0,
+          calls: [],
         },
       });
     }
@@ -375,6 +405,7 @@ export class HuntController {
             evidence: [],
             failed: true,
             failure_reason: (error as Error).message,
+            cost_usd: spentBefore(error),
           };
         }
       }),
@@ -386,25 +417,30 @@ export class HuntController {
   private async runNullCheck(decision: Decision): Promise<NullCheckAttempt> {
     if (decision.action !== "VALIDATE") return NO_NULL_CHECK;
     if (this.critic === undefined) {
-      return { result: null, blocked: "no disconfirmation critic is configured, so it stays active" };
+      return { ...NO_NULL_CHECK, blocked: "no disconfirmation critic is configured, so it stays active" };
     }
 
     // validateDecision has already required a target the ledger knows.
     const hypothesis = this.ledger.projection.hypotheses.get(decision.target_hypothesis_id ?? "");
     if (hypothesis === undefined) return NO_NULL_CHECK;
     if (hypothesis.status !== "active") {
-      return { result: null, blocked: `already ${hypothesis.status}; no second verdict was run` };
+      return { ...NO_NULL_CHECK, blocked: `already ${hypothesis.status}; no second verdict was run` };
     }
 
+    const input = nullCheckInput(this.ledger.projection, hypothesis);
+    const argued = input.evidence.map((linked) => linked.record.evidence_id);
     try {
-      const result = await this.critic.argueNull(nullCheckInput(this.ledger.projection, hypothesis));
-      return { result, blocked: "" };
+      const result = await this.critic.argueNull(input);
+      return { result, blocked: "", cost_usd: result.cost_usd, argued };
     } catch (error) {
       // A critic that cannot run fails closed. An unavailable argument is not a
-      // won one, and the hunt keeps going with the hypothesis still open.
+      // won one, and the hunt keeps going with the hypothesis still open — but
+      // whatever it spent before dying is still charged.
       return {
         result: null,
         blocked: `the disconfirmation critic failed (${(error as Error).message}), so it stays active`,
+        cost_usd: spentBefore(error),
+        argued: [],
       };
     }
   }
@@ -428,9 +464,13 @@ export class HuntController {
         payload: {
           hypothesis_id: hypothesisId,
           survives: nullCheck.survives,
+          // What the argument was made against, so a later verdict can tell a
+          // current survival from one that predates half the evidence.
+          argued_evidence_ids: attempt.argued,
           strongest_benign_explanation: nullCheck.strongest_benign_explanation,
           rationale: nullCheck.rationale,
           model_id: nullCheck.model_id,
+          prompt_version: nullCheck.prompt_version,
           cost_usd: nullCheck.cost_usd,
         },
         salience: "notable",
@@ -498,9 +538,11 @@ export class HuntController {
       },
     });
 
-    // The critic is a paid call like any other, so it lands in the budget
-    // counter rather than being spent off the books.
-    const spent = Number((result.cost_usd + (nullCheck.result?.cost_usd ?? 0)).toFixed(6));
+    // Every paid call in the iteration lands in the budget counter: the workers
+    // are the largest share of a real hunt's spend, and a max_cost_usd that only
+    // sees the Hunt Lead is not a budget.
+    const workers = dispatchResults.reduce((total, dispatchResult) => total + dispatchResult.cost_usd, 0);
+    const spent = Number((result.cost_usd + workers + nullCheck.cost_usd).toFixed(6));
     const hunt = this.ledger.projection.hunt;
     this.ledger.patch("hunt", hunt.hunt_id, {
       iteration,
@@ -540,11 +582,28 @@ export class HuntController {
     };
   }
 
+  // Corroboration is counted over source systems, so a label the hunt never
+  // declared earns no independence credit: it collapses into one bucket rather
+  // than letting two invented names read as two systems agreeing. The worker's
+  // claim stays on the record.
+  private attributeSource(record: WorkerEvidence): Pick<EvidenceRecord, "source_system" | "payload"> {
+    const declared = this.ledger.projection.hunt.spec.data_domains;
+    if (record.provenance !== "worker" || declared.length === 0 || declared.includes(record.source_system)) {
+      return { source_system: record.source_system, payload: record.payload };
+    }
+    return {
+      source_system: UNDECLARED_SOURCE,
+      payload: { ...record.payload, claimed_source_system: record.source_system },
+    };
+  }
+
   private persistDispatch(iteration: number, result: DispatchResult): number {
     // Idempotency on dispatch_id: a retried dispatch re-delivers the same
-    // evidence, and appending it twice would inflate corroboration counts.
+    // evidence, and appending it twice would inflate corroboration counts. A gap
+    // record does not count as delivery, or a retry of a dispatch that failed
+    // could never bring anything back.
     const already = [...this.ledger.projection.evidence.values()].some(
-      (record) => record.dispatch_id === result.dispatch_id,
+      (record) => record.dispatch_id === result.dispatch_id && !isGap(record),
     );
     if (already) {
       this.ledger.patch("dispatch", result.dispatch_id, { status: "complete" });
@@ -568,12 +627,14 @@ export class HuntController {
       : result.evidence;
 
     const known = this.ledger.projection.hypotheses;
+    const dispatch = this.ledger.projection.dispatches.get(result.dispatch_id);
     for (const { supports, weakens, ...record } of records) {
       const evidenceId = newId("ev");
       this.ledger.append({
         kind: "evidence",
         evidence: {
           ...record,
+          ...this.attributeSource(record),
           evidence_id: evidenceId,
           dispatch_id: result.dispatch_id,
           iteration,
@@ -602,6 +663,9 @@ export class HuntController {
           question,
           status: "open",
           spawning_evidence_id: null,
+          // Inherited from the work that opened it, so the lead stays attached to
+          // the hypothesis it serves however far it travels down the frontier.
+          hypothesis_id: dispatch?.target_hypothesis_id ?? null,
         },
       });
     }
@@ -609,8 +673,10 @@ export class HuntController {
     this.ledger.patch("dispatch", result.dispatch_id, {
       status: result.failed ? "failed" : "complete",
       failure_reason: result.failed ? result.failure_reason : null,
+      cost_usd: result.cost_usd,
+      calls: result.calls ?? [],
     });
-    return result.failed ? 0 : records.length;
+    return records.length;
   }
 
   // Unresolved hypotheses become inconclusive, never disproven: the hunt

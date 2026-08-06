@@ -72,15 +72,17 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
 
 // Two source systems, because the verdict predicates a scripted walk has to
 // clear are the same ones a real hunt clears — one system agreeing with itself
-// would never reach proven.
-function scriptedEvidence(hypothesisId: string): WorkerEvidence[] {
-  return ["scripted-siem", "scripted-edr"].map((source) => ({
+// would never reach proven. Declared domains when the playbook has them, or the
+// controller would collapse invented labels into one and nothing would prove.
+function scriptedEvidence(hypothesisId: string, domains: readonly string[]): WorkerEvidence[] {
+  const sources = domains.length >= 2 ? domains.slice(0, 2) : ["scripted-siem", "scripted-edr"];
+  return sources.map((source) => ({
     source_system: source,
     summary: `${source}: scripted evidence, no telemetry was queried`,
-    payload: {},
+    payload: { scripted: true },
     salience: "routine" as const,
     why_notable: "",
-    provenance: "scripted",
+    provenance: "worker",
     attacker_influenceable: false,
     instruction_like: false,
     supports: [hypothesisId],
@@ -151,7 +153,7 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
     ? new HuntController(
         ledger,
         new ScriptedDecisionProvider(scriptedRun(Number(values.iterations), hypothesisId)),
-        new ScriptedWorkerDispatcher(scriptedEvidence(hypothesisId)),
+        new ScriptedWorkerDispatcher(scriptedEvidence(hypothesisId, spec.data_domains)),
         spec.dispatch,
         spec.digest,
         new ScriptedDisconfirmationCritic(),

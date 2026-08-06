@@ -2,11 +2,12 @@
 
 An isolated, YAML-driven agent loop for hypothesis-driven threat hunting.
 
-A deterministic controller owns the loop and all state. Two LLM roles sit behind
-injectable ports: a **lead** that reads a ledger digest and emits one typed
-decision, and a **worker** that turns a query intent into evidence. What each
-role is told, must answer in, and may call is declared in YAML, so a different
-workflow is a config change rather than a code change.
+A deterministic controller owns the loop and all state. Three LLM roles sit
+behind injectable ports: a **lead** that reads a ledger digest and emits one
+typed decision, a **worker** that turns a query intent into evidence, and a
+**critic** that argues the strongest benign explanation before anything may be
+called proven. What each role is told, must answer in, and may call is declared
+in YAML, so a different workflow is a config change rather than a code change.
 
 ```
 vigilhunt --prompt <prompt> --id <entity> --workflow <playbook.yaml>
@@ -76,29 +77,68 @@ wrong one is a load error, so there is no precedence chain to reason about.
 
 | file | owns | authored by |
 |---|---|---|
-| `arch/threathunt.yaml` | roles, their prompts and output schemas, `dispatch`, `digest` | operator |
-| `frothly.yaml` (`--workflow`) | hypotheses, ATT&CK mapping, data domains, scope, `directives`, narrative | uploadable |
-| `vigil.config.yaml` | `model`, `rates`, `budgets`, `runtime`, `tools` | operator |
+| `arch/threathunt.yaml` | the three roles, their prompts and output schemas, `dispatch`, `digest` | operator |
+| `frothly.yaml` (`--workflow`) | hypotheses, ATT&CK mapping, `data_domains`, scope, `directives`, narrative | uploadable |
+| `vigil.config.yaml` | `model`, `rates`, `budgets`, `runtime`, `verdicts`, `tools` | operator |
 
 The playbook is the only layer meant to be handed around, and it deliberately
 cannot declare a schema, a tool, a model, or a budget. Its `directives` are
 appended per role to the arch prompt rather than replacing it: the arch says how
 to reason about any dataset, the playbook says what this one is.
 
-An arch may **narrow** the decision vocabulary — drop `HANDOFF_IR` if there is no
-IR team to hand off to — but never widen it. A verb the controller cannot execute
-is rejected at load rather than becoming a dead end the lead keeps choosing.
+An arch may **narrow** the decision vocabulary — drop a verb the pipeline has no
+use for — but never widen it, and it may only declare verbs the controller
+actually acts on. A verb that would be journaled and ignored is rejected at load
+rather than becoming a dead end the lead keeps choosing: it would cost an
+iteration and move nothing. Today that is `INVESTIGATE`, `VALIDATE` and
+`CONCLUDE`; `EXECUTABLE_ACTIONS` grows as the controller learns a verb, and a
+pivot into another domain is an `INVESTIGATE` that says so in its rationale.
 
 `rates` is USD per million tokens and is required. It lives in config rather than
 a table in code because a model with no known rate would bill zero and silently
-disable `budgets.max_cost_usd`.
+disable `budgets.max_cost_usd`. Every paid call is charged to the hunt — the lead
+including its rejected emissions, each worker (the largest share of a real hunt,
+and recorded on its dispatch row), and the critic, including what a call that
+died mid-way had already spent.
+
+## Verdicts
+
+A hypothesis reaches `proven` only by clearing predicates the controller counts
+off the ledger. `stated_confidence` is recorded for calibration and gates
+nothing.
+
+```yaml
+verdicts:
+  min_corroborating_sources: 2   # distinct source systems supporting it
+  gap_lock_threshold: 3          # unanswered questions before it closes inconclusive
+```
+
+`VALIDATE` runs the critic against the **raw payloads** linked to one hypothesis,
+not the digest — the digest is the lead's own compression of its own case, and an
+argument built inside it is not independent. The critic's argument is appended as
+evidence and weakens the hypothesis when the benign story stands; it never
+decides. A verdict must rest on a *current* argument: the latest null check must
+have survived **and** have been argued against everything now linked, so evidence
+arriving after a refused verdict means validating again.
+
+Corroboration is counted over **source systems, not records or workers**: one
+tool queried twice is one system agreeing with itself. The worker names the
+telemetry domain each finding came from, narrowed at spec build to the playbook's
+`data_domains`, and a label the hunt never declared collapses into one bucket
+rather than buying independence credit.
+
+A gap is a question the hunt could not answer, keyed by the lead or intent rather
+than counted per failure — three retries of one query are one blind spot, and a
+question answered later is not one at all. Enough of them and the hypothesis
+closes `inconclusive`, never `disproven`.
 
 ## The ledger
 
 One JSONL file per hunt under `runs/`, one event per line, append-only. State is
 a fold over that file and is never written back, so the file is the whole audit
-trail: every decision with the digest exactly as the model saw it, every query
-with its cost, and every hypothesis transition.
+trail: every decision with the digest exactly as the model saw it, every dispatch
+with the tool calls it ran and what it cost, the rows behind each finding, and
+every hypothesis transition with the numbers it turned on.
 
 Workers append evidence; only the controller mutates state. Unresolved
 hypotheses close as `inconclusive`, never `disproven` — the hunt stopped
@@ -146,7 +186,8 @@ the digest rules, and both are already data.
 | `ai/loop.ts` | the controller: read → decide → dispatch → persist |
 | `ai/ledger.ts` | append-only JSONL and its projection |
 | `ai/digest.ts` | ledger → what the lead sees, with the salience floor and contrarian quota |
-| `ai/llm.ts` | `input()`, `output_schema()`, `llm_output()`, and the two role implementations |
+| `ai/strength.ts` | `evidence_strength` off the ledger, and the predicates a verdict clears |
+| `ai/llm.ts` | `input()`, `output_schema()`, `llm_output()`, and the three role implementations |
 | `ai/limiter.ts` | RPM/TPM buckets, concurrency gate, jittered backoff |
 | `ai/spec.ts` | the three YAML layers and their merge |
 | `ai/lease.ts` | per-hunt lockfile so one process advances a ledger |
