@@ -2,7 +2,7 @@ import { Ajv, type ValidateFunction } from "ajv";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { estimateTokens, Limiter, statusOf } from "./limiter.js";
-import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
+import type { DecisionProvider, DisconfirmationCritic, WorkerDispatcher } from "./ports.js";
 import type { HuntSpec, Rates, RoleSpec } from "./spec.js";
 import { toOpenAITools, type Tool } from "./tools.js";
 import type {
@@ -11,6 +11,8 @@ import type {
   Digest,
   DispatchRequest,
   DispatchResult,
+  NullCheckInput,
+  NullCheckResult,
   Salience,
 } from "./types.js";
 
@@ -80,6 +82,32 @@ export function renderDigest(digest: Digest): string {
   }
 
   if (digest.notes.length > 0) lines.push("", "## Notes", ...digest.notes.map((n) => `- ${n}`));
+  return lines.filter((line) => line !== "").join("\n");
+}
+
+// The critic reads raw payloads, delimited the same way: the case against a
+// hypothesis is built from what was collected, not from the digest's summary of it.
+export function renderNullCheck(check: NullCheckInput): string {
+  const lines = [
+    "# Hypothesis put up for a verdict",
+    `[${check.hypothesis_id}] ${check.statement}`,
+    "",
+    "## Everything the hunt has linked to it",
+  ];
+
+  if (check.evidence.length === 0) lines.push("Nothing is linked to this hypothesis.");
+  for (const { relation, record } of check.evidence) {
+    lines.push(
+      `<vigil:evidence id="${record.evidence_id}" relation="${relation}" source="${record.source_system}" ` +
+        `attacker_influenceable="${record.attacker_influenceable}">`,
+      record.summary,
+      record.why_notable ? `why notable: ${record.why_notable}` : "",
+      JSON.stringify(record.payload),
+      "</vigil:evidence>",
+    );
+  }
+
+  if (check.narrative) lines.push("", "## Scenario", check.narrative);
   return lines.filter((line) => line !== "").join("\n");
 }
 
@@ -304,6 +332,65 @@ export class LlmDecisionProvider implements DecisionProvider {
       rejected_attempts: result.rejected,
     };
   }
+}
+
+// The critic is never asked whether the hypothesis is true — only whether the
+// benign story it just built accounts for the evidence. Asking it to rate the
+// hypothesis directly makes it a second Hunt Lead, which is the bias this whole
+// pass exists to cancel.
+interface CriticOutput {
+  benign_explanation: string;
+  benign_explanation_stands: boolean;
+  rationale: string;
+}
+
+export class LlmDisconfirmationCritic implements DisconfirmationCritic {
+  private readonly role: RoleSpec;
+  private readonly tools: Tool[];
+
+  constructor(
+    private readonly spec: HuntSpec,
+    tools: readonly Tool[] = [],
+    private readonly limiter: Limiter = createLimiter(spec),
+    private readonly client: OpenAI = createClient(),
+  ) {
+    const role = spec.roles.critic;
+    if (role === undefined) throw new LlmError("this arch declares no critic role");
+    this.role = role;
+    this.tools = toolsFor(role, tools);
+  }
+
+  async argueNull(check: NullCheckInput): Promise<NullCheckResult> {
+    const result = await llm_output<CriticOutput>({
+      client: this.client,
+      model: this.spec.model,
+      messages: input(this.role, renderNullCheck(check)),
+      schema: output_schema(this.role),
+      tools: this.tools,
+      limiter: this.limiter,
+      rates: this.spec.rates,
+    });
+
+    return {
+      survives: !result.value.benign_explanation_stands,
+      strongest_benign_explanation: result.value.benign_explanation,
+      rationale: result.value.rationale,
+      cost_usd: result.cost_usd,
+      model_id: result.model,
+    };
+  }
+}
+
+// An arch with no critic role gets no critic rather than a startup failure: the
+// hunt still runs, it just cannot prove anything and says so each VALIDATE.
+export function criticFor(
+  spec: HuntSpec,
+  tools: readonly Tool[] = [],
+  limiter?: Limiter,
+  client?: OpenAI,
+): DisconfirmationCritic | undefined {
+  if (spec.roles.critic === undefined) return undefined;
+  return new LlmDisconfirmationCritic(spec, tools, limiter, client);
 }
 
 interface WorkerOutput {

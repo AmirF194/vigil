@@ -1,22 +1,28 @@
-import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
+import type { DecisionProvider, DisconfirmationCritic, WorkerDispatcher } from "./ports.js";
 import type {
   Decision,
   DecisionResult,
   Digest,
   DispatchRequest,
   DispatchResult,
+  NullCheckInput,
+  NullCheckResult,
 } from "./types.js";
 
 export const SCRIPTED_MODEL_ID = "scripted";
+
+// A scripted decision may be written as a function of the digest, so a script
+// can cite evidence ids that did not exist when it was written.
+export type ScriptedDecision = Decision | ((digest: Digest) => Decision);
 
 // Replays a fixed sequence, then concludes. The fallback stops a hunt that
 // outlives its script from looping forever.
 export class ScriptedDecisionProvider implements DecisionProvider {
   readonly seenDigests: Digest[] = [];
-  private readonly decisions: Decision[];
+  private readonly decisions: ScriptedDecision[];
 
   constructor(
-    decisions: Iterable<Decision>,
+    decisions: Iterable<ScriptedDecision>,
     private readonly costPerDecision = 0,
     private readonly modelId = SCRIPTED_MODEL_ID,
   ) {
@@ -29,10 +35,11 @@ export class ScriptedDecisionProvider implements DecisionProvider {
 
   async decide(digest: Digest): Promise<DecisionResult> {
     this.seenDigests.push(digest);
-    const decision = this.decisions.shift() ?? {
+    const next = this.decisions.shift() ?? {
       action: "CONCLUDE" as const,
       rationale: "scripted provider exhausted",
     };
+    const decision = typeof next === "function" ? next(digest) : next;
     return {
       decision,
       model_id: this.modelId,
@@ -68,6 +75,32 @@ export class ScriptedWorkerDispatcher implements WorkerDispatcher {
       evidence: structuredClone(this.evidence),
       failed: false,
       failure_reason: "",
+    };
+  }
+}
+
+// Argues whichever way the test needs, so the proven path can be driven without
+// a model. `survives` is about the hypothesis: false means the benign
+// explanation accounted for the evidence.
+export class ScriptedDisconfirmationCritic implements DisconfirmationCritic {
+  readonly checks: NullCheckInput[] = [];
+
+  constructor(
+    private readonly survives = true,
+    private readonly costPerCheck = 0,
+    private readonly explanation = "routine administrative activity would produce the same records",
+  ) {}
+
+  async argueNull(check: NullCheckInput): Promise<NullCheckResult> {
+    this.checks.push(check);
+    return {
+      survives: this.survives,
+      strongest_benign_explanation: this.explanation,
+      rationale: this.survives
+        ? "the benign explanation does not account for the linked evidence"
+        : "the benign explanation accounts for the linked evidence",
+      cost_usd: this.costPerCheck,
+      model_id: SCRIPTED_MODEL_ID,
     };
   }
 }

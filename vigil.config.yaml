@@ -9,6 +9,16 @@ budgets:
   max_iterations: 12
   max_cost_usd: 5.00
 
+# What a hypothesis must clear to be proven. Counted by the controller from the
+# ledger — a model's own confidence never enters this.
+verdicts:
+  # Distinct source systems supporting it. One system agreeing with itself is
+  # not corroboration.
+  min_corroborating_sources: 2
+  # Unanswered queries bearing on it before the verdict closes inconclusive:
+  # "we could not look" must never read as "we cleared it".
+  gap_lock_threshold: 3
+
 runtime:
   concurrency: 4
   rate_limit: { rpm: 60, tpm: 200000 }

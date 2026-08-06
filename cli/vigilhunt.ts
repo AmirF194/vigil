@@ -2,14 +2,20 @@
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline/promises";
 import { HuntController, resumeHunt, startHunt } from "../ai/loop.js";
-import { LlmDecisionProvider, LlmWorkerDispatcher } from "../ai/llm.js";
+import { criticFor, LlmDecisionProvider, LlmWorkerDispatcher } from "../ai/llm.js";
 import { Lease } from "../ai/lease.js";
 import { steer } from "../ai/inbox.js";
-import { ScriptedDecisionProvider, ScriptedWorkerDispatcher } from "../ai/scripted.js";
+import {
+  ScriptedDecisionProvider,
+  ScriptedDisconfirmationCritic,
+  ScriptedWorkerDispatcher,
+  type ScriptedDecision,
+} from "../ai/scripted.js";
 import { buildSpec, SpecError, type HuntSpec } from "../ai/spec.js";
+import { isGap } from "../ai/strength.js";
 import { buildTools, closeTools } from "../ai/tools.js";
 import type { Ledger } from "../ai/ledger.js";
-import type { Decision, Entity } from "../ai/types.js";
+import type { Digest, Entity, WorkerEvidence } from "../ai/types.js";
 
 const USAGE = `vigilhunt --prompt <prompt> --id <entity> --workflow <playbook.yaml>
 
@@ -64,25 +70,47 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
   return ["y", "yes"].includes(answer.trim().toLowerCase());
 }
 
-const SCRIPTED_EVIDENCE = {
-  source_system: "scripted",
-  summary: "scripted evidence, no telemetry was queried",
-  payload: {},
-  salience: "routine" as const,
-  why_notable: "",
-  provenance: "scripted",
-  attacker_influenceable: false,
-  instruction_like: false,
+// Two source systems, because the verdict predicates a scripted walk has to
+// clear are the same ones a real hunt clears — one system agreeing with itself
+// would never reach proven.
+function scriptedEvidence(hypothesisId: string): WorkerEvidence[] {
+  return ["scripted-siem", "scripted-edr"].map((source) => ({
+    source_system: source,
+    summary: `${source}: scripted evidence, no telemetry was queried`,
+    payload: {},
+    salience: "routine" as const,
+    why_notable: "",
+    provenance: "scripted",
+    attacker_influenceable: false,
+    instruction_like: false,
+    supports: [hypothesisId],
+  }));
+}
+
+const SCRIPTED_INVESTIGATE = {
+  action: "INVESTIGATE" as const,
+  rationale: "scripted wiring check",
+  query_intent: "scripted query",
 };
 
-// Investigate for the whole run rather than concluding at once, so --scripted
-// exercises dispatch, steering and resume instead of just the terminal path.
-function scriptedRun(iterations: number): Decision[] {
-  return Array.from({ length: iterations }, () => ({
-    action: "INVESTIGATE" as const,
-    rationale: "scripted wiring check",
-    query_intent: "scripted query",
-  }));
+// Investigate for most of the run rather than concluding at once, so --scripted
+// exercises dispatch, steering and resume; the last two turns walk the verdict
+// path, which is the other half of the wiring.
+function scriptedRun(iterations: number, hypothesisId: string): ScriptedDecision[] {
+  if (iterations < 3) return Array.from({ length: iterations }, () => SCRIPTED_INVESTIGATE);
+
+  return [
+    ...Array.from({ length: iterations - 2 }, () => SCRIPTED_INVESTIGATE),
+    // Cites what exists by the time it runs: the evidence ids are not knowable
+    // when the script is written.
+    (digest: Digest) => ({
+      action: "VALIDATE" as const,
+      rationale: "scripted verdict check",
+      target_hypothesis_id: hypothesisId,
+      evidence_citations: digest.recent_evidence.map((record) => record.evidence_id),
+    }),
+    { action: "CONCLUDE" as const, rationale: "scripted wiring check complete" },
+  ];
 }
 
 // First Ctrl-C parks after the current iteration so nothing is lost; a second
@@ -118,13 +146,16 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
   process.on("exit", () => lease.release());
 
   const tools = values.scripted ? [] : await buildTools(spec, ledger);
+  const hypothesisId = [...ledger.projection.hypotheses.keys()][0] ?? "";
   const controller = values.scripted
     ? new HuntController(
         ledger,
-        new ScriptedDecisionProvider(scriptedRun(Number(values.iterations))),
-        new ScriptedWorkerDispatcher([SCRIPTED_EVIDENCE]),
+        new ScriptedDecisionProvider(scriptedRun(Number(values.iterations), hypothesisId)),
+        new ScriptedWorkerDispatcher(scriptedEvidence(hypothesisId)),
         spec.dispatch,
         spec.digest,
+        new ScriptedDisconfirmationCritic(),
+        spec.verdicts,
       )
     : new HuntController(
         ledger,
@@ -132,6 +163,8 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
         new LlmWorkerDispatcher(spec, tools),
         spec.dispatch,
         spec.digest,
+        criticFor(spec, tools),
+        spec.verdicts,
       );
 
   const reaped = controller.reap();
@@ -148,7 +181,10 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
       const outcome = result.hunt_outcome === null ? "" : ` (${result.hunt_outcome})`;
       console.log(
         `  [${result.iteration}] ${result.action.padEnd(12)} evidence+${result.evidence_appended}` +
-          `  $${result.cost_usd.toFixed(4)}  ${result.hunt_status}${outcome}`,
+          `  $${result.cost_usd.toFixed(4)}  ${result.hunt_status}${outcome}` +
+          // A refused verdict is the interesting half of VALIDATE; without the
+          // note it reads exactly like a turn that did nothing.
+          (result.note ? `\n       ${result.note}` : ""),
       );
       if (result.hunt_status === "terminal") break;
       lease.renew();
@@ -251,9 +287,11 @@ function summarize(ledger: Ledger): void {
   console.log("\nhypotheses");
   for (const hypothesis of hypotheses.values()) {
     console.log(`  [${hypothesis.status.padEnd(12)}] ${hypothesis.statement}`);
+    // A verdict nobody can read the reasoning of is not an auditable verdict.
+    if (hypothesis.resolution_reason) console.log(`                 ${hypothesis.resolution_reason}`);
   }
 
-  const gaps = [...evidence.values()].filter((record) => record.provenance === "tool_failure");
+  const gaps = [...evidence.values()].filter(isGap);
   console.log(`\nevidence (${evidence.size}, ${gaps.length} visibility gap(s))`);
   for (const record of evidence.values()) {
     console.log(`  ${record.evidence_id}  ${record.salience.padEnd(9)} ${record.summary}`);

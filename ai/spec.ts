@@ -45,9 +45,12 @@ export interface RoleSpec {
   tools: string[];
 }
 
-export type RoleName = "lead" | "worker";
-export const ROLE_NAMES = ["lead", "worker"] as const satisfies readonly RoleName[];
-export type Roles = Record<RoleName, RoleSpec>;
+export type RoleName = "lead" | "worker" | "critic";
+export const ROLE_NAMES = ["lead", "worker", "critic"] as const satisfies readonly RoleName[];
+
+// The critic is optional. An arch without one still runs a whole hunt; it simply
+// has no way to reach proven, which is a legible outcome rather than an error.
+export type Roles = { lead: RoleSpec; worker: RoleSpec; critic?: RoleSpec };
 
 // The loop's shape: what the roles are told, what they must answer in, how an
 // iteration fans out. Operator-authored and never uploaded.
@@ -76,12 +79,21 @@ export interface Rates {
   output: number;
 }
 
+// What a hypothesis must clear to be proven, and how much blindness forces it
+// inconclusive. Deployment config because a two-tool shop and a full SOC do not
+// have the same corroboration available.
+export interface Verdicts {
+  min_corroborating_sources: number;
+  gap_lock_threshold: number;
+}
+
 // Where this deployment points and what it may spend.
 export interface Config {
   model: string;
   rates: Rates;
   budgets: Budgets;
   runtime: Runtime;
+  verdicts: Verdicts;
   tools: ToolSpec[];
 }
 
@@ -104,7 +116,7 @@ const PLAYBOOK_KEYS = new Set([
   "directives",
   "narrative",
 ]);
-const CONFIG_KEYS = new Set(["model", "rates", "budgets", "runtime", "tools"]);
+const CONFIG_KEYS = new Set(["model", "rates", "budgets", "runtime", "verdicts", "tools"]);
 
 export const DEFAULT_MODEL = "openai/gpt-4o";
 export const DEFAULT_ARCH = packaged("arch/threathunt.yaml");
@@ -116,6 +128,11 @@ export const DEFAULT_RUNTIME: Runtime = {
   retry_attempts: 3,
   lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
 };
+
+// Two systems because one system agreeing with itself is not corroboration;
+// three gaps because a hypothesis with that much unseen around it has not been
+// cleared, it has been given up on.
+export const DEFAULT_VERDICTS: Verdicts = { min_corroborating_sources: 2, gap_lock_threshold: 3 };
 
 export const DEFAULT_DISPATCH: DispatchPolicy = { mode: "serial", fan_out_over: "questions", max_workers: 1 };
 export const DEFAULT_DIGEST: DigestPolicy = { evidence_window: 25 };
@@ -239,7 +256,8 @@ function parseRoles(raw: unknown): Roles {
     throw new SpecError(`unknown role(s): ${unknown.sort().join(", ")}; expected ${ROLE_NAMES.join(", ")}`);
   }
 
-  const roles = { lead: parseRole(record["lead"], "lead"), worker: parseRole(record["worker"], "worker") };
+  const roles: Roles = { lead: parseRole(record["lead"], "lead"), worker: parseRole(record["worker"], "worker") };
+  if (record["critic"] !== undefined) roles.critic = parseRole(record["critic"], "critic");
   assertVocabulary(roles.lead.output_schema);
   return roles;
 }
@@ -287,6 +305,25 @@ function parseBudgets(raw: unknown): Budgets {
   return { ...DEFAULT_BUDGETS, ...record } as Budgets;
 }
 
+function parseVerdicts(raw: unknown): Verdicts {
+  const record = asRecord(raw, "verdicts");
+  const unknown = Object.keys(record).filter((key) => !(key in DEFAULT_VERDICTS));
+  if (unknown.length > 0) {
+    throw new SpecError(
+      `unknown verdicts key(s): ${unknown.sort().join(", ")}; expected any of ${Object.keys(DEFAULT_VERDICTS).sort().join(", ")}`,
+    );
+  }
+  const verdicts = { ...DEFAULT_VERDICTS, ...record } as Verdicts;
+  // A threshold of zero would either prove everything or lock everything, and
+  // both read as a working hunt right up until someone trusts the verdict.
+  for (const [key, value] of Object.entries(verdicts)) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new SpecError(`verdicts.${key} must be a positive integer, got ${String(value)}`);
+    }
+  }
+  return verdicts;
+}
+
 function parseRuntime(raw: unknown): Runtime {
   const record = asRecord(raw, "runtime");
   return {
@@ -328,6 +365,7 @@ export function parseConfig(text: string): Config {
     rates: parseRates(front["rates"], model),
     budgets: parseBudgets(front["budgets"]),
     runtime: parseRuntime(front["runtime"]),
+    verdicts: parseVerdicts(front["verdicts"]),
     tools: parseTools(front["tools"]),
   };
 }
@@ -357,14 +395,15 @@ const EMPTY_PLAYBOOK: Playbook = {
 // Playbook prose layers onto the arch prompt rather than replacing it: the
 // playbook says what this dataset is, the arch says how to reason about any of them.
 function applyDirectives(roles: Roles, directives: Partial<Record<RoleName, string>>, declared: Set<string>): Roles {
-  const applied = ROLE_NAMES.map((name) => {
+  const applied = ROLE_NAMES.flatMap((name) => {
     const role = roles[name];
+    if (role === undefined) return [];
     const missing = role.tools.filter((id) => !declared.has(id));
     if (missing.length > 0) {
       throw new SpecError(`arch role ${name} needs tool(s) the config does not declare: ${missing.join(", ")}`);
     }
     const directive = directives[name];
-    return [name, directive ? { ...role, prompt: `${role.prompt}\n\n${directive}` } : role];
+    return [[name, directive ? { ...role, prompt: `${role.prompt}\n\n${directive}` } : role]];
   });
   return Object.fromEntries(applied) as Roles;
 }

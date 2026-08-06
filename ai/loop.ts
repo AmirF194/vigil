@@ -2,8 +2,17 @@ import { join } from "node:path";
 import { buildDigest } from "./digest.js";
 import { drain } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
-import type { DecisionProvider, WorkerDispatcher } from "./ports.js";
-import { DEFAULT_DIGEST, DEFAULT_DISPATCH, type DigestPolicy, type DispatchPolicy, type HuntSpec } from "./spec.js";
+import type { DecisionProvider, DisconfirmationCritic, WorkerDispatcher } from "./ports.js";
+import {
+  DEFAULT_DIGEST,
+  DEFAULT_DISPATCH,
+  DEFAULT_VERDICTS,
+  type DigestPolicy,
+  type DispatchPolicy,
+  type HuntSpec,
+  type Verdicts,
+} from "./spec.js";
+import { CRITIC_SOURCE_SYSTEM, evidenceStrength, NULL_CHECK_PROVENANCE, unmetPredicates } from "./strength.js";
 import {
   ACTIONS_REQUIRING_CITATION,
   DECISION_ACTIONS,
@@ -14,7 +23,11 @@ import {
   type DispatchRequest,
   type DispatchResult,
   type HuntOutcome,
+  type Hypothesis,
   type IterationResult,
+  type NullCheckEvidence,
+  type NullCheckInput,
+  type NullCheckResult,
 } from "./types.js";
 
 export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
@@ -32,6 +45,15 @@ interface FanOutTarget {
   questionId: string | null;
 }
 
+// Either the critic ran, or it did not and the hunt is owed the reason: silence
+// must never read the same as a hypothesis that withstood the argument.
+interface NullCheckAttempt {
+  result: NullCheckResult | null;
+  blocked: string;
+}
+
+const NO_NULL_CHECK: NullCheckAttempt = { result: null, blocked: "" };
+
 // The controller rejects anything outside the closed vocabulary, so the Hunt
 // Lead cannot widen its own action space by emitting a new verb.
 export function validateDecision(decision: Decision, projection: Projection): void {
@@ -48,6 +70,32 @@ export function validateDecision(decision: Decision, projection: Projection): vo
   if (unknown.length > 0) {
     throw new InvalidDecision(`${decision.action} cites unknown evidence: ${unknown.join(", ")}`);
   }
+
+  // A verdict is about one claim. Without the target there is nothing to argue
+  // the null against, so this is as much a violation as an uncited citation.
+  if (decision.action === "VALIDATE") {
+    const target = decision.target_hypothesis_id;
+    if (!target) throw new InvalidDecision("VALIDATE must name the target_hypothesis_id it puts up for a verdict");
+    if (!projection.hypotheses.has(target)) {
+      throw new InvalidDecision(`VALIDATE names unknown hypothesis: ${target}`);
+    }
+  }
+}
+
+// Raw payloads, not digest summaries: the critic argues against what was
+// actually collected rather than against the Hunt Lead's compression of it.
+function nullCheckInput(projection: Projection, hypothesis: Hypothesis): NullCheckInput {
+  const evidence = projection.links
+    .filter((link) => link.hypothesis_id === hypothesis.hypothesis_id)
+    .map((link) => ({ relation: link.relation, record: projection.evidence.get(link.evidence_id) }))
+    .filter((linked): linked is NullCheckEvidence => linked.record !== undefined);
+
+  return {
+    hypothesis_id: hypothesis.hypothesis_id,
+    statement: hypothesis.statement,
+    narrative: projection.hunt.narrative,
+    evidence,
+  };
 }
 
 // The violation goes back to the Hunt Lead as a digest note, which is where the
@@ -91,6 +139,7 @@ export function startHunt(spec: HuntSpec, dir: string): Ledger {
         attack_technique: spec.attack_techniques[index] ?? null,
         provenance: "hunt_spec",
         resolution_reason: null,
+        evidence_strength: null,
       },
     });
   }
@@ -113,6 +162,10 @@ export class HuntController {
     private readonly dispatcher?: WorkerDispatcher | undefined,
     private readonly policy: DispatchPolicy = DEFAULT_DISPATCH,
     private readonly digestPolicy: DigestPolicy = DEFAULT_DIGEST,
+    // Optional: a hunt with no critic runs to a legible end, it just cannot
+    // prove anything, and says so rather than transitioning quietly.
+    private readonly critic?: DisconfirmationCritic | undefined,
+    private readonly verdicts: Verdicts = DEFAULT_VERDICTS,
   ) {}
 
   async advanceIteration(): Promise<IterationResult> {
@@ -131,7 +184,8 @@ export class HuntController {
     const { presented, result } = await this.decide(digest, projection);
 
     const dispatchResults = await this.runDispatches(iteration, result.decision);
-    return this.write(iteration, presented, result, dispatchResults);
+    const nullCheck = await this.runNullCheck(result.decision);
+    return this.write(iteration, presented, result, dispatchResults, nullCheck);
   }
 
   // A rejection is a correctable mistake, not a lost iteration: the Hunt Lead is
@@ -327,11 +381,110 @@ export class HuntController {
     );
   }
 
+  // The only call that can lead to proven. Runs before anything is written, so
+  // an iteration that pays the critic records the charge with its decision.
+  private async runNullCheck(decision: Decision): Promise<NullCheckAttempt> {
+    if (decision.action !== "VALIDATE") return NO_NULL_CHECK;
+    if (this.critic === undefined) {
+      return { result: null, blocked: "no disconfirmation critic is configured, so it stays active" };
+    }
+
+    // validateDecision has already required a target the ledger knows.
+    const hypothesis = this.ledger.projection.hypotheses.get(decision.target_hypothesis_id ?? "");
+    if (hypothesis === undefined) return NO_NULL_CHECK;
+    if (hypothesis.status !== "active") {
+      return { result: null, blocked: `already ${hypothesis.status}; no second verdict was run` };
+    }
+
+    try {
+      const result = await this.critic.argueNull(nullCheckInput(this.ledger.projection, hypothesis));
+      return { result, blocked: "" };
+    } catch (error) {
+      // A critic that cannot run fails closed. An unavailable argument is not a
+      // won one, and the hunt keeps going with the hypothesis still open.
+      return {
+        result: null,
+        blocked: `the disconfirmation critic failed (${(error as Error).message}), so it stays active`,
+      };
+    }
+  }
+
+  // The one writer of proven, and kept off write() because termination reads
+  // hypothesis terminality. Returns what to tell the operator.
+  private applyVerdict(iteration: number, decision: Decision, attempt: NullCheckAttempt): string {
+    const hypothesisId = decision.target_hypothesis_id ?? "";
+    if (attempt.result === null) return `${hypothesisId}: ${attempt.blocked}`;
+    const nullCheck = attempt.result;
+
+    const evidenceId = newId("ev");
+    this.ledger.append({
+      kind: "evidence",
+      evidence: {
+        evidence_id: evidenceId,
+        dispatch_id: null,
+        iteration,
+        source_system: CRITIC_SOURCE_SYSTEM,
+        summary: `strongest benign explanation: ${nullCheck.strongest_benign_explanation}`,
+        payload: {
+          hypothesis_id: hypothesisId,
+          survives: nullCheck.survives,
+          strongest_benign_explanation: nullCheck.strongest_benign_explanation,
+          rationale: nullCheck.rationale,
+          model_id: nullCheck.model_id,
+          cost_usd: nullCheck.cost_usd,
+        },
+        salience: "notable",
+        why_notable: nullCheck.rationale,
+        provenance: NULL_CHECK_PROVENANCE,
+        attacker_influenceable: false,
+        instruction_like: false,
+        captured_at: new Date().toISOString(),
+      },
+    });
+
+    // A benign explanation that stands is counter-evidence like any other: it
+    // enters the record, reaches the next digest, and is never a verdict itself.
+    if (!nullCheck.survives) {
+      this.ledger.append({
+        kind: "link",
+        link: { evidence_id: evidenceId, hypothesis_id: hypothesisId, relation: "weakens" },
+      });
+    }
+
+    const strength = evidenceStrength(this.ledger.projection, hypothesisId);
+
+    // Checked whichever way the critic argued: not having been able to look is
+    // never the same as having cleared it, so this closes inconclusive.
+    if (strength.open_gaps >= this.verdicts.gap_lock_threshold) {
+      this.ledger.patch("hypothesis", hypothesisId, {
+        status: "inconclusive",
+        resolution_reason:
+          `gap-locked: ${strength.open_gaps} open visibility gap(s) bear on this hypothesis, ` +
+          "so the hunt could not look rather than having cleared it",
+        evidence_strength: strength,
+      });
+      return `${hypothesisId} inconclusive (gap-locked)`;
+    }
+
+    const unmet = unmetPredicates(strength, this.verdicts);
+    if (unmet.length > 0) return `${hypothesisId} stays active: ${unmet.join("; ")}`;
+
+    this.ledger.patch("hypothesis", hypothesisId, {
+      status: "proven",
+      resolution_reason:
+        `survived the argue-the-null pass against "${nullCheck.strongest_benign_explanation}" ` +
+        `on ${strength.corroborating_sources} corroborating source system(s)`,
+      evidence_strength: strength,
+    });
+    return `${hypothesisId} proven`;
+  }
+
   private write(
     iteration: number,
     digest: Digest,
     result: DecisionResult,
     dispatchResults: readonly DispatchResult[],
+    nullCheck: NullCheckAttempt,
   ): IterationResult {
     const decisionId = newId("dec");
     this.ledger.append({
@@ -345,10 +498,13 @@ export class HuntController {
       },
     });
 
+    // The critic is a paid call like any other, so it lands in the budget
+    // counter rather than being spent off the books.
+    const spent = Number((result.cost_usd + (nullCheck.result?.cost_usd ?? 0)).toFixed(6));
     const hunt = this.ledger.projection.hunt;
     this.ledger.patch("hunt", hunt.hunt_id, {
       iteration,
-      cost_usd: Number((hunt.cost_usd + result.cost_usd).toFixed(6)),
+      cost_usd: Number((hunt.cost_usd + spent).toFixed(6)),
     });
 
     const appended = dispatchResults.reduce(
@@ -356,12 +512,18 @@ export class HuntController {
       0,
     );
 
-    let note = "";
+    // Before termination: a verdict reached this iteration must be on the record
+    // when the terminal path coerces whatever is still active.
+    const notes: string[] = [];
+    if (result.decision.action === "VALIDATE") {
+      notes.push(this.applyVerdict(iteration, result.decision, nullCheck));
+    }
+
     if (result.decision.action === "CONCLUDE") {
       this.terminate("completed");
     } else if (this.budgetExhausted()) {
       this.terminate("budget_terminated");
-      note = "budget exhausted";
+      notes.push("budget exhausted");
     }
 
     const final = this.ledger.projection.hunt;
@@ -370,11 +532,11 @@ export class HuntController {
       iteration,
       action: result.decision.action,
       decision_id: decisionId,
-      cost_usd: result.cost_usd,
+      cost_usd: spent,
       evidence_appended: appended,
       hunt_status: final.status,
       hunt_outcome: final.outcome,
-      note,
+      note: notes.filter((entry) => entry !== "").join("; "),
     };
   }
 

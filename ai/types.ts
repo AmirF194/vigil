@@ -108,6 +108,19 @@ export interface Hypothesis {
   attack_technique: string | null;
   provenance: string;
   resolution_reason: string | null;
+  // What the numbers were at verdict time. Absent while the hypothesis is
+  // active; a verdict that cannot be re-read is not auditable.
+  evidence_strength?: EvidenceStrength | null;
+}
+
+// Controller-computed from deterministic features of the ledger, never a model
+// self-report, and the only thing a verdict is allowed to gate on.
+export interface EvidenceStrength {
+  corroborating_sources: number;
+  contradicting_records: number;
+  open_gaps: number;
+  attacker_influenceable_only: boolean;
+  survived_disconfirmation: boolean;
 }
 
 export interface OpenQuestion {
@@ -234,6 +247,31 @@ export interface DispatchResult {
   questions?: string[];
   failed: boolean;
   failure_reason: string;
+}
+
+export interface NullCheckEvidence {
+  relation: LinkRelation;
+  record: EvidenceRecord;
+}
+
+// What the disconfirmation critic is given: the claim and the raw payloads
+// behind it. Deliberately not the digest — the digest is the Hunt Lead's own
+// compression of its own case, and an argument built inside it is not independent.
+export interface NullCheckInput {
+  hypothesis_id: string;
+  statement: string;
+  narrative: string;
+  evidence: NullCheckEvidence[];
+}
+
+export interface NullCheckResult {
+  // Whether the hypothesis is left standing. false means the benign explanation
+  // accounts for the evidence, so nothing here has been shown.
+  survives: boolean;
+  strongest_benign_explanation: string;
+  rationale: string;
+  cost_usd: number;
+  model_id: string;
 }
 
 export interface IterationResult {
