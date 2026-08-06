@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# vigil-hunt — the threat-hunting harness CLI.
+# Thin wrapper so the command reads like a tool rather than a module path.
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+exec python -m core.hunting.cli "$@"

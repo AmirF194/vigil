@@ -61,6 +61,18 @@ from database.models import (
     ChatMessage,
 )
 
+# The Hunt Ledger owns its own tables in core/hunting/models.py; they ride the
+# same Base, so they only need importing here to reach create_all().
+from core.hunting.models import (  # noqa: F401
+    HuntRecord,
+    HuntHypothesis,
+    HuntOpenQuestion,
+    HuntEvidence,
+    HuntEvidenceLink,
+    HuntDecision,
+    HuntDispatch,
+)
+
 from core.config import get_settings
 from core.secrets import get_secret
 
