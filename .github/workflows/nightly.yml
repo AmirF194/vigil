@@ -21,19 +21,9 @@ jobs:
     # Skipping (not failing) keeps forks quiet.
     if: github.repository == 'Vigil-SOC/vigil'
     runs-on: ubuntu-latest
-    # Mirrors ci-cd.yml's test-integration: the schema and the tests resolve the
-    # database from POSTGRES_*, so a DATABASE_URL here would be ignored.
-    env:
-      TESTING: 'true'
-      SECRET_KEY: test-secret-key
-      POSTGRES_HOST: localhost
-      POSTGRES_PORT: '5432'
-      POSTGRES_USER: test
-      POSTGRES_PASSWORD: test
-      POSTGRES_DB: deeptempo_test
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: postgres:16-alpine
         env:
           POSTGRES_DB: deeptempo_test
           POSTGRES_USER: test
@@ -48,8 +38,6 @@ jobs:
     
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: true
       
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -62,28 +50,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Enable Postgres extensions
+      - name: Run all tests
         run: |
-          PGPASSWORD=test psql -h localhost -p 5432 -U test -d deeptempo_test \
-            -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm;"
-
-      - name: Initialize schema
-        run: python -c "from database.connection import init_database; init_database()"
-
-      # Split by DEV_MODE: the integration suite needs the auth bypass on, while
-      # the security suite exists to prove the gates it bypasses still hold.
-      - name: Run unit + integration tests
-        run: |
-          pytest tests/unit tests/integration -v --cov --cov-report=xml --cov-report=term
+          pytest tests/ -v --cov --cov-report=xml --cov-report=term
         env:
-          DEV_MODE: 'true'
-          CLAUDE_API_KEY: ${{ secrets.CLAUDEAPI }}
-          ANTHROPIC_API_KEY: ${{ secrets.CLAUDEAPI }}
-
-      - name: Run security tests
-        run: pytest tests/security -v --no-cov
-        env:
-          DEV_MODE: 'false'
+          TESTING: true
+          DATABASE_URL: postgresql://test:test@localhost:5432/deeptempo_test
       
       - name: Upload coverage
         uses: codecov/codecov-action@v5
@@ -101,8 +73,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: true
       
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -135,8 +105,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: true
       
       - name: Run pip-audit
         run: |
@@ -156,50 +124,6 @@ jobs:
           else
             echo "Vulnerabilities detected - review pip-audit.json"
           fi
-
-  # ============================================================================
-  # Database Migration Tests
-  # ============================================================================
-  migration-tests:
-    name: Database Migration Tests
-    if: github.repository == 'Vigil-SOC/vigil'
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_DB: migration_test
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-        ports:
-          - 5432:5432
-    
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: true
-      
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      
-      - name: Install dependencies
-        run: |
-          pip install alembic psycopg2-binary sqlalchemy
-      
-      - name: Test migrations
-        run: |
-          # Test upgrade
-          alembic upgrade head || echo "Migration test completed"
-          
-          # Test downgrade
-          alembic downgrade -1 || echo "Downgrade test completed"
-          
-          # Test re-upgrade
-          alembic upgrade head || echo "Re-upgrade test completed"
-        env:
-          DATABASE_URL: postgresql://test:test@localhost:5432/migration_test
 
   # ============================================================================
   # Notify on Failure

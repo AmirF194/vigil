@@ -13,12 +13,12 @@ All routine operations are pure Python logic.
 import asyncio
 import json
 import logging
-import os
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from core.config import get_settings
 from daemon.agent_runner import AgentRunner
 from daemon.config import OrchestratorConfig
 
@@ -67,6 +67,7 @@ from daemon.plan_generator import (
 )
 from daemon.shared_intel import SharedIntelligence
 from daemon.workdir import WorkdirManager
+from services.soc_agents import ORCHESTRATION_DECISION_ID, ORCHESTRATOR_ACTOR
 
 logger = logging.getLogger(__name__)
 
@@ -731,7 +732,7 @@ class Orchestrator:
                 confidence=0.8,
                 reason=f"[Auto-investigation {inv_id}] {action.get('reason', '')}",
                 evidence=[inv_id],
-                created_by="orchestrator",
+                created_by=ORCHESTRATOR_ACTOR,
             )
             logger.info(f"Created approval action for {inv_id}: {action_str}")
         except Exception as e:
@@ -841,7 +842,7 @@ class Orchestrator:
         only when explicitly set to "false" to allow emergency disable in
         broken environments.
         """
-        if os.environ.get("MEMPALACE_DAEMON_ENABLED", "true").lower() == "false":
+        if get_settings().mempalace_daemon_enabled is False:
             logger.warning(
                 "MemPalace daemon integration disabled via MEMPALACE_DAEMON_ENABLED=false "
                 "(core dependency — only disable for emergency debugging)"
@@ -955,7 +956,7 @@ class Orchestrator:
 
                 entry = AIDecisionLog(
                     decision_id=f"orch-{uuid.uuid4().hex[:8]}",
-                    agent_id="orchestrator",
+                    agent_id=ORCHESTRATION_DECISION_ID,
                     workflow_id=inv_id,
                     finding_id=finding_id,
                     case_id=case_id,
@@ -964,7 +965,7 @@ class Orchestrator:
                     reasoning=reasoning,
                     recommended_action=action,
                     decision_metadata={
-                        "source": "orchestrator",
+                        "source": ORCHESTRATOR_ACTOR,
                         "investigation_id": inv_id,
                     },
                 )
@@ -1107,10 +1108,7 @@ class Orchestrator:
     ):
         """Optionally forward urgent notifications to Slack."""
         try:
-            import os
-
-            slack_enabled = os.getenv("DAEMON_SLACK_ENABLED", "false").lower() == "true"
-            if not slack_enabled:
+            if get_settings().daemon_slack_enabled is not True:
                 return
 
             import requests
