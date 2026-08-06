@@ -19,6 +19,10 @@ import {
 
 export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
 
+// One emission plus two re-asks. Bounded because a Hunt Lead that cannot obey
+// the vocabulary will not learn to on the tenth try, and every ask costs money.
+export const MAX_DECISION_ATTEMPTS = 3;
+
 export class HuntAlreadyTerminal extends Error {}
 export class InvalidDecision extends Error {}
 
@@ -44,6 +48,19 @@ export function validateDecision(decision: Decision, projection: Projection): vo
   if (unknown.length > 0) {
     throw new InvalidDecision(`${decision.action} cites unknown evidence: ${unknown.join(", ")}`);
   }
+}
+
+// The violation goes back to the Hunt Lead as a digest note, which is where the
+// digest already carries controller-side observations, so the re-ask needs no
+// change to the DecisionProvider port.
+function withRejection(digest: Digest, reason: string): Digest {
+  return {
+    ...digest,
+    notes: [
+      ...digest.notes,
+      `Your previous emission was rejected: ${reason}. Emit one decision from the closed vocabulary, citing only evidence ids present in this digest.`,
+    ],
+  };
 }
 
 export function startHunt(spec: HuntSpec, dir: string): Ledger {
@@ -111,11 +128,52 @@ export class HuntController {
     const iteration = projection.hunt.iteration + 1;
     const digest = buildDigest(projection, iteration, this.digestPolicy.evidence_window);
 
-    const result = await this.provider.decide(digest);
-    validateDecision(result.decision, projection);
+    const { presented, result } = await this.decide(digest, projection);
 
     const dispatchResults = await this.runDispatches(iteration, result.decision);
-    return this.write(iteration, digest, result, dispatchResults);
+    return this.write(iteration, presented, result, dispatchResults);
+  }
+
+  // A rejection is a correctable mistake, not a lost iteration: the Hunt Lead is
+  // told what was wrong and asked again, boundedly. The digest returned is the
+  // one that produced the accepted decision, rejection notes included, so
+  // digest_presented stays honest by construction.
+  private async decide(
+    digest: Digest,
+    projection: Projection,
+  ): Promise<{ presented: Digest; result: DecisionResult }> {
+    // Schema-level rejections from inside the provider and controller-level ones
+    // from here are the same audit fact, so they merge into one list in order.
+    const rejected: string[] = [];
+    let presented = digest;
+
+    for (let attempt = 0; attempt < MAX_DECISION_ATTEMPTS; attempt += 1) {
+      const result = await this.provider.decide(presented);
+      rejected.push(...(result.rejected_attempts ?? []));
+
+      try {
+        validateDecision(result.decision, projection);
+      } catch (error) {
+        if (!(error instanceof InvalidDecision)) throw error;
+        rejected.push(error.message);
+        presented = withRejection(presented, error.message);
+        continue;
+      }
+
+      // Left absent rather than empty when nothing was rejected, so a clean
+      // iteration journals exactly what it did before.
+      return {
+        presented,
+        result: rejected.length > 0 ? { ...result, rejected_attempts: rejected } : result,
+      };
+    }
+
+    // Known simplification for Phase 1: a wholly-failed iteration writes nothing
+    // to the ledger and surfaces to the operator, who can retry the still-active
+    // hunt. The rejected emissions live in this error rather than in an event.
+    throw new InvalidDecision(
+      `the Hunt Lead emitted nothing valid in ${MAX_DECISION_ATTEMPTS} attempts: ${rejected.join(" | ")}`,
+    );
   }
 
   // Returns true when a directive ended the hunt. A lead becomes a real lead; a

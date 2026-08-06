@@ -4,11 +4,24 @@ import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { buildDigest } from "../ai/digest.js";
 import { Ledger, newId } from "../ai/ledger.js";
-import { HuntController, InvalidDecision, startHunt, validateDecision } from "../ai/loop.js";
+import {
+  HuntController,
+  InvalidDecision,
+  MAX_DECISION_ATTEMPTS,
+  startHunt,
+  validateDecision,
+} from "../ai/loop.js";
 import { ScriptedDecisionProvider, ScriptedWorkerDispatcher } from "../ai/scripted.js";
 import { buildSpec, loadArch, parsePlaybook, SpecError } from "../ai/spec.js";
-import type { WorkerDispatcher } from "../ai/ports.js";
-import type { Decision, DispatchRequest, DispatchResult } from "../ai/types.js";
+import type { DecisionProvider, WorkerDispatcher } from "../ai/ports.js";
+import type {
+  Decision,
+  DecisionAction,
+  DecisionResult,
+  Digest,
+  DispatchRequest,
+  DispatchResult,
+} from "../ai/types.js";
 
 let dir: string;
 beforeEach(() => {
@@ -114,6 +127,78 @@ describe("controller", () => {
     expect(() =>
       validateDecision({ action: "ABANDON", rationale: "no", evidence_citations: ["ev-nope"] }, ledger.projection),
     ).toThrow(/unknown evidence/);
+  });
+});
+
+describe("bounded re-prompt", () => {
+  // Repeats one emission forever, so the bound is what stops the loop rather
+  // than a script running out.
+  class StubbornProvider implements DecisionProvider {
+    readonly seenDigests: Digest[] = [];
+    constructor(private readonly decision: Decision) {}
+    async decide(digest: Digest): Promise<DecisionResult> {
+      this.seenDigests.push(digest);
+      return { decision: this.decision, model_id: "scripted", prompt_version: "scripted/v0", cost_usd: 0 };
+    }
+  }
+
+  const UNCITED_ABANDON: Decision = { action: "ABANDON", rationale: "dead end" };
+  const OUT_OF_VOCAB = { action: "ESCALATE" as DecisionAction, rationale: "made up" };
+  const DANGLING_PIVOT: Decision = {
+    action: "PIVOT",
+    rationale: "follow the host",
+    evidence_citations: ["ev-nope"],
+  };
+
+  it.each([
+    ["an uncited ABANDON", UNCITED_ABANDON, /ABANDON must cite the evidence/],
+    ["an out-of-vocabulary action", OUT_OF_VOCAB, /unknown action ESCALATE/],
+    ["a dangling citation", DANGLING_PIVOT, /PIVOT cites unknown evidence: ev-nope/],
+  ])("re-asks after %s and accepts the correction", async (_label, bad, expected) => {
+    const ledger = ledgerFor();
+    const provider = new ScriptedDecisionProvider([bad, CONCLUDE]);
+    const result = await new HuntController(ledger, provider).advanceIteration();
+
+    expect(result.action).toBe("CONCLUDE");
+    expect(ledger.projection.decisions).toHaveLength(1);
+
+    const record = ledger.projection.decisions[0]!;
+    expect(record.rejected_attempts).toHaveLength(1);
+    expect(record.rejected_attempts![0]).toMatch(expected);
+
+    // The digest persisted with the accepted decision is the one that produced
+    // it, so the rejection the model was shown is on the record too.
+    expect(record.digest_presented.notes.join(" ")).toMatch(/previous emission was rejected/);
+    expect(provider.seenDigests).toHaveLength(2);
+    expect(provider.seenDigests[0]!.notes.join(" ")).not.toMatch(/previous emission was rejected/);
+  });
+
+  it("gives up after the bound and writes nothing for that iteration", async () => {
+    const ledger = ledgerFor();
+    const provider = new StubbornProvider(UNCITED_ABANDON);
+    const before = readFileSync(ledger.path, "utf8");
+
+    await expect(new HuntController(ledger, provider).advanceIteration()).rejects.toThrow(InvalidDecision);
+
+    expect(provider.seenDigests).toHaveLength(MAX_DECISION_ATTEMPTS);
+    expect(readFileSync(ledger.path, "utf8")).toBe(before);
+    expect(ledger.projection.decisions).toHaveLength(0);
+    // The hunt stays active, so an operator can retry it.
+    expect(ledger.projection.hunt.iteration).toBe(0);
+    expect(ledger.projection.hunt.status).toBe("active");
+  });
+
+  it("leaves rejected_attempts absent when the first emission is accepted", async () => {
+    const ledger = ledgerFor();
+    await new HuntController(ledger, new ScriptedDecisionProvider([CONCLUDE])).advanceIteration();
+    expect(ledger.projection.decisions[0]!.rejected_attempts).toBeUndefined();
+  });
+
+  it("round-trips stated_confidence without gating on it", async () => {
+    const ledger = ledgerFor();
+    const confident: Decision = { ...CONCLUDE, stated_confidence: 0.42 };
+    await new HuntController(ledger, new ScriptedDecisionProvider([confident])).advanceIteration();
+    expect(ledger.projection.decisions[0]!.decision.stated_confidence).toBe(0.42);
   });
 });
 
