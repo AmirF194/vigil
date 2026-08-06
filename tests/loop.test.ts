@@ -188,6 +188,17 @@ describe("bounded re-prompt", () => {
     expect(ledger.projection.hunt.status).toBe("active");
   });
 
+  it("charges the hunt for rejected emissions, not just the accepted one", async () => {
+    const ledger = ledgerFor();
+    const provider = new ScriptedDecisionProvider([UNCITED_ABANDON, CONCLUDE], 0.03);
+    await new HuntController(ledger, provider).advanceIteration();
+
+    // Two paid calls: a rejected emission still cost money, and hunt.cost_usd
+    // is the budget counter.
+    expect(ledger.projection.decisions[0]!.cost_usd).toBeCloseTo(0.06, 10);
+    expect(ledger.projection.hunt.cost_usd).toBeCloseTo(0.06, 10);
+  });
+
   it("leaves rejected_attempts absent when the first emission is accepted", async () => {
     const ledger = ledgerFor();
     await new HuntController(ledger, new ScriptedDecisionProvider([CONCLUDE])).advanceIteration();

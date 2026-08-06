@@ -145,11 +145,16 @@ export class HuntController {
     // Schema-level rejections from inside the provider and controller-level ones
     // from here are the same audit fact, so they merge into one list in order.
     const rejected: string[] = [];
+    // A rejected emission was still paid for. Charging only the accepted one
+    // would under-report spend by up to the attempt bound, which both hides
+    // cost-per-verdict and lets a hunt overrun max_cost_usd.
+    let spent = 0;
     let presented = digest;
 
     for (let attempt = 0; attempt < MAX_DECISION_ATTEMPTS; attempt += 1) {
       const result = await this.provider.decide(presented);
       rejected.push(...(result.rejected_attempts ?? []));
+      spent += result.cost_usd;
 
       try {
         validateDecision(result.decision, projection);
@@ -164,15 +169,21 @@ export class HuntController {
       // iteration journals exactly what it did before.
       return {
         presented,
-        result: rejected.length > 0 ? { ...result, rejected_attempts: rejected } : result,
+        result: {
+          ...result,
+          cost_usd: spent,
+          ...(rejected.length > 0 ? { rejected_attempts: rejected } : {}),
+        },
       };
     }
 
     // Known simplification for Phase 1: a wholly-failed iteration writes nothing
     // to the ledger and surfaces to the operator, who can retry the still-active
-    // hunt. The rejected emissions live in this error rather than in an event.
+    // hunt. The rejected emissions live in this error rather than in an event,
+    // and their cost goes unrecorded with them.
     throw new InvalidDecision(
-      `the Hunt Lead emitted nothing valid in ${MAX_DECISION_ATTEMPTS} attempts: ${rejected.join(" | ")}`,
+      `the Hunt Lead emitted nothing valid in ${MAX_DECISION_ATTEMPTS} attempts ` +
+        `($${spent.toFixed(4)} spent): ${rejected.join(" | ")}`,
     );
   }
 
