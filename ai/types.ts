@@ -38,7 +38,8 @@ export const ACTIONS_REQUIRING_CITATION: ReadonlySet<DecisionAction> = new Set([
 // What the controller actually does something about. An arch may only declare
 // these: a verb that is merely in the vocabulary would be journaled, change
 // nothing, and cost an iteration, and the Hunt Lead would keep choosing it.
-// Grows as the controller learns a verb — CHECKPOINT and HANDOFF_IR wait on 09.
+// Complete as of ticket 09: CHECKPOINT raises a budget_anomaly and HANDOFF_IR
+// escalates a proven hypothesis, so the whole Phase 1 vocabulary now runs.
 export const EXECUTABLE_ACTIONS = [
   "INVESTIGATE",
   "EXPAND",
@@ -46,7 +47,9 @@ export const EXECUTABLE_ACTIONS = [
   "DEEPEN",
   "ABANDON",
   "VALIDATE",
+  "CHECKPOINT",
   "CONCLUDE",
+  "HANDOFF_IR",
 ] as const satisfies readonly DecisionAction[];
 
 // parked is the budget checkpoint: the hunt has stopped spending and waits on an
@@ -69,12 +72,15 @@ export const OUTCOME_PRECEDENCE: Record<HuntOutcome, number> = {
   aborted: 3,
 };
 
+// handed_off is terminal for the hunt but not an ending of it: the claim now
+// belongs to incident response, and the hunt carries on with the rest.
 export type HypothesisStatus =
   | "active"
   | "proven"
   | "disproven"
   | "inconclusive"
-  | "parked";
+  | "parked"
+  | "handed_off";
 
 export type Salience = "routine" | "notable" | "anomalous";
 export type LinkRelation = "supports" | "weakens";
@@ -111,8 +117,19 @@ export interface Entity {
 // Human input, and the one thing in the ledger that is direction rather than
 // data. Applied by the controller at an iteration boundary, never written as state.
 // extend and conclude resolve the budget checkpoint; abort ends the hunt from
-// any state.
-export type DirectiveKind = "note" | "lead" | "abort" | "extend" | "conclude";
+// any state; approve and reject answer a raised checkpoint; benign, gap and boost
+// are the soft set, each a reversible authorization that deletes nothing.
+export type DirectiveKind =
+  | "note"
+  | "lead"
+  | "abort"
+  | "extend"
+  | "conclude"
+  | "approve"
+  | "reject"
+  | "benign"
+  | "gap"
+  | "boost";
 
 // What an extend buys. Parsed from the operator's text when the directive is
 // queued, so the ledger records the ask as numbers rather than prose the drain
@@ -129,6 +146,17 @@ export interface Directive {
   text: string;
   created_at: string;
   grant?: BudgetGrant;
+  // Which checkpoint an approve or a reject answers. Typed rather than parsed
+  // out of the text, so an answer can never land on the wrong question.
+  checkpoint_id?: string;
+  // What the soft set names: the entity a benign suppresses, the lead a boost
+  // pins, the hypothesis a declared gap bears on.
+  entity_key?: string;
+  question_id?: string;
+  hypothesis_id?: string;
+  // Set on the benign that lifts an earlier one. Reversal is an append like
+  // everything else — the suppression it undoes stays on the record.
+  revoke?: boolean;
   // Set on the notes the controller journals itself (a refused CONCLUDE, a
   // clamped extension). The inbox drain counts only what the operator wrote, so
   // a controller note can never make it skip a real directive.
@@ -171,6 +199,21 @@ export interface Hypothesis {
   // What the numbers were at verdict time. Absent while the hypothesis is
   // active; a verdict that cannot be re-read is not auditable.
   evidence_strength?: EvidenceStrength | null;
+  // The IR case this claim was escalated into. Local to this app — the ADR
+  // traded away the Vigil Case foreign key — so it names a case file beside the
+  // ledger rather than a row another process can read.
+  spawned_case_id?: string | null;
+}
+
+// HANDOFF_IR, journaled. The hunt keeps running after one: an escalation moves a
+// claim to another team, it does not end the investigation that found it.
+export interface Handoff {
+  case_id: string;
+  hypothesis_id: string;
+  iteration: number;
+  rationale: string;
+  case_file: string;
+  created_at: string;
 }
 
 // Controller-computed from deterministic features of the ledger, never a model
@@ -312,6 +355,10 @@ export interface EntityView {
   value: string;
   count: number;
   first_evidence_id: string;
+  // An operator called it known-benign. Annotated rather than hidden: the
+  // records that mention it are untouched, and a hunt that silently dropped an
+  // entity from the digest would be hiding evidence rather than de-prioritising it.
+  suppressed?: boolean;
 }
 
 // A raw payload the lead asked for by id. Rendered delimited, like all evidence.

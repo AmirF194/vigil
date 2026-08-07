@@ -1,11 +1,22 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildDigest, focusOf, rankFrontier } from "./digest.js";
-import { buildEntityGraph, entitiesOf, key } from "./entities.js";
-import { drain, grantOf, journalNote } from "./inbox.js";
+import {
+  AUTO_ACTOR,
+  DEFAULT_CHECKPOINTS,
+  pendingCheckpoints,
+  raiseCheckpoint,
+  resolutionOf,
+  resolveCheckpoint,
+  type Checkpoint,
+  type CheckpointClass,
+  type Checkpoints,
+} from "./checkpoints.js";
+import { buildDigest, focusOf, rankFrontier, suppressedEntities } from "./digest.js";
+import { buildEntityGraph, entitiesOf, fromText, key } from "./entities.js";
+import { drain, grantOf, journalNote, peek } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
 import type { DecisionProvider, DisconfirmationCritic, Enricher, WorkerDispatcher } from "./ports.js";
-import { buildReport, renderReport, reportPath } from "./report.js";
+import { buildReport, caseFilePath, renderCaseFile, renderReport, reportPath } from "./report.js";
 import { sanitize, sanitizeQuestion } from "./sanitize.js";
 import {
   DEFAULT_DIGEST,
@@ -24,6 +35,7 @@ import {
   CRITIC_SOURCE_SYSTEM,
   evidenceStrength,
   NULL_CHECK_PROVENANCE,
+  OPERATOR_GAP_PROVENANCE,
   UNDECLARED_SOURCE,
   unmetPredicates,
 } from "./strength.js";
@@ -50,6 +62,11 @@ import {
   type OpenQuestion,
   type WorkerEvidence,
 } from "./types.js";
+
+// A dispatch that never ran because an operator had already halted the hunt.
+// Recorded through the failure path like any other unanswered query: the record
+// has to say why it never ran, or the hunt looks like it chose not to look.
+const SKIPPED_ON_ABORT = "skipped: an operator abort was queued before this worker started";
 
 export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
 
@@ -215,12 +232,15 @@ function withRejection(digest: Digest, reason: string): Digest {
 export function startHunt(spec: HuntSpec, dir: string): Ledger {
   const now = new Date().toISOString();
   const huntId = newId("hunt");
+  const policy = (spec.checkpoints ?? DEFAULT_CHECKPOINTS).hypothesis_approval;
   const ledger = Ledger.create(join(dir, `${huntId}.jsonl`), {
     hunt_id: huntId,
     name: spec.name,
     spec,
     seed: newId("seed", 8),
-    status: "active",
+    // A hunt awaiting its start approval has not begun: no query runs, no money
+    // is spent, and the checkpoint below is the only thing that releases it.
+    status: policy === "ask" ? "pending_approval" : "active",
     outcome: null,
     iteration: 0,
     cost_usd: 0,
@@ -247,6 +267,27 @@ export function startHunt(spec: HuntSpec, dir: string): Ledger {
         evidence_strength: null,
       },
     });
+  }
+
+  // Raised whichever way the policy falls, so the approval is a ledger fact
+  // rather than something the CLI remembers: an approval that isn't on the
+  // ledger never happened, and one that policy gave says who gave it.
+  const checkpoint = raiseCheckpoint(
+    ledger,
+    "hypothesis_approval",
+    0,
+    `Approve and start this hunt on ${spec.hypotheses.length} hypothesis(es)?`,
+    {
+      hypotheses: [...ledger.projection.hypotheses.values()].map((hypothesis) => ({
+        hypothesis_id: hypothesis.hypothesis_id,
+        statement: hypothesis.statement,
+      })),
+      budgets: spec.budgets,
+      scope: spec.scope,
+    },
+  );
+  if (policy === "auto") {
+    resolveCheckpoint(ledger, checkpoint, "approved", AUTO_ACTOR, "checkpoint policy hypothesis_approval=auto");
   }
   return ledger;
 }
@@ -287,6 +328,13 @@ export class HuntController {
     return this.ledger.projection.hunt.spec.termination ?? DEFAULT_TERMINATION;
   }
 
+  // Read from the journaled spec for the same reason the others are: whether a
+  // class stops and asks was settled when the hunt started, so an edited config
+  // cannot quietly auto-approve a verdict on a hunt already parked for review.
+  private get checkpoints(): Checkpoints {
+    return this.ledger.projection.hunt.spec.checkpoints ?? DEFAULT_CHECKPOINTS;
+  }
+
   async advanceIteration(): Promise<IterationResult> {
     if (this.ledger.projection.hunt.status === "terminal") {
       const hunt = this.ledger.projection.hunt;
@@ -297,12 +345,9 @@ export class HuntController {
     // it — and it is how a parked hunt is resolved, so it is drained first.
     if (this.applyDirectives()) return this.halted();
 
-    const parked = this.ledger.projection.hunt;
-    if (parked.status === "parked") {
-      throw new HuntParked(
-        `${parked.hunt_id} is parked: ${parked.parked_reason ?? "awaiting an operator"}. ` +
-          "Resolve it with a directive — extend (grant +N iterations or +$N), conclude (accept the stop), or abort.",
-      );
+    const suspended = this.ledger.projection.hunt;
+    if (suspended.status === "parked" || suspended.status === "pending_approval") {
+      throw new HuntParked(this.suspendedBecause());
     }
 
     const projection = this.ledger.projection;
@@ -413,12 +458,18 @@ export class HuntController {
 
   // Returns true when the hunt ended here. A lead becomes a real lead; a note
   // only reaches the digest, so it steers without mutating anything; extend and
-  // conclude resolve the budget checkpoint.
+  // conclude resolve the budget checkpoint; approve and reject answer a raised
+  // one; the soft set is applied here so it lands at a boundary and never
+  // mid-iteration, where it would change the ground under a decision in flight.
   private applyDirectives(): boolean {
     let abort = false;
     let conclude = false;
 
+    // Everything pending is journaled by the drain before any of it is applied,
+    // so an operator's input is on the record even when an earlier directive in
+    // the same batch ends the hunt before this loop reaches it.
     for (const directive of drain(this.ledger)) {
+      if (this.ledger.projection.hunt.status === "terminal") break;
       switch (directive.kind) {
         case "abort":
           abort = true;
@@ -427,15 +478,29 @@ export class HuntController {
           conclude = true;
           break;
         case "lead":
-          this.raise(directive.text, { spawned_iteration: this.ledger.projection.hunt.iteration + 1 });
+          this.applyLead(directive);
           break;
         case "extend":
           this.extend(directive);
+          break;
+        case "approve":
+        case "reject":
+          this.applyResolution(directive);
+          break;
+        case "benign":
+          this.applyBenign(directive);
+          break;
+        case "gap":
+          this.applyGap(directive);
+          break;
+        case "boost":
+          this.applyBoost(directive);
           break;
         case "note":
           break;
       }
     }
+    if (this.ledger.projection.hunt.status === "terminal") return true;
 
     if (abort) {
       this.terminate("aborted", "an operator halted the hunt");
@@ -450,6 +515,324 @@ export class HuntController {
     // After the drain, not before: an answer already waiting in the inbox is an
     // operator who did respond, however late the process got around to reading it.
     return this.expireParked();
+  }
+
+  // Marking an entity known-benign appends a suppression; lifting it appends the
+  // reversal. Neither touches a record: the evidence that mentions the entity
+  // stays exactly where it was, and the digest says the entity was suppressed
+  // rather than quietly dropping it.
+  private applyBenign(directive: Directive): void {
+    const entityKey = directive.entity_key ?? directive.text.trim();
+    if (entityKey === "") {
+      journalNote(this.ledger, `${directive.actor} sent a benign directive naming no entity; nothing was suppressed.`);
+      return;
+    }
+    journalNote(
+      this.ledger,
+      directive.revoke === true
+        ? `${directive.actor} lifted the known-benign suppression on ${entityKey}; it is back in play.`
+        : `${directive.actor} marked ${entityKey} known-benign. Its evidence stands; the hunt opens no new work on it.`,
+    );
+  }
+
+  // A blind spot no query would ever return. Journaled as a gap record so it
+  // counts exactly like a tool failure — including gap-locking a hypothesis it
+  // bears on, which is the point: a verdict reached over known blindness is a
+  // verdict about what the hunt could see, not about what happened.
+  private applyGap(directive: Directive): void {
+    const hypothesisId =
+      directive.hypothesis_id !== undefined && this.ledger.projection.hypotheses.has(directive.hypothesis_id)
+        ? directive.hypothesis_id
+        : null;
+
+    this.appendEvidence(
+      [
+        {
+          source_system: "operator",
+          summary: `operator-declared visibility gap: ${directive.text}`,
+          payload: { hypothesis_id: hypothesisId, actor: directive.actor, directive_id: directive.directive_id },
+          salience: "notable",
+          why_notable: "the hunt cannot see here, and no query will tell it so",
+          provenance: OPERATOR_GAP_PROVENANCE,
+          attacker_influenceable: false,
+          instruction_like: false,
+        },
+      ],
+      this.ledger.projection.hunt.iteration,
+      null,
+    );
+  }
+
+  private applyBoost(directive: Directive): void {
+    const questionId = directive.question_id ?? "";
+    const question = this.ledger.projection.questions.get(questionId);
+    if (question === undefined) {
+      journalNote(this.ledger, `${directive.actor} boosted ${questionId || "(no question named)"}, which is not on the frontier.`);
+      return;
+    }
+    journalNote(this.ledger, `${directive.actor} pinned ${questionId} to the top of the frontier: ${question.question}`);
+  }
+
+  // A lead is the one directive that can grow what the hunt looks at, so it is
+  // where scope is consulted. A tenant crossing is refused outright — a boundary
+  // an operator may waive is not a boundary — while growth inside the tenant is
+  // a question, and only when the playbook actually declared a scope to grow past.
+  private applyLead(directive: Directive): void {
+    const iteration = this.ledger.projection.hunt.iteration + 1;
+    if (this.refuseCrossTenant(directive)) return;
+
+    const outside = this.outsideScope(directive);
+    if (outside === null) {
+      this.raise(directive.text, { entity_key: directive.entity_key ?? null, spawned_iteration: iteration });
+      return;
+    }
+
+    const question = `Extend this hunt's scope to ${outside}?`;
+    const { checkpoint, parked } = this.ask("scope_extension", iteration, question, {
+      question: directive.text,
+      entity_key: outside,
+      actor: directive.actor,
+    });
+    if (parked) return;
+
+    this.autoResolved(checkpoint, "checkpoint policy scope_extension=auto");
+    this.extendScope(outside);
+    this.raise(directive.text, { entity_key: outside, spawned_iteration: iteration });
+  }
+
+  private refuseCrossTenant(directive: Directive): boolean {
+    const declared = this.ledger.projection.hunt.scope["tenant"];
+    if (typeof declared !== "string" || declared === "") return false;
+
+    const named = /\btenant[:=]\s*([^\s,;]+)/i.exec(directive.text)?.[1];
+    if (named === undefined || named.toLowerCase() === declared.toLowerCase()) return false;
+
+    journalNote(
+      this.ledger,
+      `${directive.actor}'s lead names tenant ${named}, and this hunt is scoped to ${declared}. ` +
+        "Refused outright rather than raised as a checkpoint: a tenant boundary is not one an operator may waive " +
+        "from inside the hunt. Start a hunt in that tenant instead. The hunt continues.",
+    );
+    return true;
+  }
+
+  // Only meaningful when the playbook declared a scope.entities list: with no
+  // declared boundary nothing is outside it, which is what keeps a plain hunt
+  // free of a checkpoint nobody asked for. The seed entity is deliberately not a
+  // boundary — it is what the hunt is about, and following the trail off it is
+  // the whole job.
+  private outsideScope(directive: Directive): string | null {
+    const declared = new Set((this.ledger.projection.hunt.scope["entities"] as string[] | undefined) ?? []);
+    if (declared.size === 0) return null;
+
+    const named = directive.entity_key ?? fromText(directive.text).map(key)[0];
+    return named !== undefined && !declared.has(named) ? named : null;
+  }
+
+  // Why the hunt will not step. The budget park keeps 08's wording, because its
+  // three answers are extend, conclude and abort; a raised checkpoint takes two
+  // different ones and has to name them, or an operator reads the wrong menu.
+  private suspendedBecause(): string {
+    const hunt = this.ledger.projection.hunt;
+    const pending = pendingCheckpoints(this.ledger.projection)[0];
+
+    if (pending !== undefined) {
+      return (
+        `${hunt.hunt_id} is waiting on ${pending.class} checkpoint ${pending.checkpoint_id}: ${pending.question} ` +
+        `Resolve it with a directive — approve ${pending.checkpoint_id}, or reject ${pending.checkpoint_id} with a reason.`
+      );
+    }
+    return (
+      `${hunt.hunt_id} is parked: ${hunt.parked_reason ?? "awaiting an operator"}. ` +
+      "Resolve it with a directive — extend (grant +N iterations or +$N), conclude (accept the stop), or abort."
+    );
+  }
+
+  // Raise, and stop if the policy says a human owns this one. The active-time
+  // clock pauses for free: a parked hunt advances no iteration and spends
+  // nothing, so a checkpoint left open overnight costs the hunt nothing but time.
+  private ask(
+    checkpointClass: CheckpointClass,
+    iteration: number,
+    question: string,
+    payload: Record<string, unknown>,
+  ): { checkpoint: Checkpoint; parked: boolean } {
+    const checkpoint = raiseCheckpoint(this.ledger, checkpointClass, iteration, question, payload);
+    if (this.checkpoints[checkpointClass] !== "ask") return { checkpoint, parked: false };
+
+    const hunt = this.ledger.projection.hunt;
+    this.ledger.patch("hunt", hunt.hunt_id, {
+      status: "parked",
+      parked_at: new Date().toISOString(),
+      // Carries the id, so unpark can tell this checkpoint's park from the
+      // budget park it must never lift on someone else's answer.
+      parked_reason: `awaiting ${checkpointClass} checkpoint ${checkpoint.checkpoint_id}: ${question}`,
+    });
+    return { checkpoint, parked: true };
+  }
+
+  private autoResolved(checkpoint: Checkpoint, reason: string): void {
+    resolveCheckpoint(this.ledger, checkpoint, "approved", AUTO_ACTOR, reason);
+  }
+
+  private unpark(checkpoint: Checkpoint): void {
+    const hunt = this.ledger.projection.hunt;
+    const held = hunt.status === "parked" && (hunt.parked_reason ?? "").includes(checkpoint.checkpoint_id);
+    if (!held && hunt.status !== "pending_approval") return;
+    this.ledger.patch("hunt", hunt.hunt_id, { status: "active", parked_at: null, parked_reason: null });
+  }
+
+  // An operator's answer to a raised question. The checkpoint is the authority:
+  // an answer to one that does not exist, or to one already settled, is journaled
+  // and ignored rather than applied to whatever is pending now.
+  private applyResolution(directive: Directive): void {
+    const projection = this.ledger.projection;
+    const checkpoint = projection.checkpoints.get(directive.checkpoint_id ?? "");
+    if (checkpoint === undefined) {
+      journalNote(
+        this.ledger,
+        `${directive.actor} answered checkpoint ${directive.checkpoint_id ?? "(none named)"}, which this hunt never raised.`,
+      );
+      return;
+    }
+
+    const settled = resolutionOf(projection, checkpoint.checkpoint_id);
+    if (settled !== undefined) {
+      journalNote(
+        this.ledger,
+        `${directive.actor} answered ${checkpoint.checkpoint_id}, already ${settled.verdict} by ${settled.actor}. ` +
+          "The first answer stands; reversing a decision is its own directive.",
+      );
+      return;
+    }
+
+    const approved = directive.kind === "approve";
+    resolveCheckpoint(
+      this.ledger,
+      checkpoint,
+      approved ? "approved" : "rejected",
+      directive.actor,
+      directive.text,
+      directive,
+    );
+
+    switch (checkpoint.class) {
+      case "hypothesis_approval":
+        this.resolveStart(checkpoint, directive, approved);
+        return;
+      case "verdict_review":
+        this.resolveVerdict(checkpoint, directive, approved);
+        return;
+      case "scope_extension":
+        this.resolveScope(checkpoint, directive, approved);
+        return;
+      case "budget_anomaly":
+        // The Hunt Lead asked for an adult. Either answer releases it — an
+        // operator who wants the hunt stopped says so with abort or conclude.
+        journalNote(
+          this.ledger,
+          approved
+            ? `${directive.actor} acknowledged the Hunt Lead's checkpoint: ${directive.text || "carry on"}.`
+            : `${directive.actor} did not accept the Hunt Lead's concern: ${directive.text || "carry on"}. ` +
+                "The hunt continues; take it into account.",
+        );
+        this.unpark(checkpoint);
+        return;
+    }
+  }
+
+  private resolveStart(checkpoint: Checkpoint, directive: Directive, approved: boolean): void {
+    if (approved) {
+      this.unpark(checkpoint);
+      return;
+    }
+    // Through terminate() like every other ending, so a hunt that was never
+    // allowed to start still finalizes: the report is a header and the
+    // hypotheses nobody approved, which is the honest record of what happened.
+    this.terminate("aborted", `${directive.actor} rejected the hypotheses at the start checkpoint: ${directive.text}`);
+  }
+
+  // The one place an approval reaches a hypothesis, and it applies the patch
+  // applyVerdict computed at VALIDATE time. Not a second path to proven: the
+  // strength numbers are the ones the ledger produced, never the operator's text.
+  private resolveVerdict(checkpoint: Checkpoint, directive: Directive, approved: boolean): void {
+    const payload = checkpoint.payload;
+
+    if (payload["kind"] === "conclude") {
+      if (approved) {
+        for (const questionId of (payload["park"] as string[] | undefined) ?? []) {
+          this.ledger.patch("question", questionId, {
+            status: "parked",
+            closed_reason: `parked to the backlog: below the priority floor of ${this.termination.priority_floor} when the hunt ended`,
+          });
+        }
+        this.terminate(
+          payload["outcome"] as HuntOutcome,
+          `${directive.actor} approved the conclusion at checkpoint ${checkpoint.checkpoint_id}`,
+        );
+        return;
+      }
+      journalNote(
+        this.ledger,
+        `${directive.actor} refused the conclusion at ${checkpoint.checkpoint_id}: ${directive.text || "no reason given"}. ` +
+          "The hunt continues; resolve what they raised before recommending CONCLUDE again.",
+      );
+      this.unpark(checkpoint);
+      return;
+    }
+
+    const hypothesisId = String(payload["hypothesis_id"] ?? "");
+    if (approved) {
+      this.ledger.patch("hypothesis", hypothesisId, payload["patch"] as Record<string, unknown>);
+      journalNote(
+        this.ledger,
+        `${directive.actor} approved the verdict on ${hypothesisId} at ${checkpoint.checkpoint_id}.`,
+      );
+    } else {
+      // Stays active, and the reason reaches the next digest — a rejected
+      // verdict is information the Hunt Lead needs, not a silent no.
+      journalNote(
+        this.ledger,
+        `${directive.actor} rejected the verdict on ${hypothesisId}: ${directive.text || "no reason given"}. ` +
+          "It stays active; the evidence that would answer them is what to go after.",
+      );
+    }
+    this.unpark(checkpoint);
+  }
+
+  private resolveScope(checkpoint: Checkpoint, directive: Directive, approved: boolean): void {
+    const question = String(checkpoint.payload["question"] ?? "");
+    const entityKey = (checkpoint.payload["entity_key"] as string | null) ?? null;
+
+    if (!approved) {
+      journalNote(
+        this.ledger,
+        `${directive.actor} refused the scope extension to ${entityKey ?? question}: ${directive.text || "no reason given"}.`,
+      );
+      this.unpark(checkpoint);
+      return;
+    }
+
+    this.extendScope(entityKey);
+    this.raise(question, {
+      entity_key: entityKey,
+      spawned_iteration: this.ledger.projection.hunt.iteration + 1,
+    });
+    journalNote(
+      this.ledger,
+      `${directive.actor} extended the hunt's scope to ${entityKey ?? question} at ${checkpoint.checkpoint_id}.`,
+    );
+    this.unpark(checkpoint);
+  }
+
+  // The declared scope grows by an append like everything else, so what the hunt
+  // was authorised to look at is readable at any point in its history.
+  private extendScope(entityKey: string | null): void {
+    if (entityKey === null) return;
+    const hunt = this.ledger.projection.hunt;
+    const declared = (hunt.scope["entities"] as string[] | undefined) ?? [];
+    if (declared.includes(entityKey)) return;
+    this.ledger.patch("hunt", hunt.hunt_id, { scope: { ...hunt.scope, entities: [...declared, entityKey] } });
   }
 
   // Asks the predicate the same question CONCLUDE asks, before parking. A hunt
@@ -723,23 +1106,52 @@ export class HuntController {
       });
     }
 
-    // Promise.all resolves in request order regardless of completion order, so
-    // two runs over the same inputs produce the same ledger.
-    return Promise.all(
-      requests.map(async (request) => {
-        try {
-          return await dispatcher.dispatch(request);
-        } catch (error) {
-          return {
+    // Started in order rather than all at once, with the inbox read before each
+    // one and a turn of the event loop between them: a worker that has already
+    // settled gets its abort seen, so an operator who halts the hunt mid-iteration
+    // does not pay for the workers that had not started yet. Nothing waits on a
+    // worker still running, so a real fan-out keeps its parallelism.
+    const started: Promise<DispatchResult>[] = [];
+    for (const request of requests) {
+      if (this.abortQueued()) {
+        started.push(
+          Promise.resolve({
             dispatch_id: request.dispatch_id,
             evidence: [],
             failed: true,
-            failure_reason: (error as Error).message,
-            cost_usd: spentBefore(error),
-          };
-        }
-      }),
-    );
+            failure_reason: SKIPPED_ON_ABORT,
+            cost_usd: 0,
+          }),
+        );
+        continue;
+      }
+      started.push(
+        (async () => {
+          try {
+            return await dispatcher.dispatch(request);
+          } catch (error) {
+            return {
+              dispatch_id: request.dispatch_id,
+              evidence: [],
+              failed: true,
+              failure_reason: (error as Error).message,
+              cost_usd: spentBefore(error),
+            };
+          }
+        })(),
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    // Promise.all resolves in request order regardless of completion order, so
+    // two runs over the same inputs produce the same ledger.
+    return Promise.all(started);
+  }
+
+  // Only what an operator queued and the drain has not taken yet: a halt already
+  // on the ledger has ended the hunt, and a controller note is not an abort.
+  private abortQueued(): boolean {
+    return peek(this.ledger).some((directive) => directive.kind === "abort");
   }
 
   // The only call that can lead to proven. Runs before anything is written, so
@@ -832,14 +1244,87 @@ export class HuntController {
     const unmet = unmetPredicates(strength, this.verdicts);
     if (unmet.length > 0) return `${hypothesisId} stays active: ${unmet.join("; ")}`;
 
-    this.ledger.patch("hypothesis", hypothesisId, {
+    // The verdict, computed here and only here. Under "ask" it is carried in the
+    // checkpoint payload and applied verbatim on approval — the review decides
+    // whether the verdict lands, never what it says.
+    const patch = {
       status: "proven",
       resolution_reason:
         `survived the argue-the-null pass against "${nullCheck.strongest_benign_explanation}" ` +
         `on ${strength.corroborating_sources} corroborating source system(s)`,
       evidence_strength: strength,
-    });
+    };
+
+    const hypothesis = this.ledger.projection.hypotheses.get(hypothesisId);
+    const { checkpoint, parked } = this.ask(
+      "verdict_review",
+      iteration,
+      `Mark ${hypothesisId} proven? ${hypothesis?.statement ?? ""}`.trim(),
+      { kind: "hypothesis", hypothesis_id: hypothesisId, patch, evidence_strength: strength },
+    );
+    if (parked) {
+      return `${hypothesisId} awaits verdict review at checkpoint ${checkpoint.checkpoint_id}`;
+    }
+
+    this.autoResolved(checkpoint, "checkpoint policy verdict_review=auto");
+    this.ledger.patch("hypothesis", hypothesisId, patch);
     return `${hypothesisId} proven`;
+  }
+
+  // The Hunt Lead asking for an adult. It is not a verdict and it resolves
+  // nothing by itself: under "ask" the hunt stops until someone answers, under
+  // "auto" the concern is on the record and the hunt carries on.
+  private leadCheckpoint(iteration: number, decision: Decision): string {
+    const { checkpoint, parked } = this.ask("budget_anomaly", iteration, decision.rationale, {
+      raised_by: "hunt_lead",
+      target_hypothesis_id: decision.target_hypothesis_id ?? null,
+      stated_confidence: decision.stated_confidence ?? null,
+    });
+    if (parked) return `parked on checkpoint ${checkpoint.checkpoint_id}: ${decision.rationale}`;
+
+    this.autoResolved(checkpoint, "checkpoint policy budget_anomaly=auto");
+    journalNote(
+      this.ledger,
+      `The Hunt Lead raised a checkpoint: ${decision.rationale}. Checkpoint policy is auto, so nobody was asked ` +
+        "and the hunt continued — act on the concern yourself rather than raising it again.",
+    );
+    return `checkpoint ${checkpoint.checkpoint_id} journaled; policy is auto, so the hunt continues`;
+  }
+
+  // An escalation rests on a verdict, so a hypothesis that is not proven is
+  // refused the way 08 refuses a premature CONCLUDE: recorded, explained, and
+  // costing none of the bounded re-prompt. The hunt continues either way —
+  // handing one claim to incident response does not answer the others.
+  private handoff(iteration: number, decision: Decision): string {
+    const hypothesisId = decision.target_hypothesis_id ?? "";
+    const hypothesis = this.ledger.projection.hypotheses.get(hypothesisId);
+
+    if (hypothesis === undefined || hypothesis.status !== "proven") {
+      const state = hypothesis === undefined ? "not on the ledger" : hypothesis.status;
+      const refusal = `HANDOFF_IR refused: ${hypothesisId || "no hypothesis named"} is ${state}, not proven`;
+      journalNote(
+        this.ledger,
+        `${refusal}. An escalation rests on a verdict, not a hunch — VALIDATE it first, and hand it off if it survives.`,
+      );
+      return refusal;
+    }
+
+    const caseId = newId("case", 4);
+    const caseFile = caseFilePath(this.ledger.path, caseId);
+    this.ledger.patch("hypothesis", hypothesisId, { status: "handed_off", spawned_case_id: caseId });
+
+    const handoff = {
+      case_id: caseId,
+      hypothesis_id: hypothesisId,
+      iteration,
+      rationale: decision.rationale,
+      case_file: caseFile,
+      created_at: new Date().toISOString(),
+    };
+    this.ledger.append({ kind: "handoff", handoff });
+    // A deliverable, like the report: derived from the projection, never read back.
+    writeFileSync(caseFile, renderCaseFile(this.ledger.projection, handoff));
+    return `${hypothesisId} handed off to incident response as ${caseId} — ${caseFile}`;
   }
 
   // Corroboration is counted over source systems, so a label the hunt never
@@ -896,6 +1381,11 @@ export class HuntController {
     if (result.decision.action === "VALIDATE") {
       notes.push(this.applyVerdict(iteration, result.decision, nullCheck));
     }
+
+    // Both are decisions about what the hunt already knows rather than requests
+    // for more of it, so neither dispatches and both land here beside the verdict.
+    if (result.decision.action === "HANDOFF_IR") notes.push(this.handoff(iteration, result.decision));
+    if (result.decision.action === "CHECKPOINT") notes.push(this.leadCheckpoint(iteration, result.decision));
 
     // CONCLUDE is a recommendation; the predicate is the judge. A refusal leaves
     // the hunt active, so the budget check below still applies to it.
@@ -971,8 +1461,12 @@ export class HuntController {
 
     for (let depth = 0; depth < max_depth && frontier.length > 0; depth += 1) {
       const done = this.enrichedEntities();
+      // An operator called it known-benign, so the hunt stops spending on it —
+      // enrichment is the cheapest place that shows, and the records already
+      // collected about it are untouched.
+      const suppressed = suppressedEntities(this.ledger.projection);
       const fresh = new Map(frontier.map((entity) => [key(entity), entity] as const));
-      const pending = [...fresh].filter(([id]) => !done.has(id)).slice(0, max_entities);
+      const pending = [...fresh].filter(([id]) => !done.has(id) && !suppressed.has(id)).slice(0, max_entities);
       if (pending.length === 0) break;
 
       const records = (await Promise.all(pending.map(([, entity]) => enricher(entity)))).flat();
@@ -1053,6 +1547,24 @@ export class HuntController {
       return refusal;
     }
 
+    // The second verdict review: before the hunt ends, not only before a
+    // hypothesis is proven. The would-be outcome and the leads it would park are
+    // carried in the payload, so approving applies the ending the predicate
+    // computed rather than recomputing one against a ledger that has moved.
+    const { checkpoint, parked } = this.ask(
+      "verdict_review",
+      iteration,
+      `Conclude this hunt as ${verdict.outcome}?`,
+      {
+        kind: "conclude",
+        outcome: verdict.outcome,
+        park: verdict.park.map((question) => question.question_id),
+        reason: `the termination predicate passed at iteration ${iteration}`,
+      },
+    );
+    if (parked) return `awaiting review of the conclusion at checkpoint ${checkpoint.checkpoint_id}`;
+
+    this.autoResolved(checkpoint, "checkpoint policy verdict_review=auto");
     this.concludeWith(verdict, `the termination predicate passed at iteration ${iteration}`);
     return `concluded as ${verdict.outcome}`;
   }

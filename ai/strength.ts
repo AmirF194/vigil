@@ -6,10 +6,15 @@ export const NULL_CHECK_PROVENANCE = "null_check";
 export const CRITIC_SOURCE_SYSTEM = "critic";
 export const UNDECLARED_SOURCE = "undeclared";
 
-// The one gap reader over evidence. Gap *counting* is off the dispatch log
-// below; this is for the operator-facing view of what could not be run.
+// A blind spot an operator declared rather than one a tool discovered: "we have
+// no EDR on that subnet" is a fact about visibility that no query would ever
+// return, and the hunt is wrong about its own coverage without it.
+export const OPERATOR_GAP_PROVENANCE = "operator_gap";
+
+// The one gap reader over evidence, which is why a new kind of blind spot
+// updates exactly this function and the count below it.
 export function isGap(record: EvidenceRecord): boolean {
-  return record.provenance === "tool_failure";
+  return record.provenance === "tool_failure" || record.provenance === OPERATOR_GAP_PROVENANCE;
 }
 
 // What went unanswered, not how many times it failed: three retries of one query
@@ -20,7 +25,9 @@ function gapKey(dispatch: DispatchRecord): string {
 
 // A gap belongs to the hypothesis the dispatch was serving, and stops being a
 // gap once the same question is answered — being unable to look once is not a
-// permanent blind spot.
+// permanent blind spot. An operator's declared gap has no dispatch behind it and
+// no query that could close it, so it stands until the telemetry does: it is a
+// statement about coverage, not about one failed run.
 export function openGaps(projection: Projection, hypothesisId: string): number {
   const answered = new Set<string>();
   const unanswered = new Set<string>();
@@ -29,6 +36,12 @@ export function openGaps(projection: Projection, hypothesisId: string): number {
     if (dispatch.target_hypothesis_id !== hypothesisId) continue;
     if (dispatch.status === "complete") answered.add(gapKey(dispatch));
     if (dispatch.status === "failed") unanswered.add(gapKey(dispatch));
+  }
+
+  for (const record of projection.evidence.values()) {
+    if (record.provenance !== OPERATOR_GAP_PROVENANCE) continue;
+    if (record.payload["hypothesis_id"] !== hypothesisId) continue;
+    unanswered.add(record.summary);
   }
 
   return [...unanswered].filter((key) => !answered.has(key)).length;

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
+import { CHECKPOINT_CLASSES, DEFAULT_CHECKPOINTS, type Checkpoints } from "./checkpoints.js";
 import { DEFAULT_LEASE_TTL_MS } from "./lease.js";
 import { EXECUTABLE_ACTIONS, DEFAULT_BUDGETS, ENTITY_TYPES, type Budgets, type Entity, type EntityType } from "./types.js";
 
@@ -160,6 +161,10 @@ export interface Config {
   runtime: Runtime;
   verdicts: Verdicts;
   termination: Termination;
+  // Which of the four checkpoint classes stop and ask a human. Config rather
+  // than arch, because whether a deployment has an operator watching is a fact
+  // about the deployment, not about how the loop reasons.
+  checkpoints: Checkpoints;
   tools: ToolSpec[];
   // Here rather than in the arch because a chain's SQL is a fact about this
   // deployment's schema, and because a playbook is uploadable: nothing uploaded
@@ -193,6 +198,7 @@ const CONFIG_KEYS = new Set([
   "runtime",
   "verdicts",
   "termination",
+  "checkpoints",
   "tools",
   "enrichment",
 ]);
@@ -471,6 +477,25 @@ function parseTermination(raw: unknown, budgets: Budgets): Termination {
   return termination;
 }
 
+// An unknown class or an unknown policy is a checkpoint that would never fire,
+// which reads exactly like one that was answered — so both are load errors.
+function parseCheckpoints(raw: unknown): Checkpoints {
+  const record = asRecord(raw, "checkpoints");
+  const unknown = Object.keys(record).filter((key) => !(CHECKPOINT_CLASSES as readonly string[]).includes(key));
+  if (unknown.length > 0) {
+    throw new SpecError(
+      `unknown checkpoint class(es): ${unknown.sort().join(", ")}; expected any of ${[...CHECKPOINT_CLASSES].sort().join(", ")}`,
+    );
+  }
+  const checkpoints = { ...DEFAULT_CHECKPOINTS, ...record } as Checkpoints;
+  for (const [checkpointClass, policy] of Object.entries(checkpoints)) {
+    if (policy !== "ask" && policy !== "auto") {
+      throw new SpecError(`checkpoints.${checkpointClass} must be ask or auto, got ${String(policy)}`);
+    }
+  }
+  return checkpoints;
+}
+
 function parseRuntime(raw: unknown): Runtime {
   const record = asRecord(raw, "runtime");
   return {
@@ -558,6 +583,7 @@ export function parseConfig(text: string): Config {
     runtime: parseRuntime(front["runtime"]),
     verdicts: parseVerdicts(front["verdicts"]),
     termination: parseTermination(front["termination"], budgets),
+    checkpoints: parseCheckpoints(front["checkpoints"]),
     tools,
     enrichment: parseEnrichment(front["enrichment"], new Set(tools.map((tool) => tool.id))),
   };

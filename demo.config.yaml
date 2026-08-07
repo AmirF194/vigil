@@ -1,0 +1,57 @@
+# The supervised deployment: same hunt, with a human at the two moments that
+# matter. vigil.config.yaml ships the headless defaults so CI and --scripted run
+# with nothing pending; this file is what a SOC with an analyst watching looks
+# like, and it is what the ticket-09 demo walk uses.
+#
+#   npx tsx cli/vigilhunt.ts --config demo.config.yaml --workflow frothly.yaml \
+#     --prompt "..." --scripted --yes --iterations 8
+model: anthropic/claude-opus-5
+
+rates:
+  input: 15.00
+  output: 75.00
+
+budgets:
+  max_iterations: 12
+  max_cost_usd: 5.00
+
+verdicts:
+  min_corroborating_sources: 2
+  gap_lock_threshold: 3
+
+termination:
+  priority_floor: 5
+  park_ttl_ms: 604800000
+  hard_max_iterations: 24
+  hard_max_cost_usd: 10.00
+
+# The difference from the shipped config: a human approves the start and every
+# verdict. The hunt parks at each and waits — its iteration count and its
+# spend both stop while it does, so a checkpoint left open overnight costs
+# nothing but time.
+checkpoints:
+  hypothesis_approval: ask
+  scope_extension: ask
+  verdict_review: ask
+  budget_anomaly: ask
+
+runtime:
+  concurrency: 4
+  rate_limit: { rpm: 60, tpm: 200000 }
+  retry_attempts: 3
+
+tools:
+  - id: duckdb_query
+    kind: duckdb
+    database: ~/Downloads/botsv3_duckdb/botsv3.duckdb
+    max_rows: 200
+    timeout_ms: 30000
+    memory_limit: 2GB
+  - id: expand
+    kind: expand
+  - id: intel_lookup
+    kind: threatfox
+    feed: https://threatfox.abuse.ch/export/json/recent/
+  - id: web_intel
+    kind: firecrawl
+    limit: 3

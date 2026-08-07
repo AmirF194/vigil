@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
+import type { Checkpoint, Resolution } from "./checkpoints.js";
 import type { HuntReport } from "./report.js";
 import {
   SCHEMA_VERSION,
@@ -9,6 +10,7 @@ import {
   type DispatchRecord,
   type EvidenceLink,
   type EvidenceRecord,
+  type Handoff,
   type Hypothesis,
   type HuntState,
   type OpenQuestion,
@@ -25,6 +27,9 @@ export type LedgerBody =
   | { kind: "dispatch"; dispatch: DispatchRecord }
   | { kind: "decision"; decision: DecisionRecord }
   | { kind: "directive"; directive: Directive }
+  | { kind: "checkpoint"; checkpoint: Checkpoint }
+  | { kind: "resolution"; resolution: Resolution }
+  | { kind: "handoff"; handoff: Handoff }
   | { kind: "finalize"; report: HuntReport }
   | { kind: "patch"; target: PatchTarget; id: string; fields: Record<string, unknown> };
 
@@ -43,6 +48,9 @@ export interface Projection {
   dispatches: Map<string, DispatchRecord>;
   decisions: DecisionRecord[];
   directives: Directive[];
+  checkpoints: Map<string, Checkpoint>;
+  resolutions: Resolution[];
+  handoffs: Handoff[];
 }
 
 export function newId(prefix: string, bytes = 6): string {
@@ -118,6 +126,9 @@ export function fold(events: readonly LedgerEvent[]): Projection {
     dispatches: new Map(),
     decisions: [],
     directives: [],
+    checkpoints: new Map(),
+    resolutions: [],
+    handoffs: [],
   };
 
   for (const event of events.slice(1)) {
@@ -144,6 +155,15 @@ export function fold(events: readonly LedgerEvent[]): Projection {
         break;
       case "directive":
         view.directives.push(structuredClone(event.directive));
+        break;
+      case "checkpoint":
+        view.checkpoints.set(event.checkpoint.checkpoint_id, structuredClone(event.checkpoint));
+        break;
+      case "resolution":
+        view.resolutions.push(structuredClone(event.resolution));
+        break;
+      case "handoff":
+        view.handoffs.push(structuredClone(event.handoff));
         break;
       case "finalize":
         // A deliverable, not state: the report is derived from the fold, so the

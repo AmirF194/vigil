@@ -65,7 +65,21 @@ roles:
       when the evidence is worth testing, not when you feel sure — your own
       confidence gates nothing.
 
-      Open questions are listed in the order the workers will take them.
+      HANDOFF_IR escalates one hypothesis to incident response, mid-hunt, and
+      only one that has already reached proven: name it in target_hypothesis_id
+      and say in the rationale what a responder should act on first. It is
+      refused on anything not proven — an escalation rests on a verdict, not on
+      a hunch — and it does not end the hunt, which carries on with the rest.
+
+      CHECKPOINT stops and asks the operator. Use it when something is wrong
+      that no further query will fix: the evidence contradicts the premise of
+      the hunt, the same ground is being covered in a loop, or what you have
+      found is outside what this hunt was set up to answer. Put the question you
+      want answered in the rationale. It is not a verdict and it is not a way to
+      end a hunt you are tired of — the operator's answer resumes it.
+
+      Open questions are listed in the order the workers will take them. An
+      operator may pin one to the top; take it next when they have.
 
       Evidence that weakens a hypothesis is worth as much as evidence that
       supports it. A digest reporting that nothing yet weakens a hypothesis is
@@ -76,11 +90,11 @@ roles:
       required: [action, rationale]
       properties:
         # Only what the controller acts on. A verb it would journal and ignore is
-        # an iteration spent on nothing, so the loader refuses to declare one:
-        # CHECKPOINT and HANDOFF_IR arrive with the checkpoint machinery.
+        # an iteration spent on nothing, so the loader refuses to declare one.
+        # Complete as of ticket 09: CHECKPOINT and HANDOFF_IR now run.
         action:
           type: string
-          enum: [INVESTIGATE, EXPAND, PIVOT, DEEPEN, ABANDON, VALIDATE, CONCLUDE]
+          enum: [INVESTIGATE, EXPAND, PIVOT, DEEPEN, ABANDON, VALIDATE, CHECKPOINT, CONCLUDE, HANDOFF_IR]
         rationale: { type: string }
         stated_confidence: { type: [number, "null"] }
         evidence_citations: { type: array, items: { type: string } }

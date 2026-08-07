@@ -6,7 +6,8 @@ import { HuntController, resumeHunt, startHunt } from "../ai/loop.js";
 import { createEnricher } from "../ai/enrich.js";
 import { criticFor, LlmDecisionProvider, LlmWorkerDispatcher } from "../ai/llm.js";
 import { Lease } from "../ai/lease.js";
-import { steer } from "../ai/inbox.js";
+import { directiveActor, steer, type DirectiveFields } from "../ai/inbox.js";
+import { pendingCheckpoints, resolutionOf, AUTO_ACTOR } from "../ai/checkpoints.js";
 import { buildReport, renderReport, reportPath } from "../ai/report.js";
 import {
   ScriptedDecisionProvider,
@@ -14,10 +15,11 @@ import {
   ScriptedWorkerDispatcher,
   type ScriptedDecision,
 } from "../ai/scripted.js";
-import { buildSpec, SpecError, type HuntSpec } from "../ai/spec.js";
+import { buildSpec, parseEntity, SpecError, type HuntSpec } from "../ai/spec.js";
+import { key } from "../ai/entities.js";
 import { buildTools, closeTools } from "../ai/tools.js";
 import { Ledger } from "../ai/ledger.js";
-import type { Digest, Entity, WorkerEvidence } from "../ai/types.js";
+import type { Decision, Digest, DirectiveKind, Entity, WorkerEvidence } from "../ai/types.js";
 
 const USAGE = `vigilhunt --prompt <prompt> --id <entity> --workflow <playbook.yaml>
 
@@ -40,6 +42,22 @@ vigilhunt --steer <ledger.jsonl> --prompt <text> [--lead | --abort | --extend | 
   At the budget checkpoint a parked hunt takes one of three answers:
   --extend --prompt "+5 iterations" (or "+$10"), --conclude, or --abort.
 
+vigilhunt --steer <ledger.jsonl> --approve <checkpoint_id>
+vigilhunt --steer <ledger.jsonl> --reject <checkpoint_id> --prompt <reason>
+  Answer a raised checkpoint. The ledger is the authority: the answer is
+  journaled and applied at the next boundary, whichever process runs it.
+
+vigilhunt --steer <ledger.jsonl> --benign <entity> [--revoke]
+vigilhunt --steer <ledger.jsonl> --gap <text> [--hypothesis <id>]
+vigilhunt --steer <ledger.jsonl> --boost <question_id>
+  Steer a running hunt. --benign stops the hunt chasing an entity without
+  removing a single record; --revoke lifts it again. --gap declares a blind
+  spot no query would report. --boost pins an open question to the top of
+  the frontier. All three are reversible, attributed, and delete nothing.
+
+vigilhunt checkpoints <ledger.jsonl>
+  List what the hunt is waiting on: id, class, question and age.
+
 vigilhunt report <ledger.jsonl>
   Rebuild the hunt report from the ledger. Derived, so it works at any time
   and on hunts that ended long ago.
@@ -61,7 +79,7 @@ function validateEntry(prompt?: string, entity?: string, workflow?: string): str
   return null;
 }
 
-async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
+function describe(spec: HuntSpec): void {
   console.log(`\nHunt: ${spec.name}`);
   spec.hypotheses.forEach((statement, index) => console.log(`  H${index + 1}. ${statement}`));
 
@@ -70,12 +88,45 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
   console.log(`  budgets: ${spec.budgets.max_iterations} iterations, $${spec.budgets.max_cost_usd.toFixed(2)}`);
   console.log(`  arch: ${spec.arch} (${spec.dispatch.mode}, up to ${spec.dispatch.max_workers} worker(s))`);
   console.log(`  model: ${spec.model}`);
+}
 
-  if (assumeYes || !process.stdin.isTTY) return true;
+// The prompt is delivery; the ledger is the record. startHunt has already raised
+// the hypothesis_approval checkpoint, so this resolves it with a directive —
+// attributed to the operator when a human answered, to policy when nobody was
+// asked. A rejection returns false and the caller ends the hunt through
+// terminate(), which is how a hunt that never ran still gets a report.
+async function approve(ledger: Ledger, spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
+  describe(spec);
+
+  const checkpoint = pendingCheckpoints(ledger.projection).find((entry) => entry.class === "hypothesis_approval");
+  if (checkpoint === undefined) {
+    // Policy resolved it inside startHunt. Nothing to ask, and nothing to
+    // journal twice.
+    return true;
+  }
+
+  const fields: DirectiveFields = { checkpoint_id: checkpoint.checkpoint_id };
+  if (assumeYes) {
+    steer(ledger.path, "approve", "--yes on the command line", fields);
+    console.log(`\napproved ${checkpoint.checkpoint_id} as ${directiveActor()} (--yes)`);
+    return true;
+  }
+  if (!process.stdin.isTTY) {
+    // No operator to ask. Journaled as policy rather than as a person, so the
+    // ledger never claims a human approved something nobody saw.
+    steer(ledger.path, "approve", "no TTY: nobody was asked", { ...fields, actor: AUTO_ACTOR });
+    console.log(`\napproved ${checkpoint.checkpoint_id} as ${AUTO_ACTOR} (no TTY)`);
+    return true;
+  }
+
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await rl.question("\nApprove and start this hunt? [y/N] ");
+  const answer = (await rl.question("\nApprove and start this hunt? [y/N] ")).trim().toLowerCase();
   rl.close();
-  return ["y", "yes"].includes(answer.trim().toLowerCase());
+
+  const approved = ["y", "yes"].includes(answer);
+  steer(ledger.path, approved ? "approve" : "reject", approved ? "approved at the prompt" : "rejected at the prompt", fields);
+  console.log(`${approved ? "approved" : "rejected"} ${checkpoint.checkpoint_id} as ${directiveActor()}`);
+  return approved;
 }
 
 // Carries observables and a payload rather than a bare sentence, and couples them
@@ -135,32 +186,50 @@ const SCRIPTED_INVESTIGATE = {
   query_intent: "scripted query",
 };
 
-// Investigate for most of the run rather than concluding at once, so --scripted
-// exercises dispatch, steering and resume; the last three turns walk the
-// termination path, which is the other half of the wiring: a CONCLUDE the
-// controller refuses because the hypothesis is still active, then the verdict
-// that resolves it, then a CONCLUDE the predicate lets through.
-function scriptedRun(iterations: number, hypothesisIds: string[]): ScriptedDecision[] {
-  // One turn per hypothesis, plus the refused CONCLUDE, the passing one, and at
-  // least one INVESTIGATE to give the verdicts something to rest on.
-  const walk = hypothesisIds.length + 3;
-  if (iterations < walk) return Array.from({ length: iterations }, () => SCRIPTED_INVESTIGATE);
+// Turns spent gathering before the walk starts testing verdicts, so a VALIDATE
+// has something to rest on.
+const SCRIPTED_WARMUP = 2;
 
-  return [
-    ...Array.from({ length: iterations - walk + 1 }, () => SCRIPTED_INVESTIGATE),
-    { action: "CONCLUDE" as const, rationale: "scripted early stop — the controller should refuse this" },
-    // Cites what exists by the time it runs: the evidence ids are not knowable
-    // when the script is written.
-    ...hypothesisIds.map(
-      (hypothesisId) => (digest: Digest) => ({
-        action: "VALIDATE" as const,
-        rationale: "scripted verdict check",
-        target_hypothesis_id: hypothesisId,
-        evidence_citations: digest.recent_evidence.map((record) => record.evidence_id),
-      }),
-    ),
-    { action: "CONCLUDE" as const, rationale: "scripted wiring check complete" },
-  ];
+// Read off the digest each turn rather than fixed in advance, because a
+// checkpoint parks the hunt mid-walk: whatever an operator did while it was
+// parked is what the next turn has to start from. A fixed script would re-run
+// the CONCLUDE it was refused for on a hunt where it would now be granted, and
+// call that a passing wiring check.
+function scriptedNext(digest: Digest): Decision {
+  if (digest.iteration <= SCRIPTED_WARMUP) return SCRIPTED_INVESTIGATE;
+
+  // A verdict that landed goes to incident response mid-hunt, which is the
+  // whole point of HANDOFF_IR — the hunt keeps running for the rest.
+  const proven = digest.hypotheses.find((hypothesis) => hypothesis.status === "proven");
+  if (proven !== undefined) {
+    return {
+      action: "HANDOFF_IR",
+      rationale: "scripted escalation: a confirmed compromise goes to IR without waiting for the hunt to end",
+      target_hypothesis_id: proven.hypothesis_id,
+    };
+  }
+
+  const active = digest.hypotheses.find((hypothesis) => hypothesis.status === "active");
+  if (active === undefined) return { action: "CONCLUDE", rationale: "scripted wiring check complete" };
+
+  // One CONCLUDE the controller should refuse, so the scripted walk exercises
+  // the termination predicate rather than only the happy path.
+  if (digest.iteration === SCRIPTED_WARMUP + 1) {
+    return { action: "CONCLUDE", rationale: "scripted early stop — the controller should refuse this" };
+  }
+
+  // Cites what exists by the time it runs: the evidence ids are not knowable
+  // when the script is written.
+  return {
+    action: "VALIDATE",
+    rationale: "scripted verdict check",
+    target_hypothesis_id: active.hypothesis_id,
+    evidence_citations: digest.recent_evidence.map((record) => record.evidence_id),
+  };
+}
+
+function scriptedRun(iterations: number): ScriptedDecision[] {
+  return Array.from({ length: Math.max(iterations, 1) }, () => scriptedNext);
 }
 
 // First Ctrl-C parks after the current iteration so nothing is lost; a second
@@ -200,7 +269,7 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
   const controller = values.scripted
     ? new HuntController(
         ledger,
-        new ScriptedDecisionProvider(scriptedRun(Number(values.iterations), hypothesisIds)),
+        new ScriptedDecisionProvider(scriptedRun(Number(values.iterations))),
         new ScriptedWorkerDispatcher(scriptedEvidence(spec, hypothesisIds)),
         spec.dispatch,
         spec.digest,
@@ -257,6 +326,48 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
 
 type Values = { iterations: string; scripted: boolean; yes: boolean };
 
+function age(since: string): string {
+  const minutes = Math.max(0, Math.round((Date.now() - Date.parse(since)) / 60_000));
+  if (minutes < 60) return `${minutes}m ago`;
+  return minutes < 1440 ? `${Math.round(minutes / 60)}h ago` : `${Math.round(minutes / 1440)}d ago`;
+}
+
+// Delivery, not authority: everything printed here is folded from the JSONL, so
+// a checkpoint raised by a process that has since died still shows up.
+function checkpoints(path: string): number {
+  const ledger = Ledger.open(path);
+  const { hunt } = ledger.projection;
+  const pending = pendingCheckpoints(ledger.projection);
+
+  console.log(`${hunt.hunt_id} — ${hunt.name} (${hunt.status})`);
+
+  if (pending.length === 0) {
+    console.log("\nno pending checkpoints");
+    // The budget park is 08's, and takes a different set of answers. Named here
+    // anyway: an operator asking what a hunt is waiting on means the question,
+    // not the mechanism.
+    if (hunt.status === "parked") {
+      console.log(`\nparked all the same — ${hunt.parked_reason ?? "awaiting an operator"}`);
+      console.log(`  extend:   vigilhunt --steer ${path} --extend --prompt "+5 iterations"`);
+      console.log(`  conclude: vigilhunt --steer ${path} --conclude`);
+      console.log(`  abort:    vigilhunt --steer ${path} --abort`);
+    }
+    const resolved = ledger.projection.resolutions.length;
+    if (resolved > 0) console.log(`\n${resolved} checkpoint(s) already resolved — vigilhunt report ${path}`);
+    return 0;
+  }
+
+  console.log(`\n${pending.length} pending checkpoint(s):\n`);
+  for (const checkpoint of pending) {
+    console.log(`  ${checkpoint.checkpoint_id}  ${checkpoint.class.padEnd(19)} iteration ${checkpoint.raised_iteration}, raised ${age(checkpoint.raised_at)}`);
+    console.log(`      ${checkpoint.question}`);
+    console.log(`      approve: vigilhunt --steer ${path} --approve ${checkpoint.checkpoint_id}`);
+    console.log(`      reject:  vigilhunt --steer ${path} --reject ${checkpoint.checkpoint_id} --prompt "why"`);
+    console.log("");
+  }
+  return 0;
+}
+
 // Replay-derived: the report is rebuilt from the JSONL, so it works on a hunt
 // that ended long ago and on one still running.
 function report(path: string): number {
@@ -283,6 +394,13 @@ async function main(): Promise<number> {
       abort: { type: "boolean", default: false },
       extend: { type: "boolean", default: false },
       conclude: { type: "boolean", default: false },
+      approve: { type: "string" },
+      reject: { type: "string" },
+      benign: { type: "string" },
+      gap: { type: "string" },
+      boost: { type: "string" },
+      hypothesis: { type: "string" },
+      revoke: { type: "boolean", default: false },
       iterations: { type: "string", default: "1" },
       scripted: { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
@@ -296,13 +414,13 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  if (positionals[0] === "report") {
+  if (positionals[0] === "report" || positionals[0] === "checkpoints") {
     const path = positionals[1];
     if (path === undefined) {
-      console.error("error: report needs a ledger path\n\n" + USAGE);
+      console.error(`error: ${positionals[0]} needs a ledger path\n\n${USAGE}`);
       return 2;
     }
-    return report(path);
+    return positionals[0] === "report" ? report(path) : checkpoints(path);
   }
   if (positionals.length > 0) {
     console.error(`error: unknown command ${positionals[0]}\n\n${USAGE}`);
@@ -310,8 +428,40 @@ async function main(): Promise<number> {
   }
 
   if (values.steer !== undefined) {
+    // The typed set first: each carries its target in a field, so the drain
+    // never has to read the operator's prose to find out what they meant.
+    const typed: [string, DirectiveKind, string, DirectiveFields][] = [
+      [values.approve ?? "", "approve", values.prompt ?? "approved", { checkpoint_id: values.approve }],
+      [values.reject ?? "", "reject", values.prompt ?? "rejected", { checkpoint_id: values.reject }],
+      [
+        values.benign ?? "",
+        "benign",
+        values.prompt ?? `${values.benign} is known-benign`,
+        // Typed the same way a seed entity is, so "45.77.53.176" and
+        // "host:web-01" both land on the key the graph actually uses. An
+        // untyped value would suppress nothing and say it had.
+        {
+          entity_key: values.benign === undefined ? undefined : key(parseEntity(values.benign)),
+          ...(values.revoke ? { revoke: true } : {}),
+        },
+      ],
+      [values.gap ?? "", "gap", values.gap ?? "", { ...(values.hypothesis ? { hypothesis_id: values.hypothesis } : {}) }],
+      [values.boost ?? "", "boost", values.prompt ?? `take ${values.boost} next`, { question_id: values.boost }],
+    ];
+    const chosen = typed.find(([target]) => target !== "");
+
+    if (chosen !== undefined) {
+      const [, kind, text, fields] = chosen;
+      const directive = steer(values.steer, kind, text, fields);
+      console.log(`queued ${kind} ${directive.directive_id} as ${directive.actor} for the next iteration boundary`);
+      return 0;
+    }
+
     if (!values.abort && !values.conclude && !values.prompt) {
-      console.error("error: --steer needs --prompt <text>, or --abort, or --conclude");
+      console.error(
+        "error: --steer needs --prompt <text>, or one of --abort, --conclude, --approve <id>, " +
+          "--reject <id>, --benign <entity>, --gap <text>, --boost <question_id>",
+      );
       return 2;
     }
     if (values.extend && !values.prompt) {
@@ -328,7 +478,7 @@ async function main(): Promise<number> {
             ? "lead"
             : "note";
     const directive = steer(values.steer, kind, values.prompt ?? `operator sent ${kind}`);
-    console.log(`queued ${kind} ${directive.directive_id} for the next iteration boundary`);
+    console.log(`queued ${kind} ${directive.directive_id} as ${directive.actor} for the next iteration boundary`);
     return 0;
   }
 
@@ -363,13 +513,21 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  if (!(await approve(spec, values.yes))) {
-    console.log("aborted — no hunt created");
+  // Created before the prompt, not after: the approval is a checkpoint on this
+  // hunt's ledger, and a hunt that was declined is a record of a hunt that was
+  // declined rather than a hunt that never existed.
+  const ledger = startHunt(spec, "runs");
+  console.log(`\ncreated ${ledger.projection.hunt.hunt_id} -> ${ledger.path}`);
+
+  if (!(await approve(ledger, spec, values.yes))) {
+    // Through the controller, so the rejection ends the hunt the way every
+    // other ending does — terminate(), and therefore Finalize and a report.
+    const controller = new HuntController(ledger, new ScriptedDecisionProvider([]));
+    await controller.advanceIteration();
+    console.log(`rejected — ${ledger.projection.hunt.outcome}, report: ${reportPath(ledger.path)}`);
     return 1;
   }
 
-  const ledger = startHunt(spec, "runs");
-  console.log(`\ncreated ${ledger.projection.hunt.hunt_id} -> ${ledger.path}`);
   await run(ledger, spec, values);
   return 0;
 }
@@ -404,11 +562,29 @@ function summarize(ledger: Ledger): void {
 
   console.log(`\n$${hunt.cost_usd.toFixed(4)} over ${hunt.iteration} iteration(s)`);
 
+  for (const handoff of ledger.projection.handoffs) {
+    console.log(`\nescalated ${handoff.hypothesis_id} to incident response as ${handoff.case_id}`);
+    console.log(`  case file: ${handoff.case_file}`);
+  }
+
   if (hunt.status === "terminal") {
     console.log(`${hunt.outcome} — report: ${reportPath(ledger.path)}`);
     return;
   }
-  // The three answers a parked hunt takes, named where the operator is standing.
+
+  // What it is actually waiting on, named where the operator is standing.
+  const pending = pendingCheckpoints(ledger.projection);
+  if (pending.length > 0) {
+    console.log(`\nwaiting on ${pending.length} checkpoint(s) — vigilhunt checkpoints ${ledger.path}`);
+    for (const checkpoint of pending) {
+      console.log(`  ${checkpoint.checkpoint_id}  ${checkpoint.class}: ${checkpoint.question}`);
+      console.log(`    approve: vigilhunt --steer ${ledger.path} --approve ${checkpoint.checkpoint_id}`);
+      console.log(`    reject:  vigilhunt --steer ${ledger.path} --reject ${checkpoint.checkpoint_id} --prompt "why"`);
+    }
+    return;
+  }
+
+  // The three answers a budget-parked hunt takes.
   if (hunt.status === "parked") {
     console.log(`parked — ${hunt.parked_reason ?? "awaiting an operator"}`);
     console.log(`  extend:   vigilhunt --steer ${ledger.path} --extend --prompt "+5 iterations"`);

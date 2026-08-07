@@ -1,6 +1,16 @@
+import { resolutionOf, type Checkpoint, type Resolution } from "./checkpoints.js";
+import { suppressedEntities } from "./digest.js";
 import type { Projection } from "./ledger.js";
 import { isGap } from "./strength.js";
-import type { Budgets, EvidenceStrength, HuntOutcome, HypothesisStatus } from "./types.js";
+import type {
+  Budgets,
+  EvidenceRecord,
+  EvidenceStrength,
+  Handoff,
+  HuntOutcome,
+  HypothesisStatus,
+  LinkRelation,
+} from "./types.js";
 
 // The deliverable, derived. A hunt that ends without one is a hunt that never
 // happened — and "we found nothing, here is what we could not see" is an answer,
@@ -31,6 +41,22 @@ export interface BacklogQuestion {
   reason: string;
 }
 
+// Every point a human was asked, and what happened — including the ones policy
+// answered. A supervised hunt that cannot show where it was supervised is a hunt
+// nobody can audit.
+export interface CheckpointRecord {
+  checkpoint_id: string;
+  class: Checkpoint["class"];
+  raised_iteration: number;
+  question: string;
+  resolution: Resolution | null;
+}
+
+export interface Suppression {
+  entity_key: string;
+  actor: string;
+}
+
 export interface HuntReport {
   hunt_id: string;
   name: string;
@@ -47,10 +73,22 @@ export interface HuntReport {
   // named so the next one can pick it up.
   parked_hypotheses: HypothesisVerdict[];
   backlog: BacklogQuestion[];
+  checkpoints: CheckpointRecord[];
+  // Still in force at the end. The revoked ones are on the ledger and out of this
+  // list, because the report says what the hunt ran under, not what it was told.
+  suppressions: Suppression[];
+  handoffs: Handoff[];
 }
 
 export function reportPath(ledgerPath: string): string {
   return `${ledgerPath.replace(/\.jsonl$/, "")}.report.md`;
+}
+
+// Beside the ledger, like the report: a deliverable an IR responder can be
+// handed without access to this process or its JSONL. The id already carries
+// its own `case-` prefix, like every other id in the ledger.
+export function caseFilePath(ledgerPath: string, caseId: string): string {
+  return `${ledgerPath.replace(/\.jsonl$/, "")}.${caseId}.md`;
 }
 
 function verdictOf(hypothesis: {
@@ -107,15 +145,25 @@ export function buildReport(projection: Projection): HuntReport {
         question: question.question,
         reason: question.closed_reason ?? "",
       })),
+    checkpoints: [...projection.checkpoints.values()].map((checkpoint) => ({
+      checkpoint_id: checkpoint.checkpoint_id,
+      class: checkpoint.class,
+      raised_iteration: checkpoint.raised_iteration,
+      question: checkpoint.question,
+      resolution: resolutionOf(projection, checkpoint.checkpoint_id) ?? null,
+    })),
+    suppressions: [...suppressedEntities(projection)].map(([entity_key, actor]) => ({ entity_key, actor })),
+    handoffs: [...projection.handoffs],
   };
 }
 
 const STATUS_ORDER: Record<HypothesisStatus, number> = {
-  proven: 0,
-  disproven: 1,
-  inconclusive: 2,
-  parked: 3,
-  active: 4,
+  handed_off: 0,
+  proven: 1,
+  disproven: 2,
+  inconclusive: 3,
+  parked: 4,
+  active: 5,
 };
 
 function strengthLine(strength: EvidenceStrength): string {
@@ -131,9 +179,15 @@ function strengthLine(strength: EvidenceStrength): string {
 // The one line an operator reads first. A hunt that proved nothing says so
 // plainly and says why — an unread report is the same as no report.
 function headline(report: HuntReport): string {
-  const proven = report.hypotheses.filter((hypothesis) => hypothesis.status === "proven");
+  // handed_off counts: it is a proven hypothesis that has moved to incident
+  // response, and a report that read "nothing was proven" over an escalation
+  // would be the most misleading line in the document.
+  const proven = report.hypotheses.filter(
+    (hypothesis) => hypothesis.status === "proven" || hypothesis.status === "handed_off",
+  );
   if (proven.length > 0) {
-    return `${proven.length} hypothesis(es) reached a verdict of proven; each survived the argue-the-null pass.`;
+    const escalated = report.handoffs.length === 0 ? "" : ` ${report.handoffs.length} was escalated to incident response.`;
+    return `${proven.length} hypothesis(es) reached a verdict of proven; each survived the argue-the-null pass.${escalated}`;
   }
   if (report.outcome === "data_starved") {
     return (
@@ -203,5 +257,110 @@ export function renderReport(report: HuntReport): string {
     lines.push("");
   }
 
+  if (report.handoffs.length > 0) {
+    lines.push("## Escalated to incident response", "");
+    for (const handoff of report.handoffs) {
+      lines.push(
+        `- ${handoff.case_id} (${handoff.hypothesis_id}, iteration ${handoff.iteration}) — ${handoff.rationale}`,
+        `  case file: ${handoff.case_file}`,
+      );
+    }
+    lines.push("");
+  }
+
+  // Where a human was in the loop, and where policy stood in for one. Rendered
+  // only when something was raised, so a hunt nobody supervised does not grow a
+  // section saying so twice.
+  if (report.checkpoints.length > 0) {
+    lines.push("## Checkpoints", "");
+    for (const checkpoint of report.checkpoints) {
+      const resolution = checkpoint.resolution;
+      const answer =
+        resolution === null
+          ? "**still pending**"
+          : `${resolution.verdict} by ${resolution.actor}${resolution.reason ? ` — ${resolution.reason}` : ""}`;
+      lines.push(`- ${checkpoint.class} (iteration ${checkpoint.raised_iteration}): ${checkpoint.question} → ${answer}`);
+    }
+    lines.push("");
+  }
+
+  if (report.suppressions.length > 0) {
+    lines.push(
+      "## Operator suppressions",
+      "",
+      "Entities an operator marked known-benign. The evidence mentioning them is untouched;",
+      "the hunt stopped opening new work on them from the moment each was recorded.",
+      "",
+    );
+    for (const suppression of report.suppressions) {
+      lines.push(`- ${suppression.entity_key} — ${suppression.actor}`);
+    }
+    lines.push("");
+  }
+
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+// What an IR responder is handed: the claim, the numbers behind it, the records
+// it rests on, and — the part a finding usually loses — what the hunt could not
+// see. Built from the projection like the report, so it replays identically.
+export function renderCaseFile(projection: Projection, handoff: Handoff): string {
+  const hypothesis = projection.hypotheses.get(handoff.hypothesis_id);
+  const report = buildReport(projection);
+  const supporting = projection.links
+    .filter((link) => link.hypothesis_id === handoff.hypothesis_id)
+    .map((link) => ({ relation: link.relation, record: projection.evidence.get(link.evidence_id) }))
+    .filter((entry): entry is { relation: LinkRelation; record: EvidenceRecord } => entry.record !== undefined);
+
+  const lines: string[] = [
+    `# IR case ${handoff.case_id} — ${projection.hunt.name}`,
+    "",
+    `- **Hunt:** ${projection.hunt.hunt_id}`,
+    `- **Hypothesis:** ${handoff.hypothesis_id}`,
+    `- **Escalated:** ${handoff.created_at} (iteration ${handoff.iteration})`,
+    `- **Ledger:** ${projection.hunt.hunt_id}.jsonl`,
+    "",
+    "## The claim",
+    "",
+    hypothesis?.statement ?? "(the hypothesis is no longer on the ledger)",
+    "",
+    `_Escalated because:_ ${handoff.rationale}`,
+    "",
+  ];
+
+  if (hypothesis?.resolution_reason) lines.push(`_Verdict:_ ${hypothesis.resolution_reason}`, "");
+  if (hypothesis?.evidence_strength) {
+    lines.push(`Evidence strength at verdict: ${strengthLine(hypothesis.evidence_strength)}.`, "");
+  }
+
+  lines.push("## Evidence trail", "");
+  if (supporting.length === 0) {
+    lines.push("Nothing is linked to this hypothesis, which is itself worth knowing before acting on it.", "");
+  }
+  for (const { relation, record } of supporting) {
+    lines.push(
+      `### ${record.evidence_id} — ${relation} (${record.source_system}, iteration ${record.iteration})`,
+      "",
+      record.summary,
+      "",
+      record.attacker_influenceable ? "_This record sits in a field an adversary could have written._" : "",
+      "```json",
+      JSON.stringify(record.payload, null, 2),
+      "```",
+      "",
+    );
+  }
+
+  // The responder is about to act on this. What the hunt could not see bounds
+  // what it found, and shipping the finding without it is how a blind spot
+  // becomes someone else's wrong conclusion.
+  lines.push(`## What the hunt could not see (${report.gaps.length})`, "");
+  if (report.gaps.length === 0) {
+    lines.push("Every query the hunt wanted to run came back.", "");
+  }
+  for (const gap of report.gaps) {
+    lines.push(`- iteration ${gap.iteration}: ${gap.query_intent || gap.summary} — ${gap.summary}`);
+  }
+
+  return `${lines.filter((line, index) => line !== "" || lines[index - 1] !== "").join("\n").trimEnd()}\n`;
 }

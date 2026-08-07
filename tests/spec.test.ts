@@ -67,14 +67,15 @@ describe("decision vocabulary", () => {
     expect(() => parseArch(arch(widened + WORKER))).toThrow(/cannot run: ESCALATE/);
   });
 
-  it("refuses a verb the vocabulary knows but the controller does not act on", () => {
-    // A journaled no-op costs an iteration and moves nothing, so it is refused at
-    // load rather than left for the lead to keep choosing. CHECKPOINT is in the
-    // Phase-1 vocabulary and arrives with the checkpoint machinery, not before.
-    const parseable = LEAD.replace("CONCLUDE]", "CONCLUDE, CHECKPOINT]");
-    expect(() => parseArch(arch(parseable + WORKER))).toThrow(/cannot run: CHECKPOINT/);
-    expect(DECISION_ACTIONS).toContain("CHECKPOINT");
-    expect(EXECUTABLE_ACTIONS).not.toContain("CHECKPOINT");
+  it("runs every verb the Phase-1 vocabulary knows", () => {
+    // The guard is still what stops a journaled no-op costing an iteration and
+    // moving nothing. It simply has nothing left to refuse: CHECKPOINT and
+    // HANDOFF_IR arrived with the checkpoint machinery, so the closed vocabulary
+    // and the executable set are now the same set.
+    expect([...EXECUTABLE_ACTIONS].sort()).toEqual([...DECISION_ACTIONS].sort());
+
+    const withCheckpoint = LEAD.replace("CONCLUDE]", "CONCLUDE, CHECKPOINT, HANDOFF_IR]");
+    expect(() => parseArch(arch(withCheckpoint + WORKER))).not.toThrow();
   });
 
   it("ships an arch that declares exactly what the controller implements", () => {

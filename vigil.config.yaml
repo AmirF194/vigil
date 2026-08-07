@@ -35,6 +35,23 @@ termination:
   hard_max_iterations: 24
   hard_max_cost_usd: 10.00
 
+# Where a human is in the loop. ask suspends the hunt until someone answers;
+# auto answers on the spot and journals that policy did it — either way the
+# approval is a ledger event, and an approval that is not on the ledger never
+# happened. These defaults keep a headless or scripted run moving with no TTY
+# and nothing pending; a supervised deployment flips the first and third to ask
+# (see demo.config.yaml, which the demo walk uses).
+checkpoints:
+  # At hunt start, before any query runs.
+  hypothesis_approval: auto
+  # Growth past the declared scope. Only fires when a playbook declares one; a
+  # lead naming a different tenant is refused outright, never asked about.
+  scope_extension: ask
+  # Before a hypothesis is marked proven, and before the hunt concludes.
+  verdict_review: auto
+  # The Hunt Lead's own CHECKPOINT: it is asking for an adult.
+  budget_anomaly: ask
+
 runtime:
   concurrency: 4
   rate_limit: { rpm: 60, tpm: 200000 }
