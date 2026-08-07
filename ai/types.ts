@@ -154,6 +154,10 @@ export interface Directive {
   entity_key?: string;
   question_id?: string;
   hypothesis_id?: string;
+  // The tenant a lead is asking about, typed rather than grepped out of prose.
+  // The regex over the text stays as a fallback for a line written into the
+  // inbox by hand, but a boundary that depends on phrasing is not a boundary.
+  tenant?: string;
   // Set on the benign that lifts an earlier one. Reversal is an append like
   // everything else — the suppression it undoes stays on the record.
   revoke?: boolean;
@@ -403,6 +407,10 @@ export interface DispatchRequest {
   focus: string;
   target_hypothesis_id: string | null;
   scope: Record<string, unknown>;
+  // Cancelled when an operator halts the hunt mid-query. Not journaled — it is
+  // a handle on work in flight, and what it cancels is recorded as a gap like
+  // any other query the hunt wanted and did not get.
+  signal?: AbortSignal;
 }
 
 // supports/weakens name the hypotheses this record bears on; the controller

@@ -12,7 +12,7 @@ import {
 import { buildDigest, scoredFrontier, suppressedEntities } from "../ai/digest.js";
 import { steer } from "../ai/inbox.js";
 import { Ledger, newId, type LedgerEvent } from "../ai/ledger.js";
-import { HuntController, HuntParked, startHunt } from "../ai/loop.js";
+import { HuntController, HuntParked, startHunt, validateDecision } from "../ai/loop.js";
 import type { Enricher, WorkerDispatcher } from "../ai/ports.js";
 import { caseFilePath, reportPath, type HuntReport } from "../ai/report.js";
 import {
@@ -218,20 +218,58 @@ describe("verdict review", () => {
       [...ledger.projection.checkpoints.values()][1]!.payload["evidence_strength"] as Record<string, unknown>
     );
 
-    // More support arrives after the checkpoint was raised. The approval must
-    // not pick it up: approving is the same verdict delivered late, not a
-    // second, better-informed one.
+    steer(ledger.path, "approve", "reviewed the payloads, this holds", { checkpoint_id: checkpointId });
+    const resumed = Ledger.open(ledger.path);
+    await controllerFor(resumed, [INVESTIGATE]).advanceIteration();
+
+    // The snapshot is the one the reviewer was shown, never one recomputed on
+    // approval: approving is the same verdict delivered late, not a second and
+    // better-informed one.
+    const hypothesis = resumed.projection.hypotheses.get(hypothesisId)!;
+    expect(hypothesis.status).toBe("proven");
+    expect(hypothesis.evidence_strength).toEqual(atValidateTime);
+    expect(hypothesis.evidence_strength!.corroborating_sources).toBe(2);
+  });
+
+  it("refuses to land a verdict the argue-the-null pass no longer covers", async () => {
+    const { ledger, hypothesisId, checkpointId } = await parkedOnVerdict();
+
+    // Support the critic never argued against arrives while the review waits.
+    // The stored patch still says the hypothesis survived disconfirmation, and
+    // by the time it would land that sentence is no longer true.
     evidenceOn(ledger, hypothesisId, "okta");
-    expect(evidenceStrength(ledger.projection, hypothesisId).corroborating_sources).toBe(3);
+    expect(evidenceStrength(ledger.projection, hypothesisId).survived_disconfirmation).toBe(false);
 
     steer(ledger.path, "approve", "reviewed the payloads, this holds", { checkpoint_id: checkpointId });
     const resumed = Ledger.open(ledger.path);
     await controllerFor(resumed, [INVESTIGATE]).advanceIteration();
 
+    expect(resumed.projection.hypotheses.get(hypothesisId)!.status).toBe("active");
+    expect(resumed.projection.directives.map((directive) => directive.text).join(" ")).toMatch(
+      /no longer carries it.*VALIDATE it again/s,
+    );
+  });
+
+  it("closes inconclusive when the operator declares a gap and then approves", async () => {
+    const { ledger, hypothesisId, checkpointId } = await parkedOnVerdict();
+
+    // The honest sequence this guards: a reviewer remembers the hunt is blind
+    // somewhere, says so, and approves in the same breath. The gap they just
+    // declared must not be the one thing the approval ignores.
+    for (const blind of ["no EDR on that subnet", "no CloudTrail before August", "netflow sampled at 1:100"]) {
+      steer(ledger.path, "gap", blind, { hypothesis_id: hypothesisId });
+    }
+    steer(ledger.path, "approve", "looks right to me", { checkpoint_id: checkpointId });
+
+    const resumed = Ledger.open(ledger.path);
+    await controllerFor(resumed, [INVESTIGATE]).advanceIteration();
+
     const hypothesis = resumed.projection.hypotheses.get(hypothesisId)!;
-    expect(hypothesis.status).toBe("proven");
-    expect(hypothesis.evidence_strength).toEqual(atValidateTime);
-    expect(hypothesis.evidence_strength!.corroborating_sources).toBe(2);
+    expect(hypothesis.status).toBe("inconclusive");
+    expect(hypothesis.resolution_reason).toMatch(/gap-locked before the approved verdict landed/);
+    // The numbers on the record are the ones that closed it, not the ones the
+    // reviewer was shown — a verdict nobody can re-read is not auditable.
+    expect(hypothesis.evidence_strength!.open_gaps).toBe(3);
   });
 
   it("leaves the hypothesis active on a rejection, with the reason in the next digest", async () => {
@@ -338,6 +376,39 @@ describe("the start approval", () => {
 });
 
 describe("the soft directive set", () => {
+  it("binds the Hunt Lead rather than only the digest", async () => {
+    const { ledger, hypothesisIds } = newLedger();
+    evidenceOn(ledger, hypothesisIds[0]!, "duckdb");
+    steer(ledger.path, "benign", "our own scanner", { entity_key: "ip:45.77.53.176" });
+    await controllerFor(ledger, [INVESTIGATE]).advanceIteration();
+
+    // Dropping it from pivot candidates only makes the lead less likely to name
+    // it. An authorization the lead can decline to notice is a suggestion.
+    const citations = [...ledger.projection.evidence.keys()];
+    for (const action of ["INVESTIGATE", "DEEPEN", "PIVOT"] as const) {
+      expect(() =>
+        validateDecision(
+          { action, rationale: "chase it anyway", target_entity: "ip:45.77.53.176", evidence_citations: citations },
+          ledger.projection,
+        ),
+      ).toThrow(/known-benign/);
+    }
+
+    // ABANDON is the exception: closing work on a suppressed entity is the
+    // point of suppressing it.
+    expect(() =>
+      validateDecision(
+        {
+          action: "ABANDON",
+          rationale: "the operator cleared it",
+          target_entity: "ip:45.77.53.176",
+          evidence_citations: citations,
+        },
+        ledger.projection,
+      ),
+    ).not.toThrow();
+  });
+
   it("suppresses an entity without touching a single record, and lets a revoke lift it", async () => {
     const { ledger, hypothesisIds } = newLedger();
     const evidenceId = evidenceOn(ledger, hypothesisIds[0]!, "duckdb");

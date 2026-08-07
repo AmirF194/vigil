@@ -228,6 +228,9 @@ interface LlmOptions {
   tools?: readonly Tool[];
   limiter: Limiter;
   rates: Rates;
+  // Cancels the call in flight. A halted hunt should stop paying for a query
+  // whose answer it will never read.
+  signal?: AbortSignal;
 }
 
 // Two stages on purpose: a free-form tool loop, then a separate schema-constrained
@@ -242,8 +245,13 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
   let cost = 0;
 
   const call = async (body: Parameters<typeof client.chat.completions.create>[0]) => {
+    // Before the limiter, not only inside the request: a call still queued
+    // behind a rate limit is the cheapest one to give up on.
+    options.signal?.throwIfAborted();
     const estimate = estimateTokens(JSON.stringify(body));
-    const response = await limiter.run(estimate, () => client.chat.completions.create(body));
+    const response = await limiter.run(estimate, () =>
+      client.chat.completions.create(body, options.signal ? { signal: options.signal } : {}),
+    );
     if (!("choices" in response)) throw new LlmError("streaming responses are not supported", cost);
     cost += costOf(rates, response.usage?.prompt_tokens ?? 0, response.usage?.completion_tokens ?? 0);
     return response;
@@ -523,6 +531,7 @@ export class LlmWorkerDispatcher implements WorkerDispatcher {
       tools: toolsFor(role, this.tools),
       limiter: this.limiter,
       rates: this.spec.rates,
+      ...(request.signal ? { signal: request.signal } : {}),
     });
 
     return {

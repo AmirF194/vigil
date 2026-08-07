@@ -48,7 +48,7 @@ export function grantOf(directive: Directive): BudgetGrant {
 // case where the queuer is not the operator — an approval nobody was asked for
 // must not be attributed to whoever happened to be logged in.
 export type DirectiveFields = Partial<
-  Pick<Directive, "actor" | "checkpoint_id" | "entity_key" | "question_id" | "hypothesis_id" | "revoke">
+  Pick<Directive, "actor" | "checkpoint_id" | "entity_key" | "question_id" | "hypothesis_id" | "tenant" | "revoke">
 >;
 
 export function steer(

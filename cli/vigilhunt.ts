@@ -5,7 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { HuntController, resumeHunt, startHunt } from "../ai/loop.js";
 import { createEnricher } from "../ai/enrich.js";
 import { criticFor, LlmDecisionProvider, LlmWorkerDispatcher } from "../ai/llm.js";
-import { Lease } from "../ai/lease.js";
+import { Lease, LeaseHeld } from "../ai/lease.js";
 import { directiveActor, steer, type DirectiveFields } from "../ai/inbox.js";
 import { pendingCheckpoints, resolutionOf, AUTO_ACTOR } from "../ai/checkpoints.js";
 import { buildReport, renderReport, reportPath } from "../ai/report.js";
@@ -38,7 +38,9 @@ vigilhunt --resume <ledger.jsonl> [--iterations N]
 
 vigilhunt --steer <ledger.jsonl> --prompt <text> [--lead | --abort | --extend | --conclude]
   Queue an operator directive. Applied at the next iteration boundary.
-  --lead adds it to the frontier; --abort halts the hunt.
+  --lead adds it to the frontier, and takes --tenant <name> to say which
+  tenant it is about; --abort halts the hunt and settles it here when no
+  other process is running it.
   At the budget checkpoint a parked hunt takes one of three answers:
   --extend --prompt "+5 iterations" (or "+$10"), --conclude, or --abort.
 
@@ -368,6 +370,33 @@ function checkpoints(path: string): number {
   return 0;
 }
 
+// A queued abort only ends a hunt when someone advances it, and nobody is
+// obliged to. So the queuing process takes the lease and drains it itself: the
+// drain sees the abort before it decides anything, terminates, and finalizes.
+// A hunt another process is running is left alone — that process holds the
+// lease and will see the same directive at its next boundary.
+async function settleAbort(path: string): Promise<void> {
+  let lease: Lease;
+  try {
+    lease = Lease.acquire(path);
+  } catch (error) {
+    if (!(error instanceof LeaseHeld)) throw error;
+    console.log("a running process holds this hunt — it will halt at its next iteration boundary");
+    return;
+  }
+
+  try {
+    const ledger = Ledger.open(path);
+    if (ledger.projection.hunt.status === "terminal") return;
+    await new HuntController(ledger, new ScriptedDecisionProvider([])).advanceIteration();
+
+    const { hunt } = ledger.projection;
+    console.log(`${hunt.hunt_id} ended ${hunt.outcome} — report: ${reportPath(path)}`);
+  } finally {
+    lease.release();
+  }
+}
+
 // Replay-derived: the report is rebuilt from the JSONL, so it works on a hunt
 // that ended long ago and on one still running.
 function report(path: string): number {
@@ -401,6 +430,7 @@ async function main(): Promise<number> {
       boost: { type: "string" },
       hypothesis: { type: "string" },
       revoke: { type: "boolean", default: false },
+      tenant: { type: "string" },
       iterations: { type: "string", default: "1" },
       scripted: { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
@@ -477,8 +507,17 @@ async function main(): Promise<number> {
           : values.lead
             ? "lead"
             : "note";
-    const directive = steer(values.steer, kind, values.prompt ?? `operator sent ${kind}`);
+    const directive = steer(
+      values.steer,
+      kind,
+      values.prompt ?? `operator sent ${kind}`,
+      values.tenant === undefined ? {} : { tenant: values.tenant },
+    );
     console.log(`queued ${kind} ${directive.directive_id} as ${directive.actor} for the next iteration boundary`);
+    // An abort nobody resumes would leave the hunt open and unreported, and a
+    // hunt that ended without deliverables is the one ending the controller
+    // rules out. So the process that queued it settles it, when it can.
+    if (kind === "abort") await settleAbort(values.steer);
     return 0;
   }
 

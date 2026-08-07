@@ -13,6 +13,16 @@ attack_techniques:
 # are declared here alongside the telemetry views.
 data_domains: [net_flow, dns, http, win_events, endpoint, cloud, threat_intel, web]
 
+# What this hunt is authorised to look at. The tenant is a hard wall: a lead
+# naming a different one is refused outright rather than raised as a checkpoint,
+# because a boundary an operator can waive from inside the hunt is not one.
+#
+# Adding an `entities: [...]` list here turns entity growth into a checkpoint —
+# any lead or PIVOT onto something not on the list stops and asks. Left off for
+# this dataset, where following the trail wherever it goes is the whole job.
+scope:
+  tenant: frothly
+
 directives:
   lead: |
     This hunt covers the Frothly dataset: roughly 1.9M events from 2018-08-19 to
