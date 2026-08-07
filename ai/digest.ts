@@ -155,12 +155,22 @@ function priority(question: OpenQuestion, projection: Projection, iteration: num
   );
 }
 
+export interface ScoredQuestion {
+  question: OpenQuestion;
+  score: number;
+}
+
 // The frontier ranked rather than taken in arrival order. Every feature is folded
 // from the ledger: a stored score would be stale the moment the next dispatch
 // landed, which is the drift the projection discipline exists to prevent.
-export function rankFrontier(projection: Projection, iteration: number): OpenQuestion[] {
+//
+// The score is exported because termination measures the frontier against a
+// priority floor, and a second copy of these weights is a second definition of
+// what "worth another turn" means.
+export function scoredFrontier(projection: Projection, iteration: number): ScoredQuestion[] {
   const questions = [...projection.questions.values()];
-  // Closed once taken, so the closed leads are the execution log.
+  // Closed once taken, so the closed leads are the execution log. A parked lead
+  // was never pulled, so it covers nothing.
   const taken = new Set(questions.filter((question) => question.status === "closed").map(coverage));
   const active = new Set(
     [...projection.hypotheses.values()].filter((h) => h.status === "active").map((h) => h.hypothesis_id),
@@ -171,8 +181,11 @@ export function rankFrontier(projection: Projection, iteration: number): OpenQue
     .map((question) => ({ question, score: priority(question, projection, iteration, taken, active) }))
     .sort((a, b) =>
       b.score === a.score ? a.question.question_id.localeCompare(b.question.question_id) : b.score - a.score,
-    )
-    .map((entry) => entry.question);
+    );
+}
+
+export function rankFrontier(projection: Projection, iteration: number): OpenQuestion[] {
+  return scoredFrontier(projection, iteration).map((entry) => entry.question);
 }
 
 // Where a PIVOT could go: entities the focus actually co-occurs with, so the

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { buildDigest } from "../ai/digest.js";
+import { steer } from "../ai/inbox.js";
 import { Ledger, newId } from "../ai/ledger.js";
 import {
   HuntController,
@@ -75,6 +76,9 @@ describe("ledger", () => {
 describe("controller", () => {
   it("reaches a terminal state on CONCLUDE and snapshots every iteration", async () => {
     const ledger = ledgerFor();
+    // Nothing left active, so the termination predicate lets the recommendation
+    // through; a CONCLUDE over an active hypothesis is refused (termination.test.ts).
+    ledger.patch("hypothesis", [...ledger.projection.hypotheses.keys()][0]!, { status: "parked" });
     const controller = new HuntController(ledger, new ScriptedDecisionProvider([CONCLUDE], 0.25));
     const result = await controller.advanceIteration();
 
@@ -87,6 +91,7 @@ describe("controller", () => {
 
   it("coerces unresolved hypotheses to inconclusive, never disproven", async () => {
     const ledger = ledgerFor(["h one", "h two"]);
+    steer(ledger.path, "abort", "operator halted the hunt");
     await new HuntController(ledger, new ScriptedDecisionProvider([CONCLUDE])).advanceIteration();
     const statuses = [...ledger.projection.hypotheses.values()].map((h) => h.status);
     expect(statuses).toEqual(["inconclusive", "inconclusive"]);
@@ -115,19 +120,23 @@ describe("controller", () => {
     expect(evidence[0]!.provenance).toBe("tool_failure");
     expect([...ledger.projection.dispatches.values()][0]!.status).toBe("failed");
 
+    ledger.patch("hypothesis", [...ledger.projection.hypotheses.keys()][0]!, { status: "parked" });
     const second = await controller.advanceIteration();
     expect(second.hunt_status).toBe("terminal");
   });
 
-  it("terminates when the iteration budget runs out", async () => {
+  it("parks at the budget checkpoint rather than ending the hunt itself", async () => {
     const spec = buildSpec({ prompt: "h" });
     const ledger = startHunt(
       { ...spec, budgets: { max_iterations: 1, max_cost_usd: 10 } },
       join(dir, "run.jsonl"),
     );
     const result = await new HuntController(ledger, new ScriptedDecisionProvider([INVESTIGATE])).advanceIteration();
-    expect(result.hunt_outcome).toBe("budget_terminated");
-    expect(result.note).toBe("budget exhausted");
+
+    // Running out of money is a question for an operator, not a verdict.
+    expect(result.hunt_status).toBe("parked");
+    expect(result.hunt_outcome).toBeNull();
+    expect(result.note).toMatch(/budget exhausted/);
   });
 
   it("rejects an uncited ABANDON but accepts a cited one", () => {

@@ -1,4 +1,5 @@
 #!/usr/bin/env -S npx tsx
+import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline/promises";
 import { HuntController, resumeHunt, startHunt } from "../ai/loop.js";
@@ -6,6 +7,7 @@ import { createEnricher } from "../ai/enrich.js";
 import { criticFor, LlmDecisionProvider, LlmWorkerDispatcher } from "../ai/llm.js";
 import { Lease } from "../ai/lease.js";
 import { steer } from "../ai/inbox.js";
+import { buildReport, renderReport, reportPath } from "../ai/report.js";
 import {
   ScriptedDecisionProvider,
   ScriptedDisconfirmationCritic,
@@ -14,7 +16,7 @@ import {
 } from "../ai/scripted.js";
 import { buildSpec, SpecError, type HuntSpec } from "../ai/spec.js";
 import { buildTools, closeTools } from "../ai/tools.js";
-import type { Ledger } from "../ai/ledger.js";
+import { Ledger } from "../ai/ledger.js";
 import type { Digest, Entity, WorkerEvidence } from "../ai/types.js";
 
 const USAGE = `vigilhunt --prompt <prompt> --id <entity> --workflow <playbook.yaml>
@@ -32,9 +34,15 @@ const USAGE = `vigilhunt --prompt <prompt> --id <entity> --workflow <playbook.ya
 vigilhunt --resume <ledger.jsonl> [--iterations N]
   Continue a hunt. Its spec came with the ledger, so no spec flags apply.
 
-vigilhunt --steer <ledger.jsonl> --prompt <text> [--lead | --abort]
+vigilhunt --steer <ledger.jsonl> --prompt <text> [--lead | --abort | --extend | --conclude]
   Queue an operator directive. Applied at the next iteration boundary.
   --lead adds it to the frontier; --abort halts the hunt.
+  At the budget checkpoint a parked hunt takes one of three answers:
+  --extend --prompt "+5 iterations" (or "+$10"), --conclude, or --abort.
+
+vigilhunt report <ledger.jsonl>
+  Rebuild the hunt report from the ledger. Derived, so it works at any time
+  and on hunts that ended long ago.
 
 Ctrl-C pauses after the current iteration and offers a directive prompt.`;
 
@@ -77,7 +85,7 @@ async function approve(spec: HuntSpec, assumeYes: boolean): Promise<boolean> {
 // clear are the same ones a real hunt clears — one system agreeing with itself
 // would never reach proven. Declared domains when the playbook has them, or the
 // controller would collapse invented labels into one and nothing would prove.
-function scriptedEvidence(spec: HuntSpec, hypothesisId: string): WorkerEvidence[] {
+function scriptedEvidence(spec: HuntSpec, hypothesisIds: string[]): WorkerEvidence[] {
   const seed = (spec.scope["entity"] as Entity | undefined)?.value ?? "10.0.0.5";
   const sources = spec.data_domains.length >= 2 ? spec.data_domains.slice(0, 2) : ["scripted-siem", "scripted-edr"];
 
@@ -94,7 +102,9 @@ function scriptedEvidence(spec: HuntSpec, hypothesisId: string): WorkerEvidence[
     provenance: "worker",
     attacker_influenceable: false,
     instruction_like: false,
-    supports: [hypothesisId],
+    // Every hypothesis, because the controller will not conclude while one is
+    // active: a scripted walk that resolves only the first never reaches an end.
+    supports: hypothesisIds,
   }));
 }
 
@@ -126,21 +136,29 @@ const SCRIPTED_INVESTIGATE = {
 };
 
 // Investigate for most of the run rather than concluding at once, so --scripted
-// exercises dispatch, steering and resume; the last two turns walk the verdict
-// path, which is the other half of the wiring.
-function scriptedRun(iterations: number, hypothesisId: string): ScriptedDecision[] {
-  if (iterations < 3) return Array.from({ length: iterations }, () => SCRIPTED_INVESTIGATE);
+// exercises dispatch, steering and resume; the last three turns walk the
+// termination path, which is the other half of the wiring: a CONCLUDE the
+// controller refuses because the hypothesis is still active, then the verdict
+// that resolves it, then a CONCLUDE the predicate lets through.
+function scriptedRun(iterations: number, hypothesisIds: string[]): ScriptedDecision[] {
+  // One turn per hypothesis, plus the refused CONCLUDE, the passing one, and at
+  // least one INVESTIGATE to give the verdicts something to rest on.
+  const walk = hypothesisIds.length + 3;
+  if (iterations < walk) return Array.from({ length: iterations }, () => SCRIPTED_INVESTIGATE);
 
   return [
-    ...Array.from({ length: iterations - 2 }, () => SCRIPTED_INVESTIGATE),
+    ...Array.from({ length: iterations - walk + 1 }, () => SCRIPTED_INVESTIGATE),
+    { action: "CONCLUDE" as const, rationale: "scripted early stop — the controller should refuse this" },
     // Cites what exists by the time it runs: the evidence ids are not knowable
     // when the script is written.
-    (digest: Digest) => ({
-      action: "VALIDATE" as const,
-      rationale: "scripted verdict check",
-      target_hypothesis_id: hypothesisId,
-      evidence_citations: digest.recent_evidence.map((record) => record.evidence_id),
-    }),
+    ...hypothesisIds.map(
+      (hypothesisId) => (digest: Digest) => ({
+        action: "VALIDATE" as const,
+        rationale: "scripted verdict check",
+        target_hypothesis_id: hypothesisId,
+        evidence_citations: digest.recent_evidence.map((record) => record.evidence_id),
+      }),
+    ),
     { action: "CONCLUDE" as const, rationale: "scripted wiring check complete" },
   ];
 }
@@ -178,12 +196,12 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
   process.on("exit", () => lease.release());
 
   const tools = values.scripted ? [] : await buildTools(spec, ledger);
-  const hypothesisId = [...ledger.projection.hypotheses.keys()][0] ?? "";
+  const hypothesisIds = [...ledger.projection.hypotheses.keys()];
   const controller = values.scripted
     ? new HuntController(
         ledger,
-        new ScriptedDecisionProvider(scriptedRun(Number(values.iterations), hypothesisId)),
-        new ScriptedWorkerDispatcher(scriptedEvidence(spec, hypothesisId)),
+        new ScriptedDecisionProvider(scriptedRun(Number(values.iterations), hypothesisIds)),
+        new ScriptedWorkerDispatcher(scriptedEvidence(spec, hypothesisIds)),
         spec.dispatch,
         spec.digest,
         scriptedEnricher(spec),
@@ -218,7 +236,10 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
         `  [${result.iteration}] ${result.action.padEnd(12)} evidence+${result.evidence_appended}${enriched}` +
           `  $${result.cost_usd.toFixed(4)}  ${result.hunt_status}${outcome}`,
       );
-      if (result.hunt_status === "terminal") break;
+      if (result.note) console.log(`       ${result.note}`);
+      // Parked is as final for this process as terminal: only an operator
+      // directive moves it, and running on would spend past the budget.
+      if (result.hunt_status !== "active") break;
       lease.renew();
 
       if (paused) {
@@ -236,8 +257,20 @@ async function run(ledger: Ledger, spec: HuntSpec, values: Values): Promise<void
 
 type Values = { iterations: string; scripted: boolean; yes: boolean };
 
+// Replay-derived: the report is rebuilt from the JSONL, so it works on a hunt
+// that ended long ago and on one still running.
+function report(path: string): number {
+  const ledger = Ledger.open(path);
+  const rendered = renderReport(buildReport(ledger.projection));
+  const out = reportPath(path);
+  writeFileSync(out, rendered);
+  console.log(rendered);
+  console.log(`written to ${out}`);
+  return 0;
+}
+
 async function main(): Promise<number> {
-  const { values } = parseArgs({
+  const { values, positionals } = parseArgs({
     options: {
       prompt: { type: "string" },
       id: { type: "string" },
@@ -248,11 +281,14 @@ async function main(): Promise<number> {
       steer: { type: "string" },
       lead: { type: "boolean", default: false },
       abort: { type: "boolean", default: false },
+      extend: { type: "boolean", default: false },
+      conclude: { type: "boolean", default: false },
       iterations: { type: "string", default: "1" },
       scripted: { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
+    allowPositionals: true,
   });
 
   if (values.help) {
@@ -260,13 +296,38 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  if (values.steer !== undefined) {
-    if (!values.abort && !values.prompt) {
-      console.error("error: --steer needs --prompt <text>, or --abort");
+  if (positionals[0] === "report") {
+    const path = positionals[1];
+    if (path === undefined) {
+      console.error("error: report needs a ledger path\n\n" + USAGE);
       return 2;
     }
-    const kind = values.abort ? "abort" : values.lead ? "lead" : "note";
-    const directive = steer(values.steer, kind, values.prompt ?? "operator halted the hunt");
+    return report(path);
+  }
+  if (positionals.length > 0) {
+    console.error(`error: unknown command ${positionals[0]}\n\n${USAGE}`);
+    return 2;
+  }
+
+  if (values.steer !== undefined) {
+    if (!values.abort && !values.conclude && !values.prompt) {
+      console.error("error: --steer needs --prompt <text>, or --abort, or --conclude");
+      return 2;
+    }
+    if (values.extend && !values.prompt) {
+      console.error('error: --extend needs --prompt with the grant, e.g. --prompt "+5 iterations" or "+$10"');
+      return 2;
+    }
+    const kind = values.abort
+      ? "abort"
+      : values.conclude
+        ? "conclude"
+        : values.extend
+          ? "extend"
+          : values.lead
+            ? "lead"
+            : "note";
+    const directive = steer(values.steer, kind, values.prompt ?? `operator sent ${kind}`);
     console.log(`queued ${kind} ${directive.directive_id} for the next iteration boundary`);
     return 0;
   }
@@ -335,11 +396,28 @@ function summarize(ledger: Ledger): void {
     for (const question of open) console.log(`  ${question.question}`);
   }
 
-  console.log(`\n$${hunt.cost_usd.toFixed(4)} over ${hunt.iteration} iteration(s)`);
-  // Running out of --iterations otherwise reads exactly like reaching a verdict.
-  if (hunt.status !== "terminal") {
-    console.log(`still active — resume with: vigilhunt --resume ${ledger.path}`);
+  const backlog = [...questions.values()].filter((question) => question.status === "parked");
+  if (backlog.length > 0) {
+    console.log(`\nparked to the backlog (${backlog.length})`);
+    for (const question of backlog) console.log(`  ${question.question}`);
   }
+
+  console.log(`\n$${hunt.cost_usd.toFixed(4)} over ${hunt.iteration} iteration(s)`);
+
+  if (hunt.status === "terminal") {
+    console.log(`${hunt.outcome} — report: ${reportPath(ledger.path)}`);
+    return;
+  }
+  // The three answers a parked hunt takes, named where the operator is standing.
+  if (hunt.status === "parked") {
+    console.log(`parked — ${hunt.parked_reason ?? "awaiting an operator"}`);
+    console.log(`  extend:   vigilhunt --steer ${ledger.path} --extend --prompt "+5 iterations"`);
+    console.log(`  conclude: vigilhunt --steer ${ledger.path} --conclude`);
+    console.log(`  abort:    vigilhunt --steer ${ledger.path} --abort`);
+    return;
+  }
+  // Running out of --iterations otherwise reads exactly like reaching a verdict.
+  console.log(`still active — resume with: vigilhunt --resume ${ledger.path}`);
 }
 
 main().then(

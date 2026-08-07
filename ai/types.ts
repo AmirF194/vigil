@@ -49,7 +49,10 @@ export const EXECUTABLE_ACTIONS = [
   "CONCLUDE",
 ] as const satisfies readonly DecisionAction[];
 
-export type HuntStatus = "pending_approval" | "active" | "terminal";
+// parked is the budget checkpoint: the hunt has stopped spending and waits on an
+// operator to extend, conclude or abort it. It advances nothing until then, so it
+// refuses step() the same way a terminal hunt does — but it is not an outcome.
+export type HuntStatus = "pending_approval" | "active" | "parked" | "terminal";
 
 export type HuntOutcome =
   | "completed"
@@ -107,7 +110,17 @@ export interface Entity {
 
 // Human input, and the one thing in the ledger that is direction rather than
 // data. Applied by the controller at an iteration boundary, never written as state.
-export type DirectiveKind = "note" | "lead" | "abort";
+// extend and conclude resolve the budget checkpoint; abort ends the hunt from
+// any state.
+export type DirectiveKind = "note" | "lead" | "abort" | "extend" | "conclude";
+
+// What an extend buys. Parsed from the operator's text when the directive is
+// queued, so the ledger records the ask as numbers rather than prose the drain
+// has to re-read.
+export interface BudgetGrant {
+  iterations: number;
+  cost_usd: number;
+}
 
 export interface Directive {
   directive_id: string;
@@ -115,6 +128,11 @@ export interface Directive {
   kind: DirectiveKind;
   text: string;
   created_at: string;
+  grant?: BudgetGrant;
+  // Set on the notes the controller journals itself (a refused CONCLUDE, a
+  // clamped extension). The inbox drain counts only what the operator wrote, so
+  // a controller note can never make it skip a real directive.
+  origin?: "inbox" | "controller";
 }
 
 export interface HuntState {
@@ -134,6 +152,13 @@ export interface HuntState {
   narrative: string;
   created_at: string;
   terminated_at: string | null;
+  // When the budget checkpoint parked the hunt, and what it said. The park TTL is
+  // measured from parked_at, lazily, whenever the hunt is next touched.
+  parked_at: string | null;
+  parked_reason: string | null;
+  // Why the hunt ended, when the ending was not a Hunt Lead decision: a predicate
+  // that passed, an operator's directive, a park that expired.
+  termination_reason: string | null;
 }
 
 export interface Hypothesis {
@@ -163,7 +188,10 @@ export interface EvidenceStrength {
 export interface OpenQuestion {
   question_id: string;
   question: string;
-  status: "open" | "closed";
+  // closed means a worker took it; parked means the hunt ended below the priority
+  // floor and it became backlog. Distinct statuses because a lead nobody ever
+  // pulled is a deliverable, and a lead that was answered is not.
+  status: "open" | "closed" | "parked";
   // The entity this lead is about, so a worker taking it is told what to look at.
   entity_key: string | null;
   // Set when a decision cited one record; a worker's follow-up names its dispatch
@@ -174,6 +202,9 @@ export interface OpenQuestion {
   // The hypothesis this lead was opened in service of. Without it a lead that
   // fails is a gap belonging to nothing, and no hypothesis is ever gap-locked.
   hypothesis_id: string | null;
+  // Why it left the frontier, carrying the score it was parked at. Optional
+  // because a lead closed by the worker that took it needs no explanation.
+  closed_reason?: string | null;
 }
 
 export interface EvidenceRecord {

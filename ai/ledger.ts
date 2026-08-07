@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
+import type { HuntReport } from "./report.js";
 import {
   SCHEMA_VERSION,
   type DecisionRecord,
@@ -24,6 +25,7 @@ export type LedgerBody =
   | { kind: "dispatch"; dispatch: DispatchRecord }
   | { kind: "decision"; decision: DecisionRecord }
   | { kind: "directive"; directive: Directive }
+  | { kind: "finalize"; report: HuntReport }
   | { kind: "patch"; target: PatchTarget; id: string; fields: Record<string, unknown> };
 
 export type LedgerEvent = LedgerBody & {
@@ -142,6 +144,10 @@ export function fold(events: readonly LedgerEvent[]): Projection {
         break;
       case "directive":
         view.directives.push(structuredClone(event.directive));
+        break;
+      case "finalize":
+        // A deliverable, not state: the report is derived from the fold, so the
+        // fold must never derive anything from it.
         break;
       case "patch":
         applyPatch(view, event);

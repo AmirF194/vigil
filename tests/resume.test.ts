@@ -61,12 +61,15 @@ describe("resume", () => {
 
     const result = await controllerFor(resumed.ledger, [CONCLUDE]).advanceIteration();
     expect(result.iteration).toBe(2);
-    expect(result.hunt_outcome).toBe("completed");
+    // The controller owns termination: this CONCLUDE is refused while the
+    // hypothesis is still active, so the resumed hunt simply carries on.
+    expect(result.hunt_outcome).toBeNull();
   });
 
   it("refuses to resume a hunt that already ended", async () => {
     const ledger = newLedger();
-    await controllerFor(ledger, [CONCLUDE]).advanceIteration();
+    steer(ledger.path, "abort", "operator halted the hunt");
+    await controllerFor(ledger, []).advanceIteration();
     expect(() => resumeHunt(ledger.path)).toThrow(/already ended/);
   });
 });

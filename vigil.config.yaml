@@ -19,6 +19,22 @@ verdicts:
   # "we could not look" must never read as "we cleared it".
   gap_lock_threshold: 3
 
+# When a hunt may stop, and how far an operator may push it. The controller owns
+# termination — CONCLUDE is a recommendation measured against these.
+termination:
+  # Frontier score at or above which an open question still blocks conclusion.
+  # Scores run 0–16 (novel 3, bearing hypotheses up to 6, salience up to 4,
+  # recency up to 3); 5 is a novel lead bearing on one active hypothesis. Below
+  # it a lead is backlog, not a reason to keep spending.
+  priority_floor: 5
+  # A hunt parked at the budget checkpoint this long with no answer is abandoned
+  # in fact; saying so beats leaving it parked forever. Seven days.
+  park_ttl_ms: 604800000
+  # What an operator may extend to, in total. Twice the budgets above: double
+  # down, don't run forever.
+  hard_max_iterations: 24
+  hard_max_cost_usd: 10.00
+
 runtime:
   concurrency: 4
   rate_limit: { rpm: 60, tpm: 200000 }

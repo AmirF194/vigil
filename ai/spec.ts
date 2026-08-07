@@ -128,6 +128,30 @@ export interface Verdicts {
 // cleared, it has been given up on.
 export const DEFAULT_VERDICTS: Verdicts = { min_corroborating_sources: 2, gap_lock_threshold: 3 };
 
+// When a hunt is allowed to stop, and how far an operator may push it. The floor
+// is scored against the frontier weights in digest.ts, so it is a statement about
+// leads, not a percentage.
+export interface Termination {
+  priority_floor: number;
+  park_ttl_ms: number;
+  hard_max_iterations: number;
+  hard_max_cost_usd: number;
+}
+
+// A frontier score tops out at 16 (novel 3, three bearing hypotheses 6, anomalous
+// 4, spawned this iteration 3). Five is exactly a novel lead bearing on one active
+// hypothesis, or a novel lead raised in the last two iterations: the cheapest
+// thread still worth a turn. Below it a lead is backlog, not a reason to keep
+// spending. The TTL is a week because a hunt nobody answered for that long is
+// abandoned in fact, and the hard caps are twice the default budgets — an
+// operator may double down, not run forever.
+export const DEFAULT_TERMINATION: Termination = {
+  priority_floor: 5,
+  park_ttl_ms: 604_800_000,
+  hard_max_iterations: 2 * DEFAULT_BUDGETS.max_iterations,
+  hard_max_cost_usd: 2 * DEFAULT_BUDGETS.max_cost_usd,
+};
+
 // Where this deployment points and what it may spend.
 export interface Config {
   model: string;
@@ -135,6 +159,7 @@ export interface Config {
   budgets: Budgets;
   runtime: Runtime;
   verdicts: Verdicts;
+  termination: Termination;
   tools: ToolSpec[];
   // Here rather than in the arch because a chain's SQL is a fact about this
   // deployment's schema, and because a playbook is uploadable: nothing uploaded
@@ -161,7 +186,16 @@ const PLAYBOOK_KEYS = new Set([
   "directives",
   "narrative",
 ]);
-const CONFIG_KEYS = new Set(["model", "rates", "budgets", "runtime", "verdicts", "tools", "enrichment"]);
+const CONFIG_KEYS = new Set([
+  "model",
+  "rates",
+  "budgets",
+  "runtime",
+  "verdicts",
+  "termination",
+  "tools",
+  "enrichment",
+]);
 
 export const DEFAULT_MODEL = "openai/gpt-4o";
 export const DEFAULT_ARCH = packaged("arch/threathunt.yaml");
@@ -407,6 +441,36 @@ function parseVerdicts(raw: unknown): Verdicts {
   return verdicts;
 }
 
+// The hard ceilings may not sit under the budgets they cap, or the first
+// iteration of a fresh hunt would already be over the operator's limit.
+function parseTermination(raw: unknown, budgets: Budgets): Termination {
+  const record = asRecord(raw, "termination");
+  const unknown = Object.keys(record).filter((key) => !(key in DEFAULT_TERMINATION));
+  if (unknown.length > 0) {
+    throw new SpecError(
+      `unknown termination key(s): ${unknown.sort().join(", ")}; expected any of ${Object.keys(DEFAULT_TERMINATION).sort().join(", ")}`,
+    );
+  }
+  const termination = { ...DEFAULT_TERMINATION, ...record } as Termination;
+
+  for (const [key, value] of Object.entries(termination)) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      throw new SpecError(`termination.${key} must be a positive number, got ${String(value)}`);
+    }
+  }
+  if (termination.hard_max_iterations < budgets.max_iterations) {
+    throw new SpecError(
+      `termination.hard_max_iterations (${termination.hard_max_iterations}) is below budgets.max_iterations (${budgets.max_iterations})`,
+    );
+  }
+  if (termination.hard_max_cost_usd < budgets.max_cost_usd) {
+    throw new SpecError(
+      `termination.hard_max_cost_usd (${termination.hard_max_cost_usd}) is below budgets.max_cost_usd (${budgets.max_cost_usd})`,
+    );
+  }
+  return termination;
+}
+
 function parseRuntime(raw: unknown): Runtime {
   const record = asRecord(raw, "runtime");
   return {
@@ -486,12 +550,14 @@ export function parseConfig(text: string): Config {
   const [front] = layer(text, CONFIG_KEYS, "config");
   const model = str(front["model"]) || DEFAULT_MODEL;
   const tools = parseTools(front["tools"]);
+  const budgets = parseBudgets(front["budgets"]);
   return {
     model,
     rates: parseRates(front["rates"], model),
-    budgets: parseBudgets(front["budgets"]),
+    budgets,
     runtime: parseRuntime(front["runtime"]),
     verdicts: parseVerdicts(front["verdicts"]),
+    termination: parseTermination(front["termination"], budgets),
     tools,
     enrichment: parseEnrichment(front["enrichment"], new Set(tools.map((tool) => tool.id))),
   };

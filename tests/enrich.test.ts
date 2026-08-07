@@ -53,6 +53,9 @@ function ledgerFor(spec: HuntSpec): Ledger {
     narrative: "",
     created_at: new Date().toISOString(),
     terminated_at: null,
+    parked_at: null,
+    parked_reason: null,
+    termination_reason: null,
   });
 }
 

@@ -1,20 +1,25 @@
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildDigest, focusOf, rankFrontier } from "./digest.js";
 import { buildEntityGraph, entitiesOf, key } from "./entities.js";
-import { drain } from "./inbox.js";
+import { drain, grantOf, journalNote } from "./inbox.js";
 import { Ledger, newId, type Projection } from "./ledger.js";
 import type { DecisionProvider, DisconfirmationCritic, Enricher, WorkerDispatcher } from "./ports.js";
+import { buildReport, renderReport, reportPath } from "./report.js";
 import { sanitize, sanitizeQuestion } from "./sanitize.js";
 import {
   DEFAULT_DIGEST,
   DEFAULT_DISPATCH,
   DEFAULT_ENRICHMENT,
+  DEFAULT_TERMINATION,
   DEFAULT_VERDICTS,
   type DigestPolicy,
   type DispatchPolicy,
   type HuntSpec,
+  type Termination,
   type Verdicts,
 } from "./spec.js";
+import { terminationVerdict, type TerminationVerdict } from "./termination.js";
 import {
   CRITIC_SOURCE_SYSTEM,
   evidenceStrength,
@@ -26,9 +31,11 @@ import {
   ACTIONS_REQUIRING_CITATION,
   DECISION_ACTIONS,
   OUTCOME_PRECEDENCE,
+  type Budgets,
   type Decision,
   type DecisionResult,
   type Digest,
+  type Directive,
   type DispatchRequest,
   type DispatchResult,
   type Entity,
@@ -58,6 +65,7 @@ export const MAX_EXPANSIONS = 3;
 const EXPANSION_BUDGET = 12_000;
 
 export class HuntAlreadyTerminal extends Error {}
+export class HuntParked extends Error {}
 export class InvalidDecision extends Error {}
 
 interface FanOutTarget {
@@ -221,6 +229,9 @@ export function startHunt(spec: HuntSpec, dir: string): Ledger {
     narrative: spec.narrative,
     created_at: now,
     terminated_at: null,
+    parked_at: null,
+    parked_reason: null,
+    termination_reason: null,
   });
 
   for (const [index, statement] of spec.hypotheses.entries()) {
@@ -269,14 +280,30 @@ export class HuntController {
     return this.ledger.projection.hunt.spec.enrichment ?? DEFAULT_ENRICHMENT;
   }
 
+  // Read from the journaled spec for the same reason: the ceilings a hunt runs
+  // under were fixed when it started, so an edited config cannot quietly raise
+  // the cap on a hunt already parked against it.
+  private get termination(): Termination {
+    return this.ledger.projection.hunt.spec.termination ?? DEFAULT_TERMINATION;
+  }
+
   async advanceIteration(): Promise<IterationResult> {
     if (this.ledger.projection.hunt.status === "terminal") {
       const hunt = this.ledger.projection.hunt;
       throw new HuntAlreadyTerminal(`${hunt.hunt_id} already ended as ${hunt.outcome}`);
     }
 
-    // Human input is integrated at the boundary, before anything is decided on it.
-    if (this.applyDirectives()) return this.aborted();
+    // Human input is integrated at the boundary, before anything is decided on
+    // it — and it is how a parked hunt is resolved, so it is drained first.
+    if (this.applyDirectives()) return this.halted();
+
+    const parked = this.ledger.projection.hunt;
+    if (parked.status === "parked") {
+      throw new HuntParked(
+        `${parked.hunt_id} is parked: ${parked.parked_reason ?? "awaiting an operator"}. ` +
+          "Resolve it with a directive — extend (grant +N iterations or +$N), conclude (accept the stop), or abort.",
+      );
+    }
 
     const projection = this.ledger.projection;
     const iteration = projection.hunt.iteration + 1;
@@ -384,20 +411,145 @@ export class HuntController {
     return { ...digest, expansions: [...digest.expansions, ...expansions], notes };
   }
 
-  // Returns true when a directive ended the hunt. A lead becomes a real lead; a
-  // note only reaches the digest, so it steers without mutating anything.
+  // Returns true when the hunt ended here. A lead becomes a real lead; a note
+  // only reaches the digest, so it steers without mutating anything; extend and
+  // conclude resolve the budget checkpoint.
   private applyDirectives(): boolean {
     let abort = false;
+    let conclude = false;
+
     for (const directive of drain(this.ledger)) {
-      if (directive.kind === "abort") abort = true;
-      if (directive.kind !== "lead") continue;
-      this.raise(directive.text, { spawned_iteration: this.ledger.projection.hunt.iteration + 1 });
+      switch (directive.kind) {
+        case "abort":
+          abort = true;
+          break;
+        case "conclude":
+          conclude = true;
+          break;
+        case "lead":
+          this.raise(directive.text, { spawned_iteration: this.ledger.projection.hunt.iteration + 1 });
+          break;
+        case "extend":
+          this.extend(directive);
+          break;
+        case "note":
+          break;
+      }
     }
-    if (abort) this.terminate("aborted");
-    return abort;
+
+    if (abort) {
+      this.terminate("aborted", "an operator halted the hunt");
+      return true;
+    }
+    // Not completed: the predicate never passed, the money ran out and the
+    // operator accepted the stop. Precedence already encodes the difference.
+    if (conclude) {
+      this.terminate("budget_terminated", "an operator accepted the stop at the budget checkpoint");
+      return true;
+    }
+    // After the drain, not before: an answer already waiting in the inbox is an
+    // operator who did respond, however late the process got around to reading it.
+    return this.expireParked();
   }
 
-  private aborted(): IterationResult {
+  // Asks the predicate the same question CONCLUDE asks, before parking. A hunt
+  // with nothing active and a cleared frontier is finished; parking it would put
+  // an operator in front of work that is already done, and their answer would
+  // record it as budget_terminated — "we ran out before we were done" — when what
+  // happened is that the money ran out at the moment the hunt finished.
+  private budgetCheckpoint(iteration: number): string {
+    const verdict = terminationVerdict(this.ledger.projection, iteration, this.termination, this.verdicts);
+    if (verdict.outcome === null) return this.park();
+
+    this.concludeWith(verdict, `the termination predicate passed as the budget ran out at iteration ${iteration}`);
+    return `concluded as ${verdict.outcome} on the last of the budget`;
+  }
+
+  // The budget checkpoint. The hunt stops spending and waits: extend, conclude or
+  // abort. Parked rather than terminated, because "the money ran out" is a
+  // question for an operator, not a verdict about the hypotheses.
+  private park(): string {
+    const hunt = this.ledger.projection.hunt;
+    const reason =
+      `budget exhausted at iteration ${hunt.iteration} of ${hunt.budgets.max_iterations}, ` +
+      `$${hunt.cost_usd.toFixed(4)} of $${hunt.budgets.max_cost_usd.toFixed(2)}`;
+
+    this.ledger.patch("hunt", hunt.hunt_id, {
+      status: "parked",
+      parked_at: new Date().toISOString(),
+      parked_reason: reason,
+    });
+    return `parked: ${reason} — extend, conclude or abort`;
+  }
+
+  // Raises the budgets, capped by the hard per-hunt ceiling, and un-parks only if
+  // the grant actually bought a turn: an extension clamped down to what the hunt
+  // has already spent would un-park it into an immediate re-park.
+  private extend(directive: Directive): void {
+    const hunt = this.ledger.projection.hunt;
+    const grant = grantOf(directive);
+
+    if (grant.iterations <= 0 && grant.cost_usd <= 0) {
+      journalNote(
+        this.ledger,
+        `extend "${directive.text}" granted nothing the controller could read; ` +
+          "say how many iterations or how many dollars (e.g. \"+5 iterations\", \"+$10\").",
+      );
+      return;
+    }
+
+    const asked: Budgets = {
+      max_iterations: hunt.budgets.max_iterations + grant.iterations,
+      max_cost_usd: Number((hunt.budgets.max_cost_usd + grant.cost_usd).toFixed(6)),
+    };
+    const { hard_max_iterations, hard_max_cost_usd } = this.termination;
+    const budgets: Budgets = {
+      max_iterations: Math.min(asked.max_iterations, hard_max_iterations),
+      max_cost_usd: Math.min(asked.max_cost_usd, hard_max_cost_usd),
+    };
+    this.ledger.patch("hunt", hunt.hunt_id, { budgets });
+
+    if (budgets.max_iterations < asked.max_iterations || budgets.max_cost_usd < asked.max_cost_usd) {
+      journalNote(
+        this.ledger,
+        `${directive.actor} extended the hunt to ${asked.max_iterations} iterations / ` +
+          `$${asked.max_cost_usd.toFixed(2)}; clamped to the hard ceiling of ${hard_max_iterations} iterations / ` +
+          `$${hard_max_cost_usd.toFixed(2)}.`,
+      );
+    }
+
+    if (this.budgetExhausted()) {
+      journalNote(
+        this.ledger,
+        `the extension leaves no room at ${budgets.max_iterations} iterations / $${budgets.max_cost_usd.toFixed(2)}, ` +
+          "so the hunt stays parked; conclude or abort it.",
+      );
+      return;
+    }
+    this.ledger.patch("hunt", hunt.hunt_id, { status: "active", parked_at: null, parked_reason: null });
+  }
+
+  // Lazy expiry: no timers and no daemon in a single-process app, so the TTL is
+  // enforced wherever the hunt is next touched. A hunt nobody answered for a week
+  // is abandoned in fact, and saying so is more honest than leaving it parked.
+  private expireParked(): boolean {
+    const hunt = this.ledger.projection.hunt;
+    if (hunt.status !== "parked" || !hunt.parked_at) return false;
+
+    const parkedFor = Date.now() - Date.parse(hunt.parked_at);
+    const ttl = this.termination.park_ttl_ms;
+    if (!(parkedFor >= ttl)) return false;
+
+    this.terminate(
+      "aborted",
+      `parked since ${hunt.parked_at} with no operator decision, past the ${Math.round(ttl / 86_400_000)}-day park TTL`,
+    );
+    return true;
+  }
+
+  // What a boundary-ended iteration reports: nothing was decided and nothing was
+  // spent, so the only news is the state the hunt landed in.
+  private halted(): IterationResult {
     const hunt = this.ledger.projection.hunt;
     return {
       hunt_id: hunt.hunt_id,
@@ -409,7 +561,7 @@ export class HuntController {
       enriched: 0,
       hunt_status: hunt.status,
       hunt_outcome: hunt.outcome,
-      note: "aborted by operator directive",
+      note: hunt.termination_reason ?? `ended ${hunt.outcome ?? "at the iteration boundary"}`,
     };
   }
 
@@ -745,12 +897,13 @@ export class HuntController {
       notes.push(this.applyVerdict(iteration, result.decision, nullCheck));
     }
 
-    if (result.decision.action === "CONCLUDE") {
-      this.terminate("completed");
-    } else if (this.budgetExhausted()) {
-      this.terminate("budget_terminated");
-      notes.push("budget exhausted");
+    // CONCLUDE is a recommendation; the predicate is the judge. A refusal leaves
+    // the hunt active, so the budget check below still applies to it.
+    if (result.decision.action === "CONCLUDE") notes.push(this.concludeOrRefuse(iteration));
+    if (this.ledger.projection.hunt.status === "active" && this.budgetExhausted()) {
+      notes.push(this.budgetCheckpoint(iteration));
     }
+
     const note = notes.filter((entry) => entry !== "").join("; ");
 
     const final = this.ledger.projection.hunt;
@@ -886,9 +1039,43 @@ export class HuntController {
     return result.failed ? [] : appended;
   }
 
+  // The Hunt Lead recommends stopping; the controller decides. A refusal is not
+  // an invalid emission — the decision was schema- and citation-valid, so it
+  // stands on the record and costs none of the bounded re-prompt. What it costs
+  // is the iteration, and the reason reaches the next digest so the lead can act
+  // on it rather than re-emitting the same CONCLUDE.
+  private concludeOrRefuse(iteration: number): string {
+    const verdict = terminationVerdict(this.ledger.projection, iteration, this.termination, this.verdicts);
+
+    if (verdict.outcome === null) {
+      const refusal = `CONCLUDE refused: ${verdict.blocked_by}`;
+      journalNote(this.ledger, `${refusal}. Resolve it before recommending CONCLUDE again.`);
+      return refusal;
+    }
+
+    this.concludeWith(verdict, `the termination predicate passed at iteration ${iteration}`);
+    return `concluded as ${verdict.outcome}`;
+  }
+
+  // What a passing verdict does, wherever it was asked for. One writer, so the
+  // budget checkpoint and a CONCLUDE cannot disagree about what concluding means.
+  private concludeWith(verdict: TerminationVerdict & { outcome: HuntOutcome }, reason: string): void {
+    // Below the floor and never pulled: these are the backlog deliverable, and
+    // closing them here is what makes "done" mean the frontier was cleared.
+    for (const question of verdict.park) {
+      this.ledger.patch("question", question.question_id, {
+        status: "parked",
+        closed_reason: `parked to the backlog: below the priority floor of ${this.termination.priority_floor} when the hunt ended`,
+      });
+    }
+    this.terminate(verdict.outcome, reason);
+  }
+
   // Unresolved hypotheses become inconclusive, never disproven: the hunt
-  // stopped looking, which is not the same as having cleared them.
-  terminate(outcome: HuntOutcome): void {
+  // stopped looking, which is not the same as having cleared them. Every outcome
+  // flows through here, so Finalize sits here too — a second terminal path is how
+  // a hunt ends without a report.
+  terminate(outcome: HuntOutcome, reason = ""): void {
     const hunt = this.ledger.projection.hunt;
     if (hunt.outcome !== null && OUTCOME_PRECEDENCE[hunt.outcome] >= OUTCOME_PRECEDENCE[outcome]) return;
 
@@ -904,7 +1091,18 @@ export class HuntController {
       status: "terminal",
       outcome,
       terminated_at: new Date().toISOString(),
+      ...(reason === "" ? {} : { termination_reason: reason }),
     });
+    this.finalize();
+  }
+
+  // The deliverable. Journaled structured so the fold stays the source of truth,
+  // and rendered beside the ledger so an operator has something to read — the
+  // markdown is an artifact, never state, and nothing reads it back.
+  private finalize(): void {
+    const report = buildReport(this.ledger.projection);
+    this.ledger.append({ kind: "finalize", report });
+    writeFileSync(reportPath(this.ledger.path), renderReport(report));
   }
 
   private budgetExhausted(): boolean {
