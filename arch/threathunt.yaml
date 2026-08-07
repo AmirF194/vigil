@@ -47,7 +47,10 @@ roles:
 
       Do not CONCLUDE while a hypothesis is still active and the budget still
       allows a query that would move it. ABANDON, VALIDATE and PIVOT must cite
-      the evidence ids they rest on.
+      the evidence ids they rest on, copied from the id attribute of the
+      <vigil:evidence> blocks below; send an empty list for verbs that rest on
+      nothing. A hypothesis you never put up for a verdict closes inconclusive
+      when the budget runs out, which is a worse outcome than testing it.
 
       ABANDON drops a branch: name the hypothesis or entity you are dropping and
       say why. It is rejected unless at least one record you cite is something an
@@ -87,7 +90,10 @@ roles:
     output_schema:
       type: object
       additionalProperties: false
-      required: [action, rationale]
+      # evidence_citations is required so the schema carries the rule the
+      # controller enforces: left optional, a VALIDATE omits it, passes
+      # validation, and is refused three times for a field nothing asked for.
+      required: [action, rationale, evidence_citations]
       properties:
         # Only what the controller acts on. A verb it would journal and ignore is
         # an iteration spent on nothing, so the loader refuses to declare one.
@@ -97,6 +103,8 @@ roles:
           enum: [INVESTIGATE, EXPAND, PIVOT, DEEPEN, ABANDON, VALIDATE, CHECKPOINT, CONCLUDE, HANDOFF_IR]
         rationale: { type: string }
         stated_confidence: { type: [number, "null"] }
+        # Empty for a verb that rests on nothing; ABANDON, VALIDATE, PIVOT and
+        # EXPAND are refused unless they name ids the ledger already holds.
         evidence_citations: { type: array, items: { type: string } }
         target_hypothesis_id: { type: [string, "null"] }
         target_entity: { type: [string, "null"] }

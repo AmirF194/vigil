@@ -7,13 +7,18 @@
 #     --prompt "..." --scripted --yes --iterations 8
 model: anthropic/claude-opus-5
 
+# USD per million tokens for claude-opus-5. Wrong here means the budget guard
+# trips at the wrong spend, in either direction.
 rates:
-  input: 15.00
-  output: 75.00
+  input: 5.00
+  output: 25.00
 
+# Measured on BOTSv3, not guessed: iteration 1 cost $1.25 and iteration 2 $4.98.
+# Cost per iteration climbs because each turn resends a context the last one
+# grew, and the growth is dominated by SQL result rows carried across tool turns.
 budgets:
-  max_iterations: 12
-  max_cost_usd: 5.00
+  max_iterations: 8
+  max_cost_usd: 22.00
 
 verdicts:
   min_corroborating_sources: 2
@@ -22,8 +27,8 @@ verdicts:
 termination:
   priority_floor: 5
   park_ttl_ms: 604800000
-  hard_max_iterations: 24
-  hard_max_cost_usd: 10.00
+  hard_max_iterations: 12
+  hard_max_cost_usd: 30.00
 
 # The difference from the shipped config: a human approves the start and every
 # verdict. The hunt parks at each and waits — its iteration count and its
@@ -44,7 +49,9 @@ tools:
   - id: duckdb_query
     kind: duckdb
     database: ~/Downloads/botsv3_duckdb/botsv3.duckdb
-    max_rows: 200
+    # Halved from the shipped 200: a worker carries every row it selects across
+    # up to twelve tool turns, so result size is the dominant cost driver.
+    max_rows: 100
     timeout_ms: 30000
     memory_limit: 2GB
   - id: expand

@@ -9,6 +9,7 @@ import { HuntController, startHunt } from "../ai/loop.js";
 import { buildSpec } from "../ai/spec.js";
 import { buildTools, closeTools, type Tool } from "../ai/tools.js";
 import { Ledger } from "../ai/ledger.js";
+import { replay } from "../ai/replay.js";
 
 type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
 
@@ -34,9 +35,16 @@ function completion(message: Record<string, unknown>): OpenAI.Chat.ChatCompletio
 // Everything downstream of the HTTP call is real: the controller, both roles,
 // the tool loop, the DuckDB tool, and the ledger. Only the gateway is stubbed.
 function fakeGateway(hypothesisId: string, bodies: Body[]) {
+  // evidence_citations is required of every emission, so the stub sends it too:
+  // a fake gateway that skips it is not exercising the schema a model answers.
   const leadDecisions = [
-    { action: "INVESTIGATE", rationale: "establish a beaconing baseline", query_intent: "find regular outbound intervals" },
-    { action: "CONCLUDE", rationale: "beaconing confirmed" },
+    {
+      action: "INVESTIGATE",
+      rationale: "establish a beaconing baseline",
+      query_intent: "find regular outbound intervals",
+      evidence_citations: [],
+    },
+    { action: "CONCLUDE", rationale: "beaconing confirmed", evidence_citations: [] },
   ];
   let workerQueried = false;
 
@@ -87,7 +95,7 @@ describe.skipIf(!existsSync(DATABASE))("hunt end to end (stubbed gateway, real e
   beforeEach(() => resetEmitMode());
   afterAll(async () => closeTools(tools));
 
-  it("runs a hunt from spec to verdict and leaves a replayable ledger", async () => {
+  it("runs real SQL through a worker into the ledger and leaves it replayable", async () => {
     const spec = buildSpec({ workflowPath: "frothly.yaml" });
     const ledger = startHunt(spec, mkdtempSync(join(tmpdir(), "hunt-")));
     const hypothesisId = [...ledger.projection.hypotheses.keys()][0]!;
@@ -133,18 +141,24 @@ describe.skipIf(!existsSync(DATABASE))("hunt end to end (stubbed gateway, real e
     ]);
     expect([...ledger.projection.questions.values()][0]!.question).toBe("check 45.77.53.176");
 
+    // CONCLUDE is a recommendation, not a verdict: nothing has been validated
+    // and both hypotheses are still active, so the controller refuses it.
     const second = await controller.advanceIteration();
-    expect(second.hunt_status).toBe("terminal");
-    expect(second.hunt_outcome).toBe("completed");
-
-    // The unlinked second hypothesis is inconclusive, never disproven.
+    expect(second.hunt_status).toBe("active");
     const statuses = [...ledger.projection.hypotheses.values()].map((h) => h.status);
-    expect(statuses).toEqual(["inconclusive", "inconclusive"]);
+    expect(statuses).toEqual(["active", "active"]);
+    expect(second.note).toContain("still active");
 
     // The digest the lead saw is on the record, and the file replays to the same state.
     const decisions = ledger.projection.decisions;
     expect(decisions).toHaveLength(2);
     expect(decisions[1]!.digest_presented.recent_evidence[0]!.summary).toContain("45.77.53.176");
     expect(Ledger.open(ledger.path).projection).toEqual(ledger.projection);
+
+    // And every digest rebuilds from the prefix behind it — the determinism the
+    // ledger claims, checked rather than asserted.
+    const replayed = replay(ledger.log);
+    expect(replayed.reproduced).toBe(decisions.length);
+    expect(replayed.inexact).toBe(0);
   });
 });

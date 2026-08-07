@@ -109,6 +109,12 @@ export class Ledger {
     if (this.view === null) this.view = fold(this.events);
     return this.view;
   }
+
+  // The raw events, for replay: folding a prefix rebuilds the state behind any
+  // past decision. Readonly because only append may extend the log.
+  get log(): readonly LedgerEvent[] {
+    return this.events;
+  }
 }
 
 export function fold(events: readonly LedgerEvent[]): Projection {

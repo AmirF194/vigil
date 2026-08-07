@@ -166,8 +166,37 @@ Routine records that fall out of the window are **named, not dropped**: the
 `Compressed` block lists their ids, and a small seeded sample is resurfaced each
 turn, weighted toward records the lead has never been shown. The seed is
 journaled on the hunt event, so a resumed hunt resurfaces exactly what an
-uninterrupted one would and a replay is exact — fold the events up to any
-decision, rebuild, and you get the digest that decision was made against.
+uninterrupted one would and a replay is exact. `vigilhunt replay` checks that.
+
+## Replay
+
+Every decision journals the digest it was made against, plus `digest_seq` — the
+ledger length when that digest was built. `replay` folds each prefix, rebuilds
+the digest, and diffs it against what was recorded.
+
+```bash
+vigilhunt replay runs/hunt-<id>.jsonl
+vigilhunt replay runs/hunt-<id>.jsonl --iteration 4   # both digests, in full
+```
+
+```
+   1  INVESTIGATE  h-28806bb3               $  0.0424  ok
+   4  VALIDATE     h-28806bb3               $  0.4404  ok
+
+4 decision(s) replayed, 4 digest(s) reproduced exactly.
+```
+
+`digest_seq` is the boundary and not the decision's own `seq` because a
+dispatch is journaled while the lead is still deciding — folding to the decision
+would include records it never saw. Two fields are carried rather than
+re-derived, since the controller appends them after the digest is built: a
+rejection note and an `EXPAND`. Both must extend the rebuilt digest, never
+contradict it.
+
+Exit status is non-zero on any mismatch, so it works as a check. Ledgers written
+before `digest_seq` existed have their prefix inferred from the first dispatch of
+each iteration and are labelled `inferred boundary` — a mismatch there is not by
+itself evidence of drift.
 
 ## The entity graph
 
@@ -228,6 +257,29 @@ to the lead through the same bounded re-ask as any other invalid decision.
 What survives is `parked` with the reason and the citations on it, never
 `disproven`: the hunt stopped looking, which is not a clearing. Naming an entity
 takes its leads off the frontier instead.
+
+## When the lead stalls
+
+A rejection is correctable and costs nothing but a re-ask. Three of them in a row
+is a stalled iteration, and it is journaled before the error surfaces: a
+`STALLED` decision carrying the digest presented, every rejected emission, and
+what they cost.
+
+`STALLED` is written by the controller and is **not in the vocabulary a lead may
+emit** — an arch declaring it fails to load, and a lead emitting it is rejected
+as an unknown action, so a hunt cannot talk its way out of a verdict. The record
+names no entity and no hypothesis, so the focus fold reads straight past it, and
+the digest on it is real, so evidence the lead was shown still counts as seen.
+
+The iteration counter does not advance and the hunt stays `active`, so
+`--resume` retries the same iteration. What does advance is the cost: the spend
+is charged and the budget re-checked, so a hunt that stalls repeatedly ends as
+`budget_terminated` rather than resuming past `max_cost_usd` unnoticed.
+
+```bash
+jq -r 'select(.decision.decision.action=="STALLED")
+       | .decision.rejected_attempts[]' runs/hunt-*.jsonl
+```
 
 ## Enrichment chains
 
@@ -364,6 +416,7 @@ the digest rules, and both are already data.
 | `ai/spec.ts` | the three YAML layers, their merge, and the worker registry |
 | `ai/enrich.ts` | the declared chains: value escaping, templating, one call per entity |
 | `ai/sanitize.ts` | the worker evidence boundary |
+| `ai/replay.ts` | rebuilds each decision's digest from the prefix behind it |
 | `ai/lease.ts` | per-hunt lockfile so one process advances a ledger |
 | `ai/inbox.ts` | the operator directive queue |
 | `tools/duckdb.ts` | read-only SQL over the telemetry |
@@ -373,3 +426,102 @@ the digest rules, and both are already data.
 The dataset used by `frothly.yaml` is Splunk BOTSv3 converted to DuckDB
 (1.94M events). Point `tools[].database` wherever yours lives; the DuckDB tests
 skip when it is absent.
+
+## Setup, end to end
+
+Copy-paste from a clean checkout. Steps 1 and 2 need no key and no gateway.
+
+**1. Install and prove the loop.** No LLM, no database — the whole controller
+runs against scripted evidence.
+
+```bash
+npm install
+npm run hunt -- --prompt "a host is beaconing outbound" --scripted --yes
+```
+
+**2. Point at the telemetry.** `tools[].database` in `vigil.config.yaml` expands
+`~`; edit it if BOTSv3 lives elsewhere. The test skips when the file is absent,
+so a pass means the views resolved.
+
+```bash
+npx vitest run tests/duckdb.test.ts
+```
+
+**3. Put the provider keys somewhere.** Nothing in this repo reads a provider
+key — `ai/llm.ts` sends `apiKey: "bifrost"` and lets the gateway hold the real
+one. `.env` is not auto-loaded either, so export it into whatever shell starts a
+process that needs it.
+
+```bash
+cat > .env <<'EOF'
+ANTHROPIC_API_KEY=sk-ant-...
+# optional: web_intel fails as a visibility gap without it
+FIRECRAWL_API_KEY=fc-...
+EOF
+
+set -a; . ./.env; set +a      # run this in every new shell, both windows below
+```
+
+**4. Start the gateway.** Bifrost resolves `env.ANTHROPIC_API_KEY` at load, so
+the key never lands in a committed file. `"models": ["*"]` matters — a narrow
+per-key allow-list rejects `anthropic/claude-opus-5` with a routing error rather
+than a useful message.
+
+```bash
+mkdir -p bifrost
+cat > bifrost/config.json <<'EOF'
+{
+  "providers": {
+    "anthropic": {
+      "keys": [
+        { "name": "default", "value": "env.ANTHROPIC_API_KEY", "models": ["*"], "weight": 1.0 }
+      ]
+    }
+  }
+}
+EOF
+
+npx -y @maximhq/bifrost -app-dir ./bifrost     # leave running on :8080
+```
+
+Confirm it is up before hunting — the hunt's first model call is otherwise the
+thing that discovers it is not:
+
+```bash
+curl -s localhost:8080/v1/models | head -c 200
+```
+
+**5. Hunt.** In a second shell, with `.env` exported there too.
+
+```bash
+BIFROST_URL=http://localhost:8080 \
+  npm run hunt -- --workflow frothly.yaml --id 192.168.70.186 --iterations 8 --yes
+```
+
+**6. Read the ledger.** The run prints its path; every decision, query and cost
+is one JSON line.
+
+```bash
+LEDGER=$(ls -t runs/hunt-*.jsonl | head -1)
+jq -r 'select(.kind=="evidence") | "\(.evidence.salience)\t\(.evidence.summary)"' "$LEDGER"
+jq -r 'select(.kind=="decision") | "\(.decision.decision.action)\t\(.decision.decision.rationale)"' "$LEDGER"
+```
+
+**7. Replay it.** Every decision's digest is rebuilt from the ledger prefix
+behind it and checked against what was journaled. Non-zero exit on a mismatch.
+
+```bash
+npm run hunt -- replay "$LEDGER"
+```
+
+Resume, steer and abort are in [Steering, pausing, resuming](#steering-pausing-resuming).
+
+### When it does not work
+
+| symptom | cause |
+|---|---|
+| `ECONNREFUSED localhost:8080` | Bifrost is not running, or `BIFROST_URL` points elsewhere |
+| every iteration is a visibility gap | the DuckDB path is wrong — rerun step 2 |
+| `budget_terminated` after a few turns | `budgets` or `rates` in `vigil.config.yaml` are too tight for the model |
+| `web_intel` always fails | `FIRECRAWL_API_KEY` is not exported in the hunt's shell |
+| `ledger already exists` | two hunts raced the same id; the `.lease` file names the holder |

@@ -9,6 +9,7 @@ import { Lease, LeaseHeld } from "../ai/lease.js";
 import { directiveActor, steer, type DirectiveFields } from "../ai/inbox.js";
 import { pendingCheckpoints, resolutionOf, AUTO_ACTOR } from "../ai/checkpoints.js";
 import { buildReport, renderReport, reportPath } from "../ai/report.js";
+import { replay } from "../ai/replay.js";
 import {
   ScriptedDecisionProvider,
   ScriptedDisconfirmationCritic,
@@ -63,6 +64,11 @@ vigilhunt checkpoints <ledger.jsonl>
 vigilhunt report <ledger.jsonl>
   Rebuild the hunt report from the ledger. Derived, so it works at any time
   and on hunts that ended long ago.
+
+vigilhunt replay <ledger.jsonl> [--iteration N]
+  Rebuild the digest behind every decision from the ledger prefix and check it
+  against the one journaled at the time. Exits non-zero on any mismatch.
+  --iteration N prints the presented and rebuilt digests for one decision.
 
 Ctrl-C pauses after the current iteration and offers a directive prompt.`;
 
@@ -409,6 +415,49 @@ function report(path: string): number {
   return 0;
 }
 
+// Turns the README's determinism claim into a check: every decision's digest is
+// rebuilt from the ledger prefix behind it and diffed against what was journaled.
+function showReplay(path: string, iteration?: string): number {
+  const report = replay(Ledger.open(path).log);
+  if (report.decisions.length === 0) {
+    console.log(`${report.hunt_id} has no decisions to replay`);
+    return 0;
+  }
+
+  const only = iteration === undefined ? null : Number(iteration);
+  if (only !== null) {
+    const decision = report.decisions.find((candidate) => candidate.iteration === only);
+    if (decision === undefined) {
+      console.error(`error: no decision at iteration ${only}`);
+      return 2;
+    }
+    console.log(`iteration ${decision.iteration}  ${decision.action}  $${decision.cost_usd.toFixed(4)}`);
+    console.log(`\n--- digest presented ---\n${JSON.stringify(decision.recorded, null, 2)}`);
+    console.log(`\n--- digest rebuilt ---\n${JSON.stringify(decision.rebuilt, null, 2)}`);
+    return decision.mismatch === null ? 0 : 1;
+  }
+
+  console.log(`\nreplaying ${report.hunt_id}\n`);
+  for (const decision of report.decisions) {
+    const caveat = decision.exact ? "" : " (inferred boundary)";
+    const status = `${decision.mismatch ?? "ok"}${caveat}`;
+    const target = decision.target ?? "";
+    console.log(
+      `  ${String(decision.iteration).padStart(2)}  ${decision.action.padEnd(12)} ${target.padEnd(24)} ` +
+        `$${decision.cost_usd.toFixed(4).padStart(8)}  ${status}`,
+    );
+  }
+
+  const total = report.decisions.length;
+  console.log(`\n${total} decision(s) replayed, ${report.reproduced} digest(s) reproduced exactly.`);
+  // A ledger written before digest_seq has no exact prefix boundary, so a
+  // mismatch on one of those rows is not by itself evidence of drift.
+  if (report.inexact > 0) {
+    console.log(`${report.inexact} predate digest_seq; their prefix was inferred.`);
+  }
+  return report.reproduced === total ? 0 : 1;
+}
+
 async function main(): Promise<number> {
   const { values, positionals } = parseArgs({
     options: {
@@ -432,6 +481,7 @@ async function main(): Promise<number> {
       revoke: { type: "boolean", default: false },
       tenant: { type: "string" },
       iterations: { type: "string", default: "1" },
+      iteration: { type: "string" },
       scripted: { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
@@ -444,12 +494,13 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  if (positionals[0] === "report" || positionals[0] === "checkpoints") {
+  if (positionals[0] === "report" || positionals[0] === "checkpoints" || positionals[0] === "replay") {
     const path = positionals[1];
     if (path === undefined) {
       console.error(`error: ${positionals[0]} needs a ledger path\n\n${USAGE}`);
       return 2;
     }
+    if (positionals[0] === "replay") return showReplay(path, values.iteration);
     return positionals[0] === "report" ? report(path) : checkpoints(path);
   }
   if (positionals.length > 0) {

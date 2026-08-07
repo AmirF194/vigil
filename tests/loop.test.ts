@@ -153,10 +153,13 @@ describe("bounded re-prompt", () => {
   // than a script running out.
   class StubbornProvider implements DecisionProvider {
     readonly seenDigests: Digest[] = [];
-    constructor(private readonly decision: Decision) {}
+    constructor(
+      private readonly decision: Decision,
+      private readonly cost = 0,
+    ) {}
     async decide(digest: Digest): Promise<DecisionResult> {
       this.seenDigests.push(digest);
-      return { decision: this.decision, model_id: "scripted", prompt_version: "scripted/v0", cost_usd: 0 };
+      return { decision: this.decision, model_id: "scripted", prompt_version: "scripted/v0", cost_usd: this.cost };
     }
   }
 
@@ -191,19 +194,45 @@ describe("bounded re-prompt", () => {
     expect(provider.seenDigests[0]!.notes.join(" ")).not.toMatch(/previous emission was rejected/);
   });
 
-  it("gives up after the bound and writes nothing for that iteration", async () => {
+  it("gives up after the bound and journals the stall it threw on", async () => {
     const ledger = ledgerFor();
-    const provider = new StubbornProvider(UNCITED_ABANDON);
-    const before = readFileSync(ledger.path, "utf8");
+    const provider = new StubbornProvider(UNCITED_ABANDON, 0.02);
 
     await expect(new HuntController(ledger, provider).advanceIteration()).rejects.toThrow(InvalidDecision);
 
     expect(provider.seenDigests).toHaveLength(MAX_DECISION_ATTEMPTS);
-    expect(readFileSync(ledger.path, "utf8")).toBe(before);
-    expect(ledger.projection.decisions).toHaveLength(0);
-    // The hunt stays active, so an operator can retry it.
+
+    // The rejected emissions are on the ledger rather than only in the error,
+    // and the spend that bought them is charged against the budget.
+    const record = ledger.projection.decisions[0]!;
+    expect(record.decision.action).toBe("STALLED");
+    expect(record.rejected_attempts).toHaveLength(MAX_DECISION_ATTEMPTS);
+    expect(record.cost_usd).toBeCloseTo(0.06, 10);
+    expect(ledger.projection.hunt.cost_usd).toBeCloseTo(0.06, 10);
+
+    // The iteration did not advance, so a resume retries it, and the hunt stays
+    // active for the operator to do exactly that.
     expect(ledger.projection.hunt.iteration).toBe(0);
     expect(ledger.projection.hunt.status).toBe("active");
+  });
+
+  // A stall a lead could emit would be a way to end a hunt without a verdict.
+  it("refuses a STALLED emitted by the lead", () => {
+    const ledger = ledgerFor();
+    expect(() =>
+      validateDecision({ action: "STALLED", rationale: "let me out" }, ledger.projection),
+    ).toThrow(/unknown action STALLED/);
+  });
+
+  it("terminates a stalled hunt that has spent its budget", async () => {
+    const ledger = ledgerFor();
+    // Each attempt costs more than the whole budget allows.
+    const provider = new StubbornProvider(UNCITED_ABANDON, 3);
+
+    await expect(new HuntController(ledger, provider).advanceIteration()).rejects.toThrow(InvalidDecision);
+
+    expect(ledger.projection.hunt.status).toBe("terminal");
+    expect(ledger.projection.hunt.outcome).toBe("budget_terminated");
   });
 
   it("charges the hunt for rejected emissions, not just the accepted one", async () => {

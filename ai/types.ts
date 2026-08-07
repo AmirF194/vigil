@@ -12,8 +12,13 @@ export type DecisionAction =
   | "VALIDATE"
   | "CHECKPOINT"
   | "CONCLUDE"
-  | "HANDOFF_IR";
+  | "HANDOFF_IR"
+  // Written by the controller, never emitted. Deliberately absent from
+  // DECISION_ACTIONS below, which is the vocabulary a lead may use: an arch
+  // declaring it fails to load and a lead emitting it is rejected as unknown.
+  | "STALLED";
 
+// What a Hunt Lead may emit. A subset of DecisionAction, not the whole union.
 export const DECISION_ACTIONS = [
   "INVESTIGATE",
   "EXPAND",
@@ -336,6 +341,10 @@ export interface DecisionRecord extends DecisionResult {
   decision_id: string;
   iteration: number;
   digest_presented: Digest;
+  // Events on the ledger when the digest was built, so replay folds exactly
+  // log[0..digest_seq). The decision is journaled after its own dispatches are,
+  // which is why its seq is not that boundary. Absent on pre-replay ledgers.
+  digest_seq?: number;
   created_at: string;
 }
 

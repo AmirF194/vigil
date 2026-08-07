@@ -1,0 +1,38 @@
+name: Frothly external C2 beacon
+
+# One hypothesis, not two. CONCLUDE is refused while any hypothesis is still
+# active, so a second one doubles the iterations before the hunt can end.
+hypotheses:
+  - An internal host is beaconing to external infrastructure on a regular interval
+
+attack_techniques:
+  - T1071.001
+
+# The beacon is provable across three of these, which clears
+# min_corroborating_sources without the hunt having to range wider.
+data_domains: [net_flow, dns, http, win_events, endpoint, cloud, threat_intel, web]
+
+scope:
+  tenant: frothly
+
+directives:
+  lead: |
+    This is a short demonstration hunt on the Frothly dataset: roughly 1.9M
+    events from 2018-08-19 to 2018-08-20. One hypothesis, and the evidence for
+    it is strong and quick to reach. Establish the beacon shape in the network
+    data, corroborate it in a second domain, then VALIDATE. Do not range beyond
+    what the hypothesis needs.
+  workers: |
+    Start from the mapped views (net_flow, dns, http, win_events, endpoint,
+    cloud) and fall back to the lossless events table when no view covers the
+    sourcetype. Internal space is 192.168.0.0/16 and 172.16.0.0/12; the internal
+    domain is froth.ly. The data spans 2018-08-19 to 2018-08-20 only.
+
+    Aggregate in SQL rather than selecting raw rows: counts, stddev and min/max
+    over a GROUP BY answer the question in a handful of rows, and every row you
+    return is carried in context for the rest of your turn.
+
+narrative: |
+  Frothly is a small brewing company. The dataset spans a single night and mixes
+  network capture, Windows and Sysmon logs, osquery endpoint results, and AWS
+  CloudTrail.

@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { buildSpec, DEFAULT_ARCH, loadArch, parseArch, parsePlaybook } from "../ai/spec.js";
 import { assertReadOnly, UnsafeQuery } from "../tools/duckdb.js";
 import { renderDigest } from "../ai/llm.js";
-import { DECISION_ACTIONS, EXECUTABLE_ACTIONS, type Digest } from "../ai/types.js";
+import {
+  ACTIONS_REQUIRING_CITATION,
+  DECISION_ACTIONS,
+  EXECUTABLE_ACTIONS,
+  type Digest,
+} from "../ai/types.js";
 
 // A minimal but valid arch, so a test can vary one thing at a time.
 function arch(roles: string): string {
@@ -86,9 +91,30 @@ describe("decision vocabulary", () => {
     expect(properties["action"]!.enum).toEqual([...EXECUTABLE_ACTIONS]);
   });
 
+  // Optional in the schema, evidence_citations is simply omitted, and every verb
+  // that rests on evidence is then refused for a field nothing required.
+  it("requires the citations the controller refuses a verb for omitting", () => {
+    const schema = loadArch(DEFAULT_ARCH).roles.lead.output_schema;
+    expect(schema["required"]).toContain("evidence_citations");
+    for (const action of ACTIONS_REQUIRING_CITATION) {
+      expect([...EXECUTABLE_ACTIONS]).toContain(action);
+    }
+  });
+
   it("rejects a role with no prompt, and an unknown role", () => {
     expect(() => parseArch(arch("  lead: {}\n" + WORKER))).toThrow(/roles.lead needs a prompt/);
     expect(() => parseArch(arch(LEAD + WORKER + "  auditor: {}\n"))).toThrow(/unknown role/);
+  });
+
+  // Left as a free string, worker_agent_id is where a struggling emission puts its
+  // overflow, and the id arrives carrying prose the controller has to reject.
+  it("constrains worker_agent_id to the registry, null included", () => {
+    const spec = buildSpec({ workflowPath: "frothly.yaml", prompt: "a host is beaconing" });
+    const properties = spec.roles.lead.output_schema["properties"] as Record<string, { enum?: unknown[] }>;
+    const declared = Object.keys(spec.roles.workers);
+
+    expect(properties["worker_agent_id"]!.enum).toEqual([...declared, null]);
+    expect(declared.length).toBeGreaterThan(0);
   });
 });
 

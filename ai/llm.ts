@@ -20,6 +20,13 @@ import type {
 
 const MAX_TOOL_TURNS = 12;
 
+// Sent on every request because the gateway must supply one to reach Anthropic,
+// and its default is small enough to cut a worker off mid-JSON — which arrives
+// as an unparseable emission and costs the hunt an iteration rather than looking
+// like a limit. Kept under ~16k so a non-streaming call cannot outlive the SDK's
+// HTTP timeout; a body that sets its own still wins.
+const MAX_OUTPUT_TOKENS = 12_000;
+
 // Enough to hold an aggregate result, not enough for one query to dominate the
 // ledger. Capped at capture, where the worker boundary already normalizes.
 const MAX_PAYLOAD_CHARS = 8_000;
@@ -250,7 +257,10 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
     options.signal?.throwIfAborted();
     const estimate = estimateTokens(JSON.stringify(body));
     const response = await limiter.run(estimate, () =>
-      client.chat.completions.create(body, options.signal ? { signal: options.signal } : {}),
+      client.chat.completions.create(
+        { max_tokens: MAX_OUTPUT_TOKENS, ...body },
+        options.signal ? { signal: options.signal } : {},
+      ),
     );
     if (!("choices" in response)) throw new LlmError("streaming responses are not supported", cost);
     cost += costOf(rates, response.usage?.prompt_tokens ?? 0, response.usage?.completion_tokens ?? 0);
@@ -294,6 +304,10 @@ export async function llm_output<T>(options: LlmOptions): Promise<LlmResult<T>> 
 
     const reason = parsed === undefined ? "response was not valid JSON" : formatErrors(validate);
     rejected.push(`${reason}: ${content.slice(0, 400)}`);
+    // The rejected emission goes back as the assistant turn it was. Without it the
+    // model is asked to correct something it cannot see, and the re-ask lands as a
+    // second consecutive user turn — which is how one bad emission became three.
+    messages.push({ role: "assistant", content });
     messages.push({ role: "user", content: `That emission was rejected — ${reason}. Emit a valid decision.` });
   }
 
@@ -328,7 +342,7 @@ async function emitJson(
         messages,
         response_format: { type: "json_schema", json_schema: { name: "decision", strict: false, schema } },
       });
-      return response.choices[0]?.message?.content ?? "";
+      return textOf(response.choices[0]?.message?.content);
     } catch (error) {
       if (statusOf(error) !== 400) throw error;
       emitModes.set(model, "tool");
@@ -343,6 +357,18 @@ async function emitJson(
   });
   const toolCall = response.choices[0]?.message?.tool_calls?.[0];
   return toolCall?.type === "function" ? toolCall.function.arguments : "";
+}
+
+// The gateway fronts providers whose native reply is a content-block list, and
+// that shape reaches us intact often enough to matter. Handing an array to
+// JSON.parse stringifies it to [object Object], so the emission reads as invalid
+// JSON and a decision the model got right is thrown away.
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => (typeof block === "object" && block !== null ? String((block as { text?: unknown }).text ?? "") : ""))
+    .join("");
 }
 
 async function runTool(tool: Tool | undefined, rawArgs: string): Promise<string> {

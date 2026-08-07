@@ -150,7 +150,9 @@ function nullCheckInput(projection: Projection, hypothesis: Hypothesis): NullChe
 // Lead cannot widen its own action space by emitting a new verb or a worker
 // the registry never declared.
 export function validateDecision(decision: Decision, projection: Projection): void {
-  if (!DECISION_ACTIONS.includes(decision.action)) {
+  // Widened for the membership test only: STALLED is a DecisionAction the
+  // controller writes but no lead may emit, so it must fail this check.
+  if (!(DECISION_ACTIONS as readonly string[]).includes(decision.action)) {
     throw new InvalidDecision(`unknown action ${String(decision.action)}`);
   }
 
@@ -383,13 +385,16 @@ export class HuntController {
 
     const projection = this.ledger.projection;
     const iteration = projection.hunt.iteration + 1;
+    // Captured before the digest, not after the decision: dispatches are
+    // journaled while the lead is still deciding, so only this prefix is what it saw.
+    const digestSeq = this.ledger.log.length;
     const digest = buildDigest(projection, iteration, this.digestPolicy);
 
-    const { presented, result } = await this.decide(digest, projection);
+    const { presented, result } = await this.decide(digest, projection, digestSeq);
 
     const dispatchResults = await this.runDispatches(iteration, result.decision);
     const nullCheck = await this.runNullCheck(result.decision);
-    return await this.write(iteration, presented, result, dispatchResults, nullCheck);
+    return await this.write(iteration, digestSeq, presented, result, dispatchResults, nullCheck);
   }
 
   // A rejection is a correctable mistake, not a lost iteration: the Hunt Lead is
@@ -399,6 +404,7 @@ export class HuntController {
   private async decide(
     digest: Digest,
     projection: Projection,
+    digestSeq: number,
   ): Promise<{ presented: Digest; result: DecisionResult }> {
     // Schema-level rejections from inside the provider and controller-level ones
     // from here are the same audit fact, so they merge into one list in order.
@@ -410,11 +416,15 @@ export class HuntController {
     let presented = digest;
     let attempts = 0;
     let expansions = 0;
+    // Carried out of the loop so a stall names the model and prompt that failed
+    // rather than what the spec merely asked for.
+    let attribution = { model_id: projection.hunt.spec.model, prompt_version: "" };
 
     while (attempts < MAX_DECISION_ATTEMPTS) {
       const result = await this.provider.decide(presented);
       rejected.push(...(result.rejected_attempts ?? []));
       spent += result.cost_usd;
+      attribution = { model_id: result.model_id, prompt_version: result.prompt_version };
 
       try {
         validateDecision(result.decision, projection);
@@ -454,14 +464,57 @@ export class HuntController {
       };
     }
 
-    // Known simplification for Phase 1: a wholly-failed iteration writes nothing
-    // to the ledger and surfaces to the operator, who can retry the still-active
-    // hunt. The rejected emissions live in this error rather than in an event,
-    // and their cost goes unrecorded with them.
+    // A stalled iteration is a fact about the hunt, not an absence of one: it
+    // presented a digest and was billed for emissions. Journaling it before the
+    // throw is what keeps the ledger the whole audit trail, and charging it is
+    // what stops a hunt resuming its way past max_cost_usd one stall at a time.
+    this.recordStall(presented, digestSeq, rejected, spent, attribution);
+
     throw new InvalidDecision(
       `the Hunt Lead emitted nothing valid in ${MAX_DECISION_ATTEMPTS} attempts ` +
         `($${spent.toFixed(4)} spent): ${rejected.join(" | ")}`,
     );
+  }
+
+  // Reuses the decision event rather than adding a kind of its own: what that
+  // record means is "a digest was presented and paid for", which is exactly what
+  // happened. It names no entity and no hypothesis, so focusOf folds straight
+  // past it and a stall cannot move what the hunt is looking at; the digest it
+  // carries is real, so evidence the lead was shown still counts as seen.
+  private recordStall(
+    presented: Digest,
+    digestSeq: number,
+    rejected: readonly string[],
+    spent: number,
+    attribution: { model_id: string; prompt_version: string },
+  ): void {
+    this.ledger.append({
+      kind: "decision",
+      decision: {
+        ...attribution,
+        decision: {
+          action: "STALLED",
+          rationale: `no valid decision in ${MAX_DECISION_ATTEMPTS} attempts`,
+          target_entity: null,
+          target_hypothesis_id: null,
+        },
+        decision_id: newId("dec"),
+        iteration: presented.iteration,
+        digest_presented: presented,
+        digest_seq: digestSeq,
+        cost_usd: spent,
+        rejected_attempts: [...rejected],
+        created_at: new Date().toISOString(),
+      },
+    });
+
+    const hunt = this.ledger.projection.hunt;
+    this.ledger.patch("hunt", hunt.hunt_id, {
+      cost_usd: Number((hunt.cost_usd + spent).toFixed(6)),
+    });
+    // The iteration counter deliberately does not advance: a resume retries this
+    // iteration. So only the cost arm of the budget can newly trip here.
+    if (this.budgetExhausted()) this.terminate("budget_terminated");
   }
 
   // Whole records are dropped at the budget rather than one being cut mid-JSON,
@@ -1466,6 +1519,7 @@ export class HuntController {
 
   private async write(
     iteration: number,
+    digestSeq: number,
     digest: Digest,
     result: DecisionResult,
     dispatchResults: readonly DispatchResult[],
@@ -1479,6 +1533,7 @@ export class HuntController {
         decision_id: decisionId,
         iteration,
         digest_presented: digest,
+        digest_seq: digestSeq,
         created_at: new Date().toISOString(),
       },
     });

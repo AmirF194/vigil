@@ -55,6 +55,61 @@ describe("llm_output", () => {
     expect(result.rejected).toEqual([]);
     expect(bodies[0]!.response_format).toBeDefined();
     expect(result.cost_usd).toBeGreaterThan(0);
+
+    // Unset, the gateway's own default cuts a long worker emission off mid-JSON,
+    // which reaches the controller as an unparseable decision rather than as a
+    // limit that was hit.
+    expect(bodies[0]!.max_tokens).toBeGreaterThan(4096);
+  });
+
+  // Bifrost fronts providers whose native reply is a content-block list, and that
+  // shape reaches us intact. Handed to JSON.parse it stringifies to [object
+  // Object], so a correct decision would be discarded as invalid JSON.
+  it("reads an emission returned as content blocks rather than a string", async () => {
+    const client = clientOf(async () =>
+      completion({
+        role: "assistant",
+        content: [{ type: "text", text: '{"action":' }, { type: "text", text: '"CONCLUDE"}' }],
+      }),
+    );
+
+    const result = await llm_output<{ action: string }>({
+      client,
+      model: "anthropic/claude-opus-5",
+      messages: [{ role: "user", content: "go" }],
+      schema: SCHEMA,
+      limiter: limiter(),
+      rates: { input: 1, output: 1 },
+    });
+
+    expect(result.value.action).toBe("CONCLUDE");
+    expect(result.rejected).toEqual([]);
+  });
+
+  // A model asked to fix an emission it cannot see has nothing to correct, and the
+  // re-ask would otherwise land as a second consecutive user turn.
+  it("feeds the rejected emission back as the assistant turn it was", async () => {
+    const bodies: Body[] = [];
+    let call = 0;
+    const client = clientOf(async (body) => {
+      bodies.push(body);
+      call += 1;
+      return completion({ role: "assistant", content: call === 1 ? "not json at all" : '{"action":"CONCLUDE"}' });
+    });
+
+    const result = await llm_output<{ action: string }>({
+      client,
+      model: "anthropic/claude-opus-5",
+      messages: [{ role: "user", content: "go" }],
+      schema: SCHEMA,
+      limiter: limiter(),
+      rates: { input: 1, output: 1 },
+    });
+
+    expect(result.value.action).toBe("CONCLUDE");
+    const roles = bodies.at(-1)!.messages.map((message) => message.role);
+    expect(roles).toEqual(["user", "assistant", "user", "user"]);
+    expect(bodies.at(-1)!.messages[1]).toEqual({ role: "assistant", content: "not json at all" });
   });
 
   it("downgrades to a tool-shaped emit when the gateway rejects response_format", async () => {

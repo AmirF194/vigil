@@ -682,6 +682,24 @@ function narrowSources(roles: Roles, dataDomains: readonly string[]): Roles {
   return { ...roles, workers: Object.fromEntries(workers) };
 }
 
+// The registry again, as a schema constraint. Prose alone leaves worker_agent_id
+// a free string, and an unconstrained string is where a struggling emission puts
+// its overflow — so the id arrives carrying half the query intent and the
+// controller rejects a decision the model meant correctly.
+function constrainWorkerId(schema: Record<string, unknown>, workers: Record<string, RoleSpec>): Record<string, unknown> {
+  const properties = schema["properties"];
+  if (typeof properties !== "object" || properties === null) return schema;
+  const field = (properties as Record<string, unknown>)["worker_agent_id"];
+  if (typeof field !== "object" || field === null) return schema;
+
+  // null stays admissible: every action except INVESTIGATE dispatches no one.
+  const ids: (string | null)[] = [...Object.keys(workers), null];
+  return {
+    ...schema,
+    properties: { ...(properties as Record<string, unknown>), worker_agent_id: { ...field, enum: ids } },
+  };
+}
+
 // Generated from the registry rather than written into the prompt, so the roster
 // the lead reads cannot drift from the workers that actually exist.
 function roster(workers: Record<string, RoleSpec>): string {
@@ -728,7 +746,14 @@ export function buildSpec(options: {
   return {
     ...config,
     arch: arch.name,
-    roles: { ...roles, lead: { ...roles.lead, prompt: `${roles.lead.prompt}\n\n${roster(roles.workers)}` } },
+    roles: {
+      ...roles,
+      lead: {
+        ...roles.lead,
+        prompt: `${roles.lead.prompt}\n\n${roster(roles.workers)}`,
+        output_schema: constrainWorkerId(roles.lead.output_schema, roles.workers),
+      },
+    },
     dispatch: arch.dispatch,
     digest: arch.digest,
     name,

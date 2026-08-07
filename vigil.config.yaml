@@ -2,8 +2,8 @@ model: anthropic/claude-opus-5
 
 # USD per million tokens. Wrong here means the cost budget is wrong.
 rates:
-  input: 15.00
-  output: 75.00
+  input: 5.00
+  output: 25.00
 
 budgets:
   max_iterations: 12
