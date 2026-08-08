@@ -6,12 +6,13 @@ Handles login, logout, token refresh, password management, and MFA.
 
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Annotated, List, Optional
 from fastapi import APIRouter, HTTPException, Depends, Header, Request, Response, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from backend.dependencies import UnitOfWorkSession
 from backend.services.auth_cookies import (
     ACCESS_COOKIE_NAME,
     REFRESH_COOKIE_NAME,
@@ -41,7 +42,6 @@ from backend.services.token_blacklist import (
 from backend.middleware.auth import get_current_active_user
 from backend.middleware.rate_limit import limiter
 from database.models import User
-from database.connection import get_db
 from api._meta import Auth, RouterMeta
 from core.config import get_settings
 
@@ -155,7 +155,7 @@ class PasswordResetConfirm(BaseModel):
 
 def _apply_new_password(user: User, plaintext: str) -> None:
     """Enforce history, hash, set, update history + changed_at in one place.
-    Caller is responsible for session.commit()."""
+    The request's unit of work owns the commit."""
     if password_matches_any(plaintext, user.password_history or []) or (
         user.password_hash
         and AuthService.verify_password(plaintext, user.password_hash)
@@ -192,7 +192,7 @@ def _user_payload(user: User, session: Session) -> dict:
 
 
 @router.get("/bootstrap", response_model=BootstrapStatusResponse)
-async def bootstrap_status(session: Session = Depends(get_db)):
+async def bootstrap_status(session: UnitOfWorkSession):
     """Report whether this instance has no account yet.
 
     There is no self-service signup and creating a user needs users.write, so
@@ -207,7 +207,7 @@ async def bootstrap_status(session: Session = Depends(get_db)):
 async def bootstrap_admin(
     request: Request,
     payload: BootstrapRequest,
-    session: Session = Depends(get_db),
+    session: UnitOfWorkSession,
 ):
     """Create the first admin account. Only ever available on an empty instance.
 
@@ -216,8 +216,9 @@ async def bootstrap_admin(
     one user exists, so it is not a signup endpoint.
     """
     # Serialize bootstrap attempts. Without this two callers both read an empty
-    # table and both create an admin; there is no row yet to lock instead. Held
-    # until the transaction create_user commits, so it covers check-and-create.
+    # table and both create an admin; there is no row yet to lock instead. The
+    # lock is held to the end of the request's transaction, so it covers
+    # check-and-create.
     session.execute(
         text("SELECT pg_advisory_xact_lock(:key)"), {"key": _BOOTSTRAP_LOCK}
     )
@@ -263,7 +264,7 @@ async def login(
     request: Request,
     response: Response,
     payload: LoginRequest,
-    session: Session = Depends(get_db),
+    session: UnitOfWorkSession,
 ):
     """
     Authenticate user and issue tokens.
@@ -428,7 +429,8 @@ async def refresh_token(
     request: Request,
     response: Response,
     body: Optional[RefreshTokenRequest] = None,
-    session: Session = Depends(get_db),
+    *,
+    session: UnitOfWorkSession,
 ):
     """
     Refresh access token using refresh token.
@@ -501,8 +503,8 @@ async def refresh_token(
 
 @router.get("/me")
 async def get_current_user_info(
-    current_user: User = Depends(get_current_active_user),
-    session: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    session: UnitOfWorkSession,
 ):
     """
     Get current user information.
@@ -521,8 +523,9 @@ async def get_current_user_info(
 async def update_current_user(
     full_name: Optional[str] = None,
     email: Optional[EmailStr] = None,
-    current_user: User = Depends(get_current_active_user),
-    session: Session = Depends(get_db),
+    *,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    session: UnitOfWorkSession,
 ):
     """
     Update current user profile.
@@ -559,7 +562,9 @@ async def update_current_user(
             current_user.is_verified = False
             email_changed = True
 
-        session.commit()
+        # Flush so the read-back sees server defaults; the request's unit
+        # of work commits.
+        session.flush()
         session.refresh(current_user)
 
         if email_changed:
@@ -579,7 +584,6 @@ async def update_current_user(
         raise
     except Exception as e:
         logger.error(f"Profile update error: {e}")
-        session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update profile",
@@ -592,8 +596,8 @@ async def change_password(
     request: Request,
     response: Response,
     body: ChangePasswordRequest,
-    current_user: User = Depends(get_current_active_user),
-    session: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    session: UnitOfWorkSession,
 ):
     """
     Change user password.
@@ -632,7 +636,6 @@ async def change_password(
     try:
         # Enforce no-reuse + hash + history rotation
         _apply_new_password(current_user, body.new_password)
-        session.commit()
 
         # Invalidate every outstanding token for this user. The current
         # session is effectively logged out; the client should re-login.
@@ -652,7 +655,6 @@ async def change_password(
 
     except Exception as e:
         logger.error(f"Password change error: {e}")
-        session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to change password",
@@ -661,8 +663,8 @@ async def change_password(
 
 @router.post("/mfa/setup", response_model=MFASetupResponse)
 async def setup_mfa(
-    current_user: User = Depends(get_current_active_user),
-    session: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    session: UnitOfWorkSession,
 ):
     """
     Setup MFA for current user.
@@ -696,8 +698,8 @@ async def setup_mfa(
 @router.post("/mfa/verify", response_model=RecoveryCodesResponse)
 async def verify_mfa(
     request: MFAVerifyRequest,
-    current_user: User = Depends(get_current_active_user),
-    session: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    session: UnitOfWorkSession,
 ):
     """
     Verify the first TOTP code and enable MFA.
@@ -724,8 +726,8 @@ async def verify_mfa(
 
 @router.post("/mfa/recovery-codes", response_model=RecoveryCodesResponse)
 async def regenerate_recovery_codes(
-    current_user: User = Depends(get_current_active_user),
-    session: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    session: UnitOfWorkSession,
 ):
     """
     Generate a fresh set of one-time MFA recovery codes, invalidating any
@@ -746,8 +748,8 @@ async def regenerate_recovery_codes(
 
 @router.delete("/mfa")
 async def disable_mfa(
-    current_user: User = Depends(get_current_active_user),
-    session: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    session: UnitOfWorkSession,
 ):
     """
     Disable MFA for current user.
@@ -762,14 +764,12 @@ async def disable_mfa(
     try:
         current_user.mfa_enabled = False
         current_user.mfa_secret = None
-        session.commit()
 
         logger.info(f"MFA disabled for user: {current_user.username}")
         return {"message": "MFA disabled successfully"}
 
     except Exception as e:
         logger.error(f"MFA disable error: {e}")
-        session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to disable MFA",
@@ -786,7 +786,7 @@ async def disable_mfa(
 async def password_reset_request(
     request: Request,
     body: PasswordResetRequest,
-    session: Session = Depends(get_db),
+    session: UnitOfWorkSession,
 ):
     """
     Begin a password reset. Always returns 200 regardless of whether the
@@ -838,7 +838,7 @@ async def password_reset_request(
 async def password_reset_confirm(
     request: Request,
     body: PasswordResetConfirm,
-    session: Session = Depends(get_db),
+    session: UnitOfWorkSession,
 ):
     """
     Complete a password reset. Validates the signed token, enforces the
@@ -875,7 +875,6 @@ async def password_reset_confirm(
         # Clear any active lockout so the user can immediately log in.
         user.failed_login_count = 0
         user.locked_until = None
-        session.commit()
 
         try:
             await revoke_all_for_user(user.user_id)
@@ -889,11 +888,9 @@ async def password_reset_confirm(
         logger.info("Password reset completed for user: %s", user.username)
         return {"message": "Password reset successfully"}
     except HTTPException:
-        session.rollback()
         raise
     except Exception as exc:
         logger.error("Password reset error: %s", exc)
-        session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to reset password",

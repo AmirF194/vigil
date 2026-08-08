@@ -256,14 +256,14 @@ async def set_claude_config(config: ClaudeConfig):
 
         # GH #88: keep the new llm_provider_configs table in sync so the
         # Settings "AI Config" tab and the legacy endpoint agree on the
-        # Anthropic default. Best-effort — a DB failure here should NOT
-        # block the secret write that already succeeded.
+        # Anthropic default. Best-effort — a DB failure here (including the
+        # commit) must NOT block the secret write that already succeeded, so
+        # this runs in its own transaction rather than the request's.
         try:
-            from database.connection import get_db_session
             from database.models import LLMProviderConfig
+            from services.unit_of_work import unit_of_work
 
-            session = get_db_session()
-            try:
+            with unit_of_work() as session:
                 row = session.get(LLMProviderConfig, "anthropic-default")
                 if row is None:
                     row = LLMProviderConfig(
@@ -280,9 +280,6 @@ async def set_claude_config(config: ClaudeConfig):
                 else:
                     row.api_key_ref = "CLAUDE_API_KEY"
                     row.is_active = True
-                session.commit()
-            finally:
-                session.close()
         except Exception as sync_err:  # noqa: BLE001
             logger.warning(
                 "Legacy /config/claude could not sync llm_provider_configs: %s",

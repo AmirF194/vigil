@@ -10,11 +10,11 @@ from typing import Optional
 from fastapi import HTTPException, Header, Depends, Request, status
 from sqlalchemy.orm import Session
 
+from backend.dependencies import UnitOfWorkSession
 from backend.services.auth_cookies import ACCESS_COOKIE_NAME
 from backend.services.auth_service import AuthService
 from backend.services.token_blacklist import is_token_revoked
 from database.models import User
-from database.connection import get_db
 
 from core.config import get_settings
 
@@ -73,7 +73,8 @@ def _get_dev_user(session: Session) -> User:
 async def get_current_user(
     request: Request,
     authorization: Optional[str] = Header(None),
-    session: Session = Depends(get_db),
+    *,
+    session: UnitOfWorkSession,
 ) -> User:
     """
     Resolve the authenticated user from either the access_token HttpOnly
