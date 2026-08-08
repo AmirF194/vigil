@@ -7,6 +7,7 @@ from datetime import datetime
 
 from backend.dependencies import UnitOfWorkSession
 from database.models import SLAPolicy
+from database.schemas import CaseSchema, SLAPolicySchema
 from api._meta import Auth, RouterMeta
 
 router = APIRouter()
@@ -78,7 +79,7 @@ async def list_sla_policies(
     policies = query.all()
 
     return {
-        "policies": [p.to_dict() for p in policies],
+        "policies": SLAPolicySchema.dump_many(policies),
         "total": len(policies)
     }
 
@@ -101,7 +102,7 @@ async def get_sla_policy(policy_id: str, session: UnitOfWorkSession):
     if not policy:
         raise HTTPException(status_code=404, detail="SLA policy not found")
 
-    return policy.to_dict()
+    return SLAPolicySchema.dump(policy)
 
 
 @router.post("/")
@@ -182,7 +183,7 @@ async def create_sla_policy(data: SLAPolicyCreate, session: UnitOfWorkSession):
         session.flush()
         session.refresh(policy)
         
-        return policy.to_dict()
+        return SLAPolicySchema.dump(policy)
     
     except HTTPException:
         raise
@@ -273,7 +274,7 @@ async def update_sla_policy(
         session.flush()
         session.refresh(policy)
         
-        return policy.to_dict()
+        return SLAPolicySchema.dump(policy)
     
     except HTTPException:
         raise
@@ -365,7 +366,7 @@ async def set_default_policy(policy_id: str, session: UnitOfWorkSession):
         session.flush()
         session.refresh(policy)
         
-        return policy.to_dict()
+        return SLAPolicySchema.dump(policy)
     
     except HTTPException:
         raise
@@ -470,7 +471,7 @@ async def get_policy_cases(
 
     return {
         "policy_id": policy_id,
-        "cases": [c.to_dict() for c in cases],
+        "cases": CaseSchema.dump_many(cases),
         "total": len(cases)
     }
 

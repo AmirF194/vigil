@@ -16,6 +16,7 @@ from backend.middleware.auth import get_current_user
 from backend.services.password_validator import PasswordPolicyError, validate_password_strength
 from backend.services.token_blacklist import revoke_all_for_user
 from database.models import User, Role
+from database.schemas import RoleSchema, UserSchema
 from api._meta import Auth, RouterMeta
 
 logger = logging.getLogger(__name__)
@@ -126,7 +127,7 @@ async def list_users(
             "total": total,
             "skip": skip,
             "limit": limit,
-            "users": [user.to_dict() for user in users]
+            "users": UserSchema.dump_many(users)
         }
     
     except Exception as e:
@@ -169,12 +170,12 @@ async def get_user(
             detail="User not found"
         )
     
-    user_dict = user.to_dict()
+    user_dict = UserSchema.dump(user)
     
     # Add role information
     role = session.query(Role).filter(Role.role_id == user.role_id).first()
     if role:
-        user_dict["role"] = role.to_dict()
+        user_dict["role"] = RoleSchema.dump(role)
     
     # Add permissions
     user_dict["permissions"] = AuthService.get_user_permissions(user_id)
@@ -250,7 +251,7 @@ async def create_user(
         )
     
     logger.info(f"User created by {current_user.username}: {user.username}")
-    return user.to_dict()
+    return UserSchema.dump(user)
 
 
 @router.put("/{user_id}")
@@ -344,7 +345,7 @@ async def update_user(
                 )
 
         logger.info(f"User updated by {current_user.username}: {user.username}")
-        return user.to_dict()
+        return UserSchema.dump(user)
 
     except HTTPException:
         raise
@@ -481,7 +482,7 @@ async def change_user_role(
             )
 
         logger.info(f"User role changed by {current_user.username}: {user.username} from {old_role_id} to {request.role_id}")
-        return user.to_dict()
+        return UserSchema.dump(user)
     
     except Exception as e:
         logger.error(f"Change role error: {e}")
@@ -514,7 +515,7 @@ async def list_roles(
     try:
         roles = session.query(Role).all()
         return {
-            "roles": [role.to_dict() for role in roles]
+            "roles": RoleSchema.dump_many(roles)
         }
     
     except Exception as e:

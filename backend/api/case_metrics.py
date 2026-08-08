@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from datetime import datetime
 
 from backend.dependencies import UnitOfWorkSession
+from database.schemas import CaseMetricsSchema
 from services.case_metrics_service import CaseMetricsService
 from api._meta import Auth, RouterMeta
 
@@ -198,7 +199,7 @@ async def calculate_case_metrics(case_id: str):
     metrics = metrics_service.calculate_case_metrics(case_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Case not found")
-    return metrics.to_dict()
+    return CaseMetricsSchema.dump(metrics)
 
 
 @router.get("/breached")

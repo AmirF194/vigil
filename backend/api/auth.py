@@ -42,6 +42,7 @@ from backend.services.token_blacklist import (
 from backend.middleware.auth import get_current_active_user
 from backend.middleware.rate_limit import limiter
 from database.models import User
+from database.schemas import UserSchema
 from api._meta import Auth, RouterMeta
 from core.config import get_settings
 
@@ -186,7 +187,7 @@ def _user_payload(user: User, session: Session) -> dict:
     """User dict plus resolved permissions — the shape the SPA gates on.
     Login/refresh must include it, not just /me: the client stores the user
     from the login response and checks permissions before any /me refresh."""
-    payload = user.to_dict()
+    payload = UserSchema.dump(user)
     payload["permissions"] = AuthService.get_user_permissions(user.user_id, session)
     return payload
 
@@ -255,7 +256,7 @@ async def bootstrap_admin(
         )
 
     logger.info("First admin account created: %s", user.username)
-    return user.to_dict()
+    return UserSchema.dump(user)
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -578,7 +579,7 @@ async def update_current_user(
                 )
 
         logger.info(f"User profile updated: {current_user.username}")
-        return current_user.to_dict()
+        return UserSchema.dump(current_user)
 
     except HTTPException:
         raise
