@@ -105,7 +105,7 @@ describe("the shipped arches", () => {
 
 describe("the three files are disjoint", () => {
   it("sends a config key found in an arch to the config file", () => {
-    expect(() => loadArchOnly(archOf("budgets: { max_iterations: 4 }"))).toThrow(
+    expect(() => loadArchOnly(archOf("budgets: { max_calls: 4 }"))).toThrow(
       /budgets belongs in the config file, not the arch file/,
     );
   });
@@ -180,7 +180,7 @@ describe("the config layer", () => {
   });
 
   it("refuses a config that names no model", () => {
-    const config = scratchFile("no-model.yaml", "budgets: { max_iterations: 2 }\n");
+    const config = scratchFile("no-model.yaml", "budgets: { max_calls: 2 }\n");
     expect(() => buildSpec({ ...CASE, config }, ["EXAMINE", "CONCLUDE"])).toThrow(/config needs a model/);
   });
 });

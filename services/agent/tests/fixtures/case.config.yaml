@@ -1,7 +1,10 @@
 model: anthropic/claude-opus-5
 
 budgets:
-  max_iterations: 6
+  max_calls: 6
+  # Wall clock, not just calls and dollars: a run wedged on a slow tool burns
+  # real time against no ceiling otherwise.
+  max_wall_ms: 1800000
   max_cost_usd: 1.00
 
 runtime:

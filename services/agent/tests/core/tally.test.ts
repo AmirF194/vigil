@@ -21,11 +21,11 @@ interface Wiring {
   memory?: Memory;
   dispatch?: ToolDispatch;
   budget?: Budget;
-  max_iterations?: number;
+  max_calls?: number;
 }
 
 function harnessOf(script: readonly ScriptedTurn[], wiring: Wiring = {}): Harness<TallyKinds> {
-  const limits = { max_iterations: wiring.max_iterations ?? 10, max_cost_usd: 100 };
+  const limits = { max_calls: wiring.max_calls ?? 10, max_cost_usd: 100, max_wall_ms: 600_000 };
   return {
     provider: scriptedProvider(script),
     registry: registryOf([bumpTool()], { counter: ["bump"] }),
@@ -82,12 +82,12 @@ describe("the throwaway workflow", () => {
   // model that never says HALT still ends -- against the harness's budget.
   it("is ended by the budget when the model never stops", async () => {
     const forever = [emit("TALLY"), emit("TALLY"), emit("TALLY")].flatMap((turn) => [STOP, turn]);
-    const harness = harnessOf(forever, { max_iterations: 2 });
+    const harness = harnessOf(forever, { max_calls: 2 });
     const report = await runTally(harness, options({ target: 99 }));
 
     expect(report.status).toBe("budget_exhausted");
     expect(report.iterations).toBe(2);
-    expect(report.reason).toContain("iterations_exhausted");
+    expect(report.reason).toContain("calls_exhausted");
   });
 
   it("parks on a gated tool and goes on once a reviewer answers", async () => {
@@ -201,9 +201,9 @@ const remote: ToolDispatch = {
 
 function broke(): Budget {
   return {
-    limits: { max_iterations: 0, max_cost_usd: 0 },
-    spent: { iterations: 0, cost_usd: 0, tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0 } },
-    beginIteration: async () => ({ reason: "iterations_exhausted", used: 0, limit: 0 }),
+    limits: { max_calls: 0, max_cost_usd: 0, max_wall_ms: 600_000 },
+    spent: { calls: 0, cost_usd: 0, tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0 } },
+    beginCall: async () => ({ reason: "calls_exhausted", used: 0, limit: 0 }),
     record: () => {},
   };
 }

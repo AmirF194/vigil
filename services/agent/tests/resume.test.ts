@@ -43,7 +43,7 @@ function resumeJob(): RunJob {
 }
 
 function rewriteBudget(iterations: number): void {
-  writeFileSync(config, readFileSync(config, "utf8").replace("max_iterations: 12", `max_iterations: ${iterations}`), "utf8");
+  writeFileSync(config, readFileSync(config, "utf8").replace("max_calls: 12", `max_calls: ${iterations}`), "utf8");
 }
 
 describe("resolving a run", () => {
@@ -70,7 +70,7 @@ describe("the arch a run started under is journaled", () => {
 
     const opened = await specOf(state, RUN);
     expect(opened?.arch).toBe("threathunt");
-    expect(opened?.budgets).toEqual({ max_iterations: 12, max_cost_usd: 5 });
+    expect(opened?.budgets).toEqual({ max_calls: 12, max_cost_usd: 5, max_wall_ms: 1_800_000 });
   });
 
   // The whole point of journaling it: the file moved, the run did not.
@@ -79,10 +79,10 @@ describe("the arch a run started under is journaled", () => {
     await advance(state, startJob());
 
     rewriteBudget(99);
-    expect(resolveSpec(startJob()).budgets.max_iterations).toBe(99);
+    expect(resolveSpec(startJob()).budgets.max_calls).toBe(99);
 
     await advance(state, resumeJob());
-    expect((await specOf(state, RUN))?.budgets.max_iterations).toBe(12);
+    expect((await specOf(state, RUN))?.budgets.max_calls).toBe(12);
   });
 
   it("refuses to resume a run that has no ledger", async () => {

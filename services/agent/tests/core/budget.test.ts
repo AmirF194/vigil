@@ -14,45 +14,45 @@ function spend(counts: Partial<TokenCounts>, cost_usd: number | null = null): Sp
   return { model_id: "openai/gpt-4o", provider_type: "openai", role: "lead", tokens: tokens(counts), cost_usd };
 }
 
-function pool(quota: Quota, max_iterations = 100, max_cost_usd = 25) {
-  return budgetOf({ max_iterations, max_cost_usd }, quota, "openai");
+function pool(quota: Quota, max_calls = 100, max_cost_usd = 25) {
+  return budgetOf({ max_calls, max_cost_usd, max_wall_ms: 600_000 }, quota, "openai");
 }
 
-describe("iterations are the harness's to count", () => {
-  it("advances only on beginIteration", async () => {
+describe("calls are the harness's to count", () => {
+  it("advances only on beginCall", async () => {
     const budget = pool(unmeteredQuota);
-    expect(budget.spent.iterations).toBe(0);
-    await budget.beginIteration();
-    await budget.beginIteration();
-    expect(budget.spent.iterations).toBe(2);
+    expect(budget.spent.calls).toBe(0);
+    await budget.beginCall();
+    await budget.beginCall();
+    expect(budget.spent.calls).toBe(2);
   });
 
   it("refuses once the cap is reached, without consuming another", async () => {
     const budget = pool(unmeteredQuota, 1);
-    expect(await budget.beginIteration()).toBeNull();
-    expect(await budget.beginIteration()).toEqual({ reason: "iterations_exhausted", used: 1, limit: 1 });
-    expect(budget.spent.iterations).toBe(1);
+    expect(await budget.beginCall()).toBeNull();
+    expect(await budget.beginCall()).toEqual({ reason: "calls_exhausted", used: 1, limit: 1 });
+    expect(budget.spent.calls).toBe(1);
   });
 });
 
 describe("dollars are the gateway's to enforce", () => {
   it("parks before paying for an iteration the gateway has no room for", async () => {
     const budget = pool(reporting(25, 25));
-    expect(await budget.beginIteration()).toEqual({ reason: "cost_exhausted", used_usd: 25, limit_usd: 25 });
-    expect(budget.spent.iterations).toBe(0);
+    expect(await budget.beginCall()).toEqual({ reason: "cost_exhausted", used_usd: 25, limit_usd: 25 });
+    expect(budget.spent.calls).toBe(0);
   });
 
   it("takes the lower of the run's ceiling and the gateway's", async () => {
     const budget = pool(reporting(11, 500), 100, 10);
-    expect(await budget.beginIteration()).toEqual({ reason: "cost_exhausted", used_usd: 11, limit_usd: 10 });
+    expect(await budget.beginCall()).toEqual({ reason: "cost_exhausted", used_usd: 11, limit_usd: 10 });
   });
 
   it("reports the gateway's number as spend rather than a local sum", async () => {
     const budget = pool(reporting(7.5, 25));
-    await budget.beginIteration();
+    await budget.beginCall();
     budget.record(spend({ input: 100 }, 999));
     expect(budget.spent.cost_usd).toBe(7.5 + 999);
-    await budget.beginIteration();
+    await budget.beginCall();
     expect(budget.spent.cost_usd).toBe(7.5);
   });
 
@@ -60,7 +60,7 @@ describe("dollars are the gateway's to enforce", () => {
   // so an unreadable quota costs the pre-flight courtesy and nothing else.
   it("proceeds when the quota cannot be read", async () => {
     const budget = pool({ spent: async () => null });
-    expect(await budget.beginIteration()).toBeNull();
+    expect(await budget.beginCall()).toBeNull();
   });
 });
 
@@ -86,5 +86,43 @@ describe("tokens are journaled exactly", () => {
       cache_read: 2,
       cache_write: 4,
     });
+  });
+});
+
+describe("the wall clock is a ceiling of its own", () => {
+  function clocked(max_wall_ms: number) {
+    let at = 0;
+    const budget = budgetOf({ max_calls: 100, max_cost_usd: 25, max_wall_ms }, unmeteredQuota, "openai", () => at);
+    return { budget, tick: (ms: number) => (at += ms) };
+  }
+
+  it("lets a call through inside the window", async () => {
+    const { budget, tick } = clocked(1_000);
+    tick(400);
+    expect(await budget.beginCall()).toBeNull();
+  });
+
+  it("refuses once the window has passed, with its own reason", async () => {
+    const { budget, tick } = clocked(1_000);
+    tick(1_200);
+    expect(await budget.beginCall()).toEqual({ reason: "wall_exhausted", used_ms: 1_200, limit_ms: 1_000 });
+  });
+
+  it("does not spend the call it refused", async () => {
+    const { budget, tick } = clocked(1_000);
+    await budget.beginCall();
+    tick(5_000);
+    await budget.beginCall();
+    expect(budget.spent.calls).toBe(1);
+  });
+
+  it("refuses on wall before asking the gateway what was spent", async () => {
+    let asked = 0;
+    let at = 0;
+    const quota = { spent: async () => { asked += 1; return null; } };
+    const budget = budgetOf({ max_calls: 100, max_cost_usd: 25, max_wall_ms: 10 }, quota, "openai", () => at);
+    at = 50;
+    await budget.beginCall();
+    expect(asked).toBe(0);
   });
 });

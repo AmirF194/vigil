@@ -163,7 +163,7 @@ async function end(harness: Harness<LeadKinds>, options: LeadOptions, outcome: R
 async function report(harness: Harness<LeadKinds>, options: LeadOptions): Promise<Omit<LeadReport, "status" | "reason" | "pending">> {
   const events = await harness.state.read(options.run_id);
   // Decisions, not model calls: the harness counts a call per turn and per
-  // emission attempt, which is spend, while an arch's max_iterations means these.
+  // emission attempt, which is spend, while an arch's max_calls means these.
   return {
     iterations: events.filter((one) => one.kind === "decision").length,
     dispatched: events.filter((one) => one.kind === "dispatch").length,

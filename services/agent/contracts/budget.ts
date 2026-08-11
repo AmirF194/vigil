@@ -8,13 +8,16 @@ export interface TokenCounts {
   cache_write: number;
 }
 
+// Calls, not decisions: one workflow decision costs several model calls, so a
+// deployment meaning decisions must say so where decisions are counted.
 export interface BudgetLimits {
-  max_iterations: number;
+  max_calls: number;
   max_cost_usd: number;
+  max_wall_ms: number;
 }
 
 export interface Spend {
-  iterations: number;
+  calls: number;
   cost_usd: number;
   tokens: TokenCounts;
 }
@@ -31,8 +34,9 @@ export interface SpendPayload {
 
 // A value, never a throw: the exhaustiveness argument applies here or nowhere.
 export type Refusal =
-  | { reason: "iterations_exhausted"; used: number; limit: number }
-  | { reason: "cost_exhausted"; used_usd: number; limit_usd: number };
+  | { reason: "calls_exhausted"; used: number; limit: number }
+  | { reason: "cost_exhausted"; used_usd: number; limit_usd: number }
+  | { reason: "wall_exhausted"; used_ms: number; limit_ms: number };
 
 // What the gateway says has been spent against this run's key. Returning null
 // means it could not be read, which is not a refusal: the gateway still caps.
@@ -40,12 +44,12 @@ export interface Quota {
   spent(): Promise<{ used_usd: number; limit_usd: number } | null>;
 }
 
-// Iterations are the harness's to count, dollars the gateway's to enforce. Quota
-// is read once per iteration, so an exhausted run parks before paying for one.
+// Calls and wall are the harness's to count, dollars the gateway's to enforce.
+// Checked once per call, so an exhausted run parks before paying for another.
 export interface Budget {
   readonly limits: BudgetLimits;
   readonly spent: Spend;
-  beginIteration(): Promise<Refusal | null>;
+  beginCall(): Promise<Refusal | null>;
   record(payload: SpendPayload): void;
 }
 

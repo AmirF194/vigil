@@ -24,7 +24,7 @@ function runEvent(id: string): NewEvent<Record<never, never>> {
     payload: {
       run_kind: "hunt",
       spec: { arch: "arch/threathunt.yaml" },
-      budgets: { max_iterations: 0, max_cost_usd: 0 },
+      budgets: { max_calls: 0, max_cost_usd: 0, max_wall_ms: 600_000 },
       seed: id,
       tenant_id: null,
       started_by: "test",

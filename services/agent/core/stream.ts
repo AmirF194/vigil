@@ -13,6 +13,7 @@ import {
   type TurnConfig,
 } from "./loop.js";
 import { ProviderError, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
+import { assemble, prefixOf, type Prefix } from "./context.js";
 import { scannerFor, wrap } from "./security.js";
 import type { State } from "./seams.js";
 
@@ -53,6 +54,8 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private readonly calls: Attempt[] = [];
   private readonly rejected: string[] = [];
   private readonly transcript: Message[] = [];
+  private prefix: Prefix = { system: "", tools: [], recall: "" };
+  private folded = 0;
   private from = 0;
   private turns = 0;
   private capped = false;
@@ -71,8 +74,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
     // Recalled once and rendered into the opening turn, never re-recalled per
     // tool turn: a prefix that changes mid-loop is a prefix that cannot cache.
     const recalled = await this.harness.memory.recall(this.cfg.task, this.cfg.recall_limit);
-    this.transcript.push({ role: "system", content: this.cfg.system });
-    this.transcript.push({ role: "user", content: opening(this.cfg.task, recalled) });
+    this.prefix = prefixOf(this.cfg.system, this.tools.map(schemaOf), recalled);
 
     const ended = yield* this.toolLoop();
     return yield* announce(ended ?? (yield* this.emit()));
@@ -81,16 +83,15 @@ class Run<T, Kinds extends Record<string, unknown>> {
   // Returns an outcome only when the run ends here; otherwise the loop stops
   // because the model asked for no tools or because the cap stopped it.
   private async *toolLoop(): AsyncGenerator<StreamEvent<T>, Outcome<T> | null> {
-    const schemas = this.tools.map(schemaOf);
     while (this.turns < this.cfg.max_turns) {
       const fold = await foldRun(this.harness.state, this.cfg.run_id);
       const settled = this.settled(fold);
       if (settled !== null) return settled;
 
-      const refusal = await this.harness.budget.beginIteration();
+      const refusal = await this.harness.budget.beginCall();
       if (refusal !== null) return this.exhausted(refusal);
 
-      const turn = yield* this.burn({ messages: windowed(this.transcript), tools: schemas });
+      const turn = yield* this.burn({ messages: this.assembled(), tools: this.prefix.tools });
       this.turns += 1;
       if (turn.tool_calls.length === 0) return null;
 
@@ -160,14 +161,15 @@ class Run<T, Kinds extends Record<string, unknown>> {
 
   private async *emit(): AsyncGenerator<StreamEvent<T>, Outcome<T>> {
     const validate = compile(this.cfg.schema);
-    const ask: Message = { role: "user", content: "Emit your answer now as JSON matching the schema." };
-    const messages: Message[] = [...this.transcript, ask];
+    // The ask and any correction are the transient tail: they belong to this
+    // attempt, so they are re-rendered rather than written into the transcript.
+    let tail = "Emit your answer now as JSON matching the schema.";
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const refusal = await this.harness.budget.beginIteration();
+      const refusal = await this.harness.budget.beginCall();
       if (refusal !== null) return this.exhausted(refusal);
 
-      const turn = yield* this.burn({ messages: windowed(messages), tools: [], emit: this.cfg.schema });
+      const turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: this.cfg.schema });
 
       const parsed = tryParse(turn.content);
       if (parsed !== undefined && validate(parsed)) {
@@ -178,11 +180,22 @@ class Run<T, Kinds extends Record<string, unknown>> {
       this.rejected.push(`${reason}: ${turn.content.slice(0, 400)}`);
       // The rejected emission goes back as the assistant turn it was, or the model
       // is asked to correct something it cannot see.
-      messages.push({ role: "assistant", content: turn.content, tool_calls: [] });
-      messages.push({ role: "user", content: `That emission was rejected -- ${reason}. Emit a valid answer.` });
+      tail = [
+        "Emit your answer now as JSON matching the schema.",
+        turn.content,
+        `That emission was rejected -- ${reason}. Emit a valid answer.`,
+      ].join("\n\n");
     }
 
     return this.done("failed", null, `the role never emitted a valid answer: ${this.rejected.join(" | ")}`);
+  }
+
+  // Prefix, then the folded history, then a tail that is never persisted. What
+  // summarising drops is the fold's to decide, and the edges are never dropped.
+  private assembled(working = ""): Message[] {
+    const { messages, folded } = assemble(this.prefix, this.cfg.task, this.transcript, working, summariseFolded);
+    this.folded += folded;
+    return messages;
   }
 
   // One model call, journaled as the provider reports it rather than after it
@@ -297,15 +310,11 @@ async function foldRun<Kinds extends Record<string, unknown>>(state: State<Kinds
   return { answered, open: raised.find((id) => !answered.has(id)) ?? null, terminal };
 }
 
-// The overflow arm, stubbed: the transcript goes whole until byte-stable window
-// assembly lands, and what summarising drops is that work's to decide.
-function windowed(messages: readonly Message[]): readonly Message[] {
-  return messages;
-}
-
-function opening(task: string, recalled: readonly string[]): string {
-  if (recalled.length === 0) return task;
-  return `${task}\n\nRecalled from earlier work:\n${recalled.map((note) => `- ${note}`).join("\n")}`;
+// Names what was dropped rather than reproducing it: a summary that quotes the
+// middle back is the middle, and folds nothing.
+function summariseFolded(folded: readonly Message[]): string {
+  const calls = folded.filter((one) => one.role === "tool").length;
+  return `[${folded.length} earlier messages folded away, including ${calls} tool results.]`;
 }
 
 function schemaOf(tool: RegisteredTool): ToolSchema {

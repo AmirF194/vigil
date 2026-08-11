@@ -25,7 +25,7 @@ interface Options {
   tools?: readonly RegisteredTool[];
   grants?: Record<string, readonly string[]>;
   max_cost_usd?: number;
-  max_iterations?: number;
+  max_calls?: number;
   dispatch?: ToolDispatch;
   memory?: Memory;
   state?: InProcessState;
@@ -37,7 +37,7 @@ function harnessOf(script: readonly ScriptedTurn[], options: Options = {}): Harn
     registry: registryOf(options.tools ?? [BUMP], options.grants ?? { counter: ["bump"] }),
     dispatch: options.dispatch ?? localDispatch,
     budget: budgetOf(
-      { max_iterations: options.max_iterations ?? 10, max_cost_usd: options.max_cost_usd ?? 100 },
+      { max_calls: options.max_calls ?? 10, max_cost_usd: options.max_cost_usd ?? 100, max_wall_ms: 600_000 },
       unmeteredQuota,
       "scripted",
     ),
@@ -146,8 +146,14 @@ describe("the tool loop", () => {
     const outcome = await outcomeOf(config(), harness);
 
     expect(recalls).toBe(1);
-    const opening = outcome.transcript[1];
-    expect(opening?.role === "user" && opening.content).toContain("the count was two yesterday");
+    // Rendered into the prefix on every request and never re-recalled, so the
+    // bytes the cache keys on do not move between turns.
+    const sent = (harness.provider as ScriptedProvider).requests;
+    for (const request of sent) {
+      const opening = request.messages[1];
+      expect(opening?.role === "user" && opening.content).toContain("the count was two yesterday");
+    }
+    expect(outcome.transcript.some((one) => one.role === "system")).toBe(false);
   });
 });
 
@@ -210,12 +216,12 @@ describe("the budget gate", () => {
   // Every model call draws on the pool, so the loop stops before the one the
   // budget will not pay for rather than after it.
   it("ends the run rather than making a call the pool cannot pay for", async () => {
-    const harness = harnessOf([{ calls: [] }, HALT], { max_iterations: 0 });
+    const harness = harnessOf([{ calls: [] }, HALT], { max_calls: 0 });
     const { seen, outcome } = await watch(config(), harness);
 
     expect(requestsOf(harness)).toBe(0);
     expect(outcome.status).toBe("failed");
-    expect(outcome.refusal).toEqual({ reason: "iterations_exhausted", used: 0, limit: 0 });
+    expect(outcome.refusal).toEqual({ reason: "calls_exhausted", used: 0, limit: 0 });
     expect(seen.at(-1)?.type).toBe("failed");
   });
 });
@@ -285,7 +291,9 @@ describe("the emission", () => {
     expect(outcome.status).toBe("completed");
     expect(outcome.rejected).toHaveLength(1);
     const sent = (harness.provider as ScriptedProvider).requests.at(-1)!.messages;
-    expect(sent.at(-2)).toEqual({ role: "assistant", content: '{"verb":"SHOUT"}', tool_calls: [] });
+    expect(sent.at(-1)!.content).toContain('{"verb":"SHOUT"}');
+    // In the tail, never the transcript: a rejected attempt belongs to the attempt.
+    expect(outcome.transcript.some((one) => one.content.includes("SHOUT"))).toBe(false);
   });
 
   it("fails rather than returning something off-schema", async () => {
@@ -358,7 +366,8 @@ describe("what the stream reports", () => {
     const outcome = await outcomeOf(config(), harness);
 
     const second = (harness.provider as ScriptedProvider).requests[1]!.messages;
-    expect(second).toEqual(outcome.transcript.slice(0, second.length));
+    // Prefix of two, then the history whole: nothing is folded below the cap.
+    expect(second.slice(2)).toEqual(outcome.transcript);
     expect(second).toHaveLength(4);
   });
 });

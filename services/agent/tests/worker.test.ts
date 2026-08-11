@@ -85,7 +85,7 @@ describe("the walking skeleton run", () => {
         payload: {
           run_kind: "hunt",
           spec: job.request,
-          budgets: { max_iterations: 0, max_cost_usd: 0 },
+          budgets: { max_calls: 0, max_cost_usd: 0, max_wall_ms: 600_000 },
           seed: runId,
           tenant_id: null,
           started_by: "crashed-worker",

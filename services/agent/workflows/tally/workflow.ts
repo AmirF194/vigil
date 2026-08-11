@@ -87,7 +87,7 @@ async function end(
 }
 
 async function report(harness: Harness<TallyKinds>, runId: string): Promise<Omit<TallyReport, "status" | "reason" | "pending">> {
-  return { count: await countOf(harness.state, runId), iterations: harness.budget.spent.iterations };
+  return { count: await countOf(harness.state, runId), iterations: harness.budget.spent.calls };
 }
 
 function config(options: TallyOptions, count: number): TurnConfig {

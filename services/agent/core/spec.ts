@@ -83,7 +83,7 @@ export interface RunSpec extends Config, Omit<Playbook, "directives"> {
 export const ALL_WORKERS = "workers";
 
 export const DEFAULT_DISPATCH: DispatchPolicy = { mode: "serial", fan_out_over: "questions", max_workers: 1 };
-export const DEFAULT_BUDGETS: BudgetLimits = { max_iterations: 12, max_cost_usd: 5 };
+export const DEFAULT_BUDGETS: BudgetLimits = { max_calls: 12, max_cost_usd: 5, max_wall_ms: 1_800_000 };
 export const DEFAULT_RUNTIME: Runtime = { max_turns: 8, result_cap: 20_000, recall_limit: 3 };
 
 // Disjoint by design: a key in the wrong file is a load error rather than a silent
