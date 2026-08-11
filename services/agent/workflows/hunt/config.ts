@@ -70,3 +70,18 @@ export function terminationOf(spec: RunSpec): Termination {
 export function digestOf(spec: RunSpec): DigestPolicy {
   return over(DEFAULT_DIGEST, spec.digest);
 }
+
+export interface EnrichmentChain {
+  id: string;
+  on: string;
+  tool: string;
+  query: string;
+}
+
+export interface EnrichmentPolicy {
+  max_depth: number;
+  max_entities: number;
+  chains: EnrichmentChain[];
+}
+
+export const DEFAULT_ENRICHMENT: EnrichmentPolicy = { max_depth: 1, max_entities: 8, chains: [] };
