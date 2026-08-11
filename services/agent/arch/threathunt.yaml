@@ -2,6 +2,7 @@ name: threathunt
 
 # One decider, N workers. Serial is max_workers: 1 — there is no second loop.
 dispatch:
+  topology: fan_out
   mode: parallel
   fan_out_over: questions
   max_workers: 4

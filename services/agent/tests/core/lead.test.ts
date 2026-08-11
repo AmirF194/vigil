@@ -92,7 +92,7 @@ const SINGLE: ScriptedTurn[] = [
 ];
 
 describe("an arch drives the loop", () => {
-  it("runs the swarm arch to completion and dispatches the worker it named", async () => {
+  it("runs the fan-out arch to completion and dispatches the worker it named", async () => {
     const spec = specFor("hunt", "hunt.playbook.yaml", "hunt.config.yaml");
     const state = new InProcessState<LeadKinds>();
     const report = await runLead(harnessOf(spec, SWARM, state), options("hunt", spec));

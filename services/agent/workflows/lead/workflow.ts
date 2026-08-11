@@ -3,6 +3,7 @@ import type { DispatchPayload, NewEvent, RunKind, RunOutcome } from "../../contr
 import { commitTurn, type Harness, type Outcome, type TurnConfig } from "../../core/loop.js";
 import { drain, streamTurn } from "../../core/stream.js";
 import type { RoleSpec, RunSpec } from "../../core/spec.js";
+import { topologyFor, type Assignment, type Round } from "../../core/topology.js";
 
 // What every arch's lead emits. Everything past action is arch-specific and read
 // only when the arch declared it, so one loop drives a swarm and a single lead.
@@ -61,6 +62,8 @@ export async function runLead(harness: Harness<LeadKinds>, options: LeadOptions)
   const { run_id, spec } = options;
   if ((await harness.state.latestSeq(run_id)) === null) await open(harness, options);
 
+  const topology = topologyFor(spec.dispatch.topology);
+  const rounds: Round[] = [];
   for (;;) {
     const outcome = await drain(streamTurn<Decision, LeadKinds>(turnFor(options, "lead", spec.roles.lead, brief(spec)), harness));
     if (outcome.status === "waiting_approval") {
@@ -73,15 +76,21 @@ export async function runLead(harness: Harness<LeadKinds>, options: LeadOptions)
     }
 
     const decision = outcome.value;
-    const worker = named(spec, decision);
+    const selection = { worker: named(spec, decision), task: decision.query_intent ?? decision.rationale };
+    const assignments = topology.assign(selection, spec);
     await commitTurn(harness.state, run_id, outcome, [
-      event(options, "decision", { action: decision.action, rationale: decision.rationale, worker }),
+      event(options, "decision", { action: decision.action, rationale: decision.rationale, worker: selection.worker }),
     ]);
 
-    if (worker !== null) await dispatch(harness, options, decision, worker);
+    for (const assignment of assignments) await dispatch(harness, options, assignment);
+    rounds.push({ assigned: assignments.length });
+
     // Termination is the arch's, not the model's: an action outside the halting
     // set keeps the run going however confident the rationale sounds.
     if (options.halts.includes(decision.action)) return end(harness, options, "completed", decision.rationale);
+    // The topology's own ending, which is a different claim: a swarm that has
+    // gone quiet is finished whether or not anyone said so.
+    if (topology.settled(rounds)) return end(harness, options, "completed", `the ${topology.id} went quiet`);
   }
 }
 
@@ -92,9 +101,9 @@ function named(spec: RunSpec, decision: Decision): string | null {
   return typeof id === "string" && id in spec.roles.workers ? id : null;
 }
 
-async function dispatch(harness: Harness<LeadKinds>, options: LeadOptions, decision: Decision, worker: string): Promise<void> {
+async function dispatch(harness: Harness<LeadKinds>, options: LeadOptions, assignment: Assignment): Promise<void> {
+  const { role: worker, task: intent } = assignment;
   const role = options.spec.roles.workers[worker] as RoleSpec;
-  const intent = decision.query_intent ?? decision.rationale;
   const outcome = await drain(streamTurn<unknown, LeadKinds>(turnFor(options, worker, role, intent), harness));
 
   const complete = outcome.status === "completed";

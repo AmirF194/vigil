@@ -60,10 +60,10 @@ describe("the registry resolves a run kind to an arch", () => {
 });
 
 describe("the shipped arches", () => {
-  it("loads threathunt.yaml unmodified, as a swarm", () => {
+  it("loads threathunt.yaml unmodified, as a fan-out with a lead", () => {
     const spec = huntSpec();
     expect(spec.arch).toBe("threathunt");
-    expect(spec.dispatch).toEqual({ mode: "parallel", fan_out_over: "questions", max_workers: 4 });
+    expect(spec.dispatch).toEqual({ topology: "fan_out", mode: "parallel", fan_out_over: "questions", max_workers: 4 });
     expect(Object.keys(spec.roles.workers)).toEqual(["threat_hunter", "network_analyst", "threat_intel"]);
     expect(spec.roles.critic).toBeDefined();
     expect(spec.digest["evidence_window"]).toBe(25);
@@ -73,7 +73,7 @@ describe("the shipped arches", () => {
   it("loads investigate.yaml as a single lead with no workers and no critic", () => {
     const spec = buildSpec(CASE, archFor("investigate").actions);
     expect(spec.arch).toBe("investigate");
-    expect(spec.dispatch).toEqual({ mode: "serial", fan_out_over: "questions", max_workers: 1 });
+    expect(spec.dispatch).toEqual({ topology: "single", mode: "serial", fan_out_over: "questions", max_workers: 1 });
     expect(spec.roles.workers).toEqual({});
     expect(spec.roles.critic).toBeUndefined();
     expect(spec.roles.lead.tools).toEqual(["case_records"]);
@@ -143,6 +143,25 @@ describe("the loader refuses an arch it could not honour", () => {
   });
 
   // mode is checked rather than coerced, so it is not a field nothing reads.
+  it("rejects a topology nothing implements, at load rather than at run", () => {
+    expect(() => loadArchOnly(archOf("dispatch: { topology: hive }"))).toThrow(/no topology hive/);
+  });
+
+  it("rejects single declaring workers it would never dispatch to", () => {
+    const body = archOf("dispatch: { topology: single }").concat(
+      "\n  workers:\n    scout:\n      description: looks\n      prompt: Look.\n      output_schema: { type: object }",
+    );
+    expect(() => loadArchOnly(body)).toThrow(/single dispatches to nobody/);
+  });
+
+  it("rejects fan_out with no workers to fan out to", () => {
+    expect(() => loadArchOnly(archOf("dispatch: { topology: fan_out }"))).toThrow(/needs workers/);
+  });
+
+  it("defaults to single when an arch declares no workers", () => {
+    expect(loadArchOnly(archOf("")).dispatch.topology).toBe("single");
+  });
+
   it("rejects a dispatch mode that contradicts its worker count", () => {
     expect(() => loadArchOnly(archOf("dispatch: { mode: serial, max_workers: 3 }"))).toThrow(
       /dispatch\.mode serial is max_workers 1, so 3 contradicts it/,

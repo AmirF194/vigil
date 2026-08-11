@@ -1,3 +1,4 @@
+import { topologyFor, type TopologyId } from "./topology.js";
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import type { BudgetLimits } from "../contracts/budget.js";
@@ -6,6 +7,7 @@ export class SpecError extends Error {}
 
 // Serial is parallel with one worker, so there is no second loop to maintain.
 export interface DispatchPolicy {
+  topology: TopologyId;
   mode: "serial" | "parallel";
   fan_out_over: string;
   max_workers: number;
@@ -82,7 +84,13 @@ export interface RunSpec extends Config, Omit<Playbook, "directives"> {
 // Reserved directive key: prose every worker needs, such as what the data is.
 export const ALL_WORKERS = "workers";
 
-export const DEFAULT_DISPATCH: DispatchPolicy = { mode: "serial", fan_out_over: "questions", max_workers: 1 };
+export const DEFAULT_DISPATCH: DispatchPolicy = { topology: "fan_out", mode: "serial", fan_out_over: "questions", max_workers: 1 };
+
+// The only coherent default: an arch with no workers dispatches to nobody, and
+// one with workers fans out to them. Declaring a topology still overrides it.
+function defaultDispatch(workers: readonly string[]): DispatchPolicy {
+  return { ...DEFAULT_DISPATCH, topology: workers.length === 0 ? "single" : "fan_out" };
+}
 export const DEFAULT_BUDGETS: BudgetLimits = { max_calls: 12, max_cost_usd: 5, max_wall_ms: 1_800_000 };
 export const DEFAULT_RUNTIME: Runtime = { max_turns: 8, result_cap: 20_000, recall_limit: 3 };
 
@@ -189,8 +197,11 @@ function load<T>(path: string, parse: (text: string) => T, layer: Layer): T {
 
 // mode is checked against max_workers rather than coerced into it: silently
 // rewriting a count the operator wrote makes mode a field nothing reads.
-function parseDispatch(raw: unknown): DispatchPolicy {
-  const policy = merge(raw, DEFAULT_DISPATCH, "dispatch");
+function parseDispatch(raw: unknown, workers: readonly string[]): DispatchPolicy {
+  const policy = merge(raw, defaultDispatch(workers), "dispatch");
+  // Throws on an unknown name, so an arch naming a shape nothing implements
+  // fails at load rather than running as whatever the default happened to be.
+  topologyFor(policy.topology);
   if (policy.mode !== "serial" && policy.mode !== "parallel") {
     throw new SpecError(`dispatch.mode must be serial or parallel, got ${String(policy.mode)}`);
   }
@@ -200,6 +211,12 @@ function parseDispatch(raw: unknown): DispatchPolicy {
   }
   if (policy.mode === "serial" && policy.max_workers !== 1) {
     throw new SpecError(`dispatch.mode serial is max_workers 1, so ${policy.max_workers} contradicts it; say parallel or drop the count`);
+  }
+  if (policy.topology === "single" && workers.length > 0) {
+    throw new SpecError(`dispatch.topology single dispatches to nobody, so ${workers.length} worker(s) contradicts it`);
+  }
+  if (policy.topology !== "single" && workers.length === 0) {
+    throw new SpecError(`dispatch.topology ${policy.topology} needs workers, and the arch declares none`);
   }
   return policy;
 }
@@ -263,10 +280,11 @@ function parseRoles(raw: unknown, handled: readonly string[]): Roles {
 
 export function parseArch(text: string, handled: readonly string[]): ArchSpec {
   const [front] = read(text, "arch");
+  const roles = parseRoles(front["roles"], handled);
   return {
     name: str(front["name"]) || "unnamed",
-    roles: parseRoles(front["roles"], handled),
-    dispatch: parseDispatch(front["dispatch"]),
+    roles,
+    dispatch: parseDispatch(front["dispatch"], Object.keys(roles.workers)),
     digest: counts(front["digest"], "digest"),
   };
 }

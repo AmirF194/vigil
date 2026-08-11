@@ -3,6 +3,7 @@ name: investigate
 # One analyst, no swarm: an investigation follows a single thread and the reader
 # of the write-up wants one voice. Serial is max_workers 1 by construction.
 dispatch:
+  topology: single
   mode: serial
   fan_out_over: questions
 
