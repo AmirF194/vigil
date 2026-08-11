@@ -1,5 +1,5 @@
 import { gunzipSync } from "node:zlib";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { HuntEvent } from "../../workflows/hunt/ledger.js";
 
@@ -71,6 +71,7 @@ export function gunzipped(name: string): string {
 // The ten real ledgers. Sidecars and the torn file are deliberately not here:
 // one is not a ledger and the other is the subject of its own test.
 export function historicalRuns(): string[] {
+  if (!existsSync(RUNS)) return [];
   return readdirSync(RUNS)
     .filter((name) => name.endsWith(".jsonl.gz"))
     .map((name) => name.replace(".jsonl.gz", ""))
