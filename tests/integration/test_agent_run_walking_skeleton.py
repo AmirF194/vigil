@@ -53,9 +53,11 @@ def _enqueue(run_id: str, run_kind: str = "hunt") -> str:
         run_id=run_id,
         run_kind=run_kind,
         request={
-            "arch": "arch/threathunt.yaml",
-            "playbook": "demo.yaml",
-            "config": "vigil.config.yaml",
+            # Empty arch routes through the run-kind registry. The playbook and
+            # config are deployment-owned, so a test names fixtures, not defaults.
+            "arch": "",
+            "playbook": "tests/fixtures/hunt.playbook.yaml",
+            "config": "tests/fixtures/hunt.config.yaml",
             "prompt": "prove the seam",
         },
         enqueued_by="integration-test",
