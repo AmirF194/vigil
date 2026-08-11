@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import type { RunKind } from "../contracts/events.js";
-import { SpecError } from "../core/spec.js";
+import { SpecError, type Owned } from "../core/spec.js";
 
 // What a run kind runs, and what its workflow can act on. Adding an agent type is
 // an arch file plus an entry here, never a change to the loop.
@@ -8,6 +8,9 @@ export interface ArchEntry {
   arch: string;
   actions: readonly string[];
   halts: readonly string[];
+  // Sections of the playbook and config this workflow reads. The loader accepts
+  // them and looks no further: their meaning is the workflow's to give.
+  owned?: Owned;
 }
 
 const REGISTERED: Partial<Record<RunKind, ArchEntry>> = {
@@ -15,6 +18,7 @@ const REGISTERED: Partial<Record<RunKind, ArchEntry>> = {
     arch: packaged("threathunt.yaml"),
     actions: ["INVESTIGATE", "EXPAND", "PIVOT", "DEEPEN", "ABANDON", "VALIDATE", "CHECKPOINT", "CONCLUDE", "HANDOFF_IR"],
     halts: ["CONCLUDE"],
+    owned: { playbook: ["hypotheses", "attack_techniques", "data_domains"], config: ["enrichment", "checkpoints", "termination"] },
   },
   investigate: { arch: packaged("investigate.yaml"), actions: ["EXAMINE", "CONCLUDE"], halts: ["CONCLUDE"] },
 };

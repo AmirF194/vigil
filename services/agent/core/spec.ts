@@ -44,6 +44,7 @@ export interface ArchSpec {
 
 // The uploadable layer: the scenario, and what an analyst should know. No schemas.
 export interface Playbook {
+  sections: Record<string, unknown>;
   name: string;
   objectives: string[];
   scope: Record<string, unknown>;
@@ -66,6 +67,7 @@ export interface Runtime {
 // Deployment: where this points, what it may spend, what it may call, which calls
 // stop for a human, and the numbers a workflow measures itself against.
 export interface Config {
+  sections: Record<string, unknown>;
   model: string;
   budgets: BudgetLimits;
   runtime: Runtime;
@@ -75,6 +77,8 @@ export interface Config {
 }
 
 export interface RunSpec extends Config, Omit<Playbook, "directives"> {
+  // Whatever the workflow declared it owns, untouched. The harness never reads it.
+  sections: Record<string, unknown>;
   arch: string;
   roles: Roles;
   dispatch: DispatchPolicy;
@@ -103,6 +107,16 @@ const LAYERS = {
 } as const;
 
 export type Layer = keyof typeof LAYERS;
+
+// Sections a workflow owns, declared by its registry entry. The loader accepts
+// them and validates nothing: what they mean is the workflow's, not the harness's.
+export type Owned = Partial<Record<Layer, readonly string[]>>;
+
+const NONE: Owned = {};
+
+function allowed(layer: Layer, owned: Owned): readonly string[] {
+  return [...LAYERS[layer], ...(owned[layer] ?? [])];
+}
 
 function asRecord(value: unknown, what: string): Record<string, unknown> {
   if (value === null || value === undefined) return {};
@@ -164,18 +178,18 @@ function splitFrontMatter(text: string): [Record<string, unknown>, string] {
 
 // Names the file a stray key belongs in: the three layers are disjoint, so a
 // misplaced budgets is a typo with an address, not an unknown key.
-function placed(key: string, layer: Layer): string {
-  const owner = (Object.keys(LAYERS) as Layer[]).find((other) => (LAYERS[other] as readonly string[]).includes(key));
+function placed(key: string, layer: Layer, owned: Owned): string {
+  const owner = (Object.keys(LAYERS) as Layer[]).find((other) => allowed(other, owned).includes(key));
   if (owner !== undefined) return `${key} belongs in the ${owner} file, not the ${layer} file`;
-  return `${key} belongs in no file; a ${layer} file takes any of ${[...LAYERS[layer]].sort().join(", ")}`;
+  return `${key} belongs in no file; a ${layer} file takes any of ${[...allowed(layer, owned)].sort().join(", ")}`;
 }
 
 // One reader for all three layers. A misplaced budgets would otherwise hand an
 // autonomous run the default budget without saying so.
-function read(text: string, layer: Layer): [Record<string, unknown>, string] {
+function read(text: string, layer: Layer, owned: Owned = NONE): [Record<string, unknown>, string] {
   const [front, body] = splitFrontMatter(text);
-  const stray = Object.keys(front).filter((key) => !(LAYERS[layer] as readonly string[]).includes(key));
-  if (stray.length > 0) throw new SpecError(stray.sort().map((key) => placed(key, layer)).join("; "));
+  const stray = Object.keys(front).filter((key) => !allowed(layer, owned).includes(key));
+  if (stray.length > 0) throw new SpecError(stray.sort().map((key) => placed(key, layer, owned)).join("; "));
   return [front, body];
 }
 
@@ -291,10 +305,12 @@ export function parseArch(text: string, handled: readonly string[]): ArchSpec {
 
 // Role names are checked against the arch's registry in applyDirectives, not
 // here: a playbook is read without knowing which arch it will run under.
-export function parsePlaybook(text: string): Playbook {
-  const [front, body] = read(text, "playbook");
+export function parsePlaybook(text: string, owned: Owned = NONE): Playbook {
+  const [front, body] = read(text, "playbook", owned);
+  const sections = Object.fromEntries((owned["playbook"] ?? []).filter((key) => key in front).map((key) => [key, front[key]]));
   const directives = asRecord(front["directives"], "directives");
   return {
+    sections,
     name: str(front["name"]),
     objectives: strings(front["objectives"], "objectives"),
     scope: asRecord(front["scope"], "scope"),
@@ -315,8 +331,9 @@ function parseTools(raw: unknown): ToolSpec[] {
   });
 }
 
-export function parseConfig(text: string): Config {
-  const [front] = read(text, "config");
+export function parseConfig(text: string, owned: Owned = NONE): Config {
+  const [front] = read(text, "config", owned);
+  const sections = Object.fromEntries((owned["config"] ?? []).filter((key) => key in front).map((key) => [key, front[key]]));
   const model = str(front["model"]);
   if (model.trim() === "") throw new SpecError("config needs a model: a deployment that names none bills nothing and answers nothing");
 
@@ -329,6 +346,7 @@ export function parseConfig(text: string): Config {
   if (ungranted.length > 0) throw new SpecError(`approvals name tool(s) this config does not declare: ${ungranted.sort().join(", ")}`);
 
   return {
+    sections,
     model,
     budgets: positive(merge(front["budgets"], DEFAULT_BUDGETS, "budgets"), "budgets"),
     runtime: positive(merge(front["runtime"], DEFAULT_RUNTIME, "runtime"), "runtime"),
@@ -394,10 +412,10 @@ export interface SpecPaths {
 
 // The one place the three layers converge. handled is the workflow's action set,
 // which is what makes an arch declaring anything else a load error.
-export function buildSpec(paths: SpecPaths, handled: readonly string[]): RunSpec {
+export function buildSpec(paths: SpecPaths, handled: readonly string[], owned: Owned = NONE): RunSpec {
   const arch = load(paths.arch, (text) => parseArch(text, handled), "arch");
-  const config = load(paths.config, parseConfig, "config");
-  const playbook = load(paths.playbook, parsePlaybook, "playbook");
+  const config = load(paths.config, (text) => parseConfig(text, owned), "config");
+  const playbook = load(paths.playbook, (text) => parsePlaybook(text, owned), "playbook");
 
   const declared = new Set(config.tools.map((tool) => tool.id));
   const roles = applyDirectives(arch.roles, playbook.directives, declared);
@@ -405,6 +423,7 @@ export function buildSpec(paths: SpecPaths, handled: readonly string[]): RunSpec
 
   return {
     ...config,
+    sections: { ...config.sections, ...playbook.sections },
     arch: arch.name,
     roles: {
       ...roles,

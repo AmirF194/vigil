@@ -1,6 +1,6 @@
 import type { BudgetLimits } from "../../contracts/budget.js";
 // Type-only, so the cycle with the spec loader is erased at compile time.
-import type { RunSpec } from "../../core/spec.js";
+import type { HuntSpec } from "./config.js";
 
 
 
@@ -165,7 +165,7 @@ export interface HuntState {
   name: string;
   // Resolved once at hunt start: resume needs no YAML, and editing an arch file
   // mid-run cannot silently change what a hunt in flight was told.
-  spec: RunSpec;
+  spec: HuntSpec;
   // Journaled so stochastic resurfacing replays exactly, on resume and on audit.
   seed: string;
   status: HuntStatus;

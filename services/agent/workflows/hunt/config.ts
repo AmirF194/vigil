@@ -1,4 +1,6 @@
 import type { Counts, RunSpec } from "../../core/spec.js";
+import { DEFAULT_CHECKPOINTS, type Checkpoints } from "./checkpoints.js";
+import type { Hypothesis } from "./types.js";
 
 // The core spec carries domain config as untyped numeric bags, so what a
 // threshold means is stated here rather than in a harness the hunt shares.
@@ -85,3 +87,27 @@ export interface EnrichmentPolicy {
 }
 
 export const DEFAULT_ENRICHMENT: EnrichmentPolicy = { max_depth: 1, max_entities: 8, chains: [] };
+
+// Typed rather than a bag: a hypothesis is shaped by results and reshaped again,
+// so it has to be a first-class record everywhere the workflow touches it.
+export interface HuntSpec extends RunSpec {
+  hypotheses: Hypothesis[];
+  attack_techniques: string[];
+  data_domains: string[];
+  enrichment: EnrichmentPolicy;
+  checkpoints: Checkpoints;
+  termination: Termination;
+}
+
+export function huntSpec(spec: RunSpec): HuntSpec {
+  const held = spec.sections;
+  return {
+    ...spec,
+    hypotheses: Array.isArray(held["hypotheses"]) ? (held["hypotheses"] as Hypothesis[]) : [],
+    attack_techniques: Array.isArray(held["attack_techniques"]) ? (held["attack_techniques"] as string[]) : [],
+    data_domains: Array.isArray(held["data_domains"]) ? (held["data_domains"] as string[]) : [],
+    enrichment: { ...DEFAULT_ENRICHMENT, ...(held["enrichment"] as object | undefined) },
+    checkpoints: { ...DEFAULT_CHECKPOINTS, ...(held["checkpoints"] as object | undefined) },
+    termination: terminationOf(spec),
+  };
+}

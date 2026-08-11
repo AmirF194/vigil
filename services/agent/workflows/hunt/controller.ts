@@ -1,5 +1,6 @@
 import type { State } from "../../core/seams.js";
 import type { HuntKinds } from "./journal.js";
+import { type HuntSpec } from "./config.js";
 import { newId } from "./ids.js";
 import {
   AUTO_ACTOR,
@@ -23,7 +24,7 @@ import { sanitize, sanitizeQuestion } from "./sanitize.js";
 import {
   DEFAULT_DISPATCH,
   type DispatchPolicy,
-  type RunSpec,
+  
 } from "../../core/spec.js";
 import {  DEFAULT_DIGEST,
   DEFAULT_ENRICHMENT,
@@ -255,7 +256,7 @@ function withRejection(digest: Digest, reason: string): Digest {
   };
 }
 
-export async function startHunt(state: State<HuntKinds>, runId: string, spec: RunSpec): Promise<Journal> {
+export async function startHunt(state: State<HuntKinds>, runId: string, spec: HuntSpec): Promise<Journal> {
   const now = new Date().toISOString();
   const huntId = newId("hunt");
   const policy = (spec.checkpoints ?? DEFAULT_CHECKPOINTS).hypothesis_approval;
@@ -320,7 +321,7 @@ export async function startHunt(state: State<HuntKinds>, runId: string, spec: Ru
 
 // The ledger is the resume point: the spec came with it, so nothing is re-read
 // from disk and a mid-run edit to an arch file cannot change a hunt in flight.
-export async function resumeHunt(state: State<HuntKinds>, runId: string): Promise<{ ledger: Journal; spec: RunSpec }> {
+export async function resumeHunt(state: State<HuntKinds>, runId: string): Promise<{ ledger: Journal; spec: HuntSpec }> {
   const ledger = await Journal.open(state, runId);
   const { hunt } = ledger.projection;
   if (hunt.status === "terminal") throw new HuntAlreadyTerminal(`${hunt.hunt_id} already ended as ${hunt.outcome}`);
