@@ -46,6 +46,13 @@ export interface DispatchPayload {
   status: "pending" | "complete" | "failed";
   question_id: string | null;
   failure_reason: string | null;
+  // Optional because the harness reads none of them: a dispatch is written by a
+  // workflow, and which of these it fills is that workflow's business.
+  iteration?: number;
+  query_intent?: string;
+  target_hypothesis_id?: string | null;
+  cost_usd?: number;
+  calls?: unknown[];
 }
 
 // checkpoint_class and directive kind are workflow vocabulary, so they stay
@@ -55,6 +62,10 @@ export interface CheckpointPayload {
   checkpoint_class: string;
   question: string;
   raised_at: string;
+  // What a workflow needs to answer its own checkpoint. Optional because the
+  // harness raises checkpoints too, and its approval gate carries neither.
+  raised_iteration?: number;
+  context?: Record<string, unknown>;
 }
 
 // The resolution event is what unblocks a run, and nothing else does.
@@ -64,6 +75,9 @@ export interface ResolutionPayload {
   answer: "approve" | "reject";
   text: string;
   resolved_at: string;
+  // The operator directive that carried it, when a human answered. Absent on a
+  // policy resolution: there was no input, only a rule.
+  directive_id?: string | null;
 }
 
 export interface DirectivePayload {

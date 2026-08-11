@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { InProcessState } from "../../core/state.js";
-import { asHarnessEvents, gunzipped, historicalRuns } from "../support/historical.js";
+import { asHarnessEvents, gunzipped, historicalRuns, renamedGolden } from "../support/historical.js";
 import { fold, LedgerError, projectionOf, type HuntKinds } from "../../workflows/hunt/ledger.js";
+import { digestOf } from "../../workflows/hunt/config.js";
+import { buildDigest } from "../../workflows/hunt/digest.js";
+import { evidenceStrength } from "../../workflows/hunt/strength.js";
+import { buildReport } from "../../workflows/hunt/report.js";
 
 const RUNS = historicalRuns();
 
@@ -23,7 +27,7 @@ function comparable(projection: ReturnType<typeof fold>): unknown {
 // Written by running the file ledger's own fold over the same fixture, with the
 // same Map conversion applied, so this compares implementations and not shapes.
 function golden(name: string): unknown {
-  return JSON.parse(gunzipped(`${name}.projection.json.gz`));
+  return renamedGolden(JSON.parse(gunzipped(`${name}.projection.json.gz`)));
 }
 
 describe("the fold survives the move to the harness ledger", () => {
@@ -66,5 +70,24 @@ describe("a ledger that is not one", () => {
     } as (typeof events)[number]);
 
     expect(() => fold(events)).toThrow(/unknown hypothesis h-never/);
+  });
+});
+
+// Every fold, not only the projection: what a hunt produces is derived, so a
+// port that folds to the same projection can still report something different.
+function folds(name: string): unknown {
+  const view = fold(asHarnessEvents(gunzipped(`${name}.jsonl.gz`), name));
+  return JSON.parse(
+    JSON.stringify({
+      digest: buildDigest(view, view.hunt.iteration, digestOf(view.hunt.spec)),
+      strength: Object.fromEntries([...view.hypotheses.keys()].map((id) => [id, evidenceStrength(view, id)])),
+      report: buildReport(view),
+    }),
+  );
+}
+
+describe("the derived folds survive the move too", () => {
+  it.each(RUNS)("%s derives the digest, strength and report the file ledger did", (name) => {
+    expect(folds(name)).toEqual(renamedGolden(JSON.parse(gunzipped(`${name}.folds.json.gz`))));
   });
 });
