@@ -18,6 +18,8 @@ SCOPED = (
     "services/agent",
     "core/agents/queue.py",
     "core/agents/agent_runs_router.py",
+    "core/agents/tool_registry.py",
+    "core/agents/tools_router.py",
     "core/llm/cost/rates.py",
     "infra/database/init/19_agent_ledger.sql",
     "infra/database/init/20_model_rates.sql",

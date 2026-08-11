@@ -1,0 +1,63 @@
+import type { RegisteredTool, ToolResult } from "../contracts/tool.js";
+import type { ToolDispatch } from "./seams.js";
+
+export interface RemoteOptions {
+  url: string;
+  token: string;
+  fetch?: typeof globalThis.fetch;
+}
+
+const FAILURE_KINDS = new Set(["invalid_args", "refused", "timeout", "unavailable", "backend_error"]);
+
+function unavailable(detail: string): ToolResult {
+  return { ok: false, failure: { kind: "unavailable", detail } };
+}
+
+// The far side owns the discrimination, so anything that does not arrive as a
+// ToolResult is this hop failing rather than the tool, and reads as unavailable.
+function resultOf(body: unknown): ToolResult {
+  if (typeof body !== "object" || body === null) return unavailable("the endpoint did not answer with a result");
+  const value = body as Record<string, unknown>;
+  if (value["ok"] === true && Array.isArray(value["rows"])) return value as unknown as ToolResult;
+  const failure = value["failure"];
+  if (typeof failure === "object" && failure !== null && FAILURE_KINDS.has(String((failure as Record<string, unknown>)["kind"]))) {
+    return { ok: false, failure } as ToolResult;
+  }
+  return unavailable("the endpoint answered with neither rows nor a known failure");
+}
+
+// Satisfies the same port as localDispatch, so neither the loop nor a workflow
+// knows whether a tool runs in this process. Bounds travel and are applied there.
+export function remoteDispatch(options: RemoteOptions): ToolDispatch {
+  const call = options.fetch ?? globalThis.fetch;
+  return {
+    invoke: async (tool: RegisteredTool, args: Record<string, unknown>): Promise<ToolResult> => {
+      const timer = AbortSignal.timeout(tool.bounds.timeoutMs);
+      let response: Response;
+      try {
+        response = await call(options.url, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${options.token}` },
+          body: JSON.stringify({
+            tool: tool.id,
+            args,
+            bounds: { max_rows: tool.bounds.maxRows, timeout_ms: tool.bounds.timeoutMs },
+          }),
+          signal: timer,
+        });
+      } catch (error) {
+        // The far side never answered, so nothing is known about the tool itself.
+        const timedOut = error instanceof Error && error.name === "TimeoutError";
+        if (timedOut) return { ok: false, failure: { kind: "timeout", timeoutMs: tool.bounds.timeoutMs } };
+        return unavailable(error instanceof Error ? error.message : String(error));
+      }
+
+      if (!response.ok) return unavailable(`the endpoint answered ${response.status}`);
+      try {
+        return resultOf(await response.json());
+      } catch (error) {
+        return unavailable(error instanceof Error ? error.message : String(error));
+      }
+    },
+  };
+}

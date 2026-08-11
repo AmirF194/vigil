@@ -238,14 +238,14 @@ def test_required_auth_rejects_a_reason():
 
 
 def test_every_non_required_router_has_a_reason():
-    """The live tree, not just the validator: all 5 deviations are justified."""
+    """The live tree, not just the validator: all 6 deviations are justified."""
     from core.routing import Auth
 
     deviations = [
         (name, meta) for name, _r, meta in _specs() if meta.auth is not Auth.REQUIRED
     ]
-    assert len(deviations) == 5, (
-        f"expected 5 non-REQUIRED routers, found {len(deviations)}: "
+    assert len(deviations) == 6, (
+        f"expected 6 non-REQUIRED routers, found {len(deviations)}: "
         f"{sorted(n for n, _ in deviations)}. A new one needs review."
     )
     for name, meta in deviations:
