@@ -789,7 +789,7 @@ export class HuntController {
     if (settled !== undefined) {
       journalNote(
         this.ledger,
-        `${directive.actor} answered ${checkpoint.checkpoint_id}, already ${settled.verdict} by ${settled.actor}. ` +
+        `${directive.actor} answered ${checkpoint.checkpoint_id}, already ${settled.answer} by ${settled.actor}. ` +
           "The first answer stands; reversing a decision is its own directive.",
       );
       return;
@@ -1002,10 +1002,12 @@ export class HuntController {
     const asked: Budgets = {
       max_calls: hunt.budgets.max_calls + grant.iterations,
       max_cost_usd: Number((hunt.budgets.max_cost_usd + grant.cost_usd).toFixed(6)),
+      max_wall_ms: hunt.budgets.max_wall_ms,
     };
     const { hard_max_calls, hard_max_cost_usd } = this.termination;
     const budgets: Budgets = {
       max_calls: Math.min(asked.max_calls, hard_max_calls),
+      max_wall_ms: hunt.budgets.max_wall_ms,
       max_cost_usd: Math.min(asked.max_cost_usd, hard_max_cost_usd),
     };
     this.ledger.patch("hunt", hunt.hunt_id, { budgets });
