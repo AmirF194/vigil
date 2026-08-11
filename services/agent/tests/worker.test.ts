@@ -1,9 +1,12 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { LedgerRepository } from "../ledger/repository.js";
 import { advance } from "../worker.js";
 import type { RunJob } from "../contracts/job.js";
+
+const FIXTURES = join(import.meta.dirname, "fixtures");
 
 const pool = new pg.Pool({
   connectionString: process.env["DATABASE_URL"] ?? "postgres://vigil:vigil@localhost:55432/vigil_test",
@@ -28,7 +31,12 @@ function startJob(id: string): StartJob {
     enqueued_at: new Date().toISOString(),
     enqueued_by: "test",
     reason: "start",
-    request: { arch: "arch/threathunt.yaml", playbook: "demo.yaml", config: "vigil.config.yaml", prompt: "go" },
+    request: {
+      arch: "",
+      playbook: join(FIXTURES, "hunt.playbook.yaml"),
+      config: join(FIXTURES, "hunt.config.yaml"),
+      prompt: "go",
+    },
   };
 }
 
@@ -58,12 +66,12 @@ describe("the walking skeleton run", () => {
     expect(await ledger.terminal(runId)).toMatchObject({ outcome: "completed" });
   });
 
-  it("journals the request into the run event, so a resume needs no other state", async () => {
+  it("journals the resolved spec into the run event, so a resume needs no other state", async () => {
     await advance(ledger, startJob(runId));
 
     const [first] = await ledger.read(runId);
     expect(first?.kind).toBe("run");
-    expect(first?.payload).toMatchObject({ spec: { arch: "arch/threathunt.yaml" }, started_by: "test" });
+    expect(first?.payload).toMatchObject({ spec: { arch: "threathunt" }, started_by: "test" });
   });
 
   // A crash between the two appends must resume rather than collide on seq 0.

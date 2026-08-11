@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 class StartRunRequest(BaseModel):
     run_kind: str = Field(default="hunt", description=f"One of {', '.join(RUN_KINDS)}.")
-    arch: str = Field(..., description="Path to the arch file: the shape of the run.")
+    arch: str = Field(default="", description="Arch file path; empty routes through the run-kind registry.")
     playbook: str = Field(..., description="Path to the playbook: the scenario as data.")
     config: str = Field(..., description="Path to the deployment config.")
     prompt: str = Field(default="", description="What the run is being asked to do.")

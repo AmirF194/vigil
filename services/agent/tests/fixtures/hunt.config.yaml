@@ -1,0 +1,32 @@
+model: anthropic/claude-opus-5
+
+budgets:
+  max_iterations: 12
+  max_cost_usd: 5.00
+
+runtime:
+  max_turns: 6
+  result_cap: 20000
+  recall_limit: 3
+
+tools:
+  - id: duckdb_query
+    kind: duckdb
+    database: ./fixtures/records.duckdb
+    max_rows: 200
+    timeout_ms: 30000
+  - id: expand
+    kind: expand
+  - id: intel_lookup
+    kind: threatfox
+    feed: https://threatfox.abuse.ch/export/json/recent/
+  - id: web_intel
+    kind: firecrawl
+    limit: 3
+
+approvals: []
+
+thresholds:
+  min_corroborating_sources: 2
+  gap_lock_threshold: 3
+  priority_floor: 5

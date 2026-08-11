@@ -1,0 +1,38 @@
+import { fileURLToPath } from "node:url";
+import type { RunKind } from "../contracts/events.js";
+import { SpecError } from "../core/spec.js";
+
+// What a run kind runs, and what its workflow can act on. Adding an agent type is
+// an arch file plus an entry here, never a change to the loop.
+export interface ArchEntry {
+  arch: string;
+  actions: readonly string[];
+  halts: readonly string[];
+}
+
+const REGISTERED: Partial<Record<RunKind, ArchEntry>> = {
+  hunt: {
+    arch: packaged("threathunt.yaml"),
+    actions: ["INVESTIGATE", "EXPAND", "PIVOT", "DEEPEN", "ABANDON", "VALIDATE", "CHECKPOINT", "CONCLUDE", "HANDOFF_IR"],
+    halts: ["CONCLUDE"],
+  },
+  investigate: { arch: packaged("investigate.yaml"), actions: ["EXAMINE", "CONCLUDE"], halts: ["CONCLUDE"] },
+};
+
+// Resolved against the package rather than the cwd: the arch files ship with the
+// worker, so a run started from any directory finds the same ones.
+function packaged(file: string): string {
+  return fileURLToPath(new URL(`./${file}`, import.meta.url));
+}
+
+export function archFor(kind: RunKind): ArchEntry {
+  const entry = REGISTERED[kind];
+  if (entry === undefined) {
+    throw new SpecError(`no architecture is registered for run_kind ${kind}; registered: ${registeredKinds().join(", ")}`);
+  }
+  return entry;
+}
+
+export function registeredKinds(): RunKind[] {
+  return (Object.keys(REGISTERED) as RunKind[]).sort();
+}

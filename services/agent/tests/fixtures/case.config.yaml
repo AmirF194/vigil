@@ -1,0 +1,22 @@
+model: anthropic/claude-opus-5
+
+budgets:
+  max_iterations: 6
+  max_cost_usd: 1.00
+
+runtime:
+  max_turns: 4
+  result_cap: 8000
+  recall_limit: 2
+
+tools:
+  - id: case_records
+    kind: duckdb
+    database: ./fixtures/records.duckdb
+    max_rows: 100
+    timeout_ms: 15000
+
+approvals: [case_records]
+
+thresholds:
+  min_corroborating_sources: 2
