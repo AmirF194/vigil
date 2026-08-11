@@ -1,11 +1,17 @@
 """CrowdStrike Falcon API service for detection polling and host management."""
 
 import logging
-import requests
+import httpx
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
+
+# Client-level floor; every call site also passes timeout=30 explicitly.
+DEFAULT_TIMEOUT = 30.0
+
+# requests followed redirects by default; httpx does not.
+_FOLLOW_REDIRECTS = True
 
 
 class CrowdStrikeService:
@@ -18,7 +24,10 @@ class CrowdStrikeService:
         self.base_url = base_url.rstrip('/')
         self.access_token: Optional[str] = None
         self.token_expiry: Optional[datetime] = None
-        self.session = requests.Session()
+        self.session = httpx.Client(
+            timeout=DEFAULT_TIMEOUT,
+            follow_redirects=_FOLLOW_REDIRECTS,
+        )
     
     def _ensure_authenticated(self) -> bool:
         """Ensure we have a valid access token."""

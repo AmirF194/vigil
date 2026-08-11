@@ -284,7 +284,10 @@ class DataPoller:
         findings = []
         for query in queries:
             try:
-                results = self._splunk_service.search(
+                # search() polls its job with time.sleep for up to ~60s,
+                # which would otherwise freeze the whole daemon loop.
+                results = await asyncio.to_thread(
+                    self._splunk_service.search,
                     query=query,
                     earliest_time=earliest_time,
                     latest_time="now",
@@ -401,7 +404,8 @@ class DataPoller:
             lookback_minutes = max(self.config.crowdstrike_interval // 60 + 1, 5)
             since = datetime.utcnow() - timedelta(minutes=lookback_minutes)
             
-            detections = self._crowdstrike_service.get_detections(
+            detections = await asyncio.to_thread(
+                self._crowdstrike_service.get_detections,
                 filter_query=f"created_timestamp:>='{since.isoformat()}Z'",
                 limit=100
             )

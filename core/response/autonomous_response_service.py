@@ -1,5 +1,6 @@
 """Autonomous response service with approval workflow integration."""
 
+import asyncio
 import logging
 from typing import Dict, List, Optional, Callable, Any
 from datetime import datetime
@@ -54,8 +55,8 @@ class AutonomousResponseService:
         """Send escalation to Slack channel."""
         try:
             from core.config import get_integration_config
-            import requests
-            
+            import httpx
+
             config = get_integration_config('slack')
             token = config.get('bot_token')
             
@@ -71,7 +72,9 @@ class AutonomousResponseService:
                 "low": "#36a64f"
             }
             
-            response = requests.post(
+            # Blocking POST inside an async method — offload it.
+            response = await asyncio.to_thread(
+                httpx.post,
                 "https://slack.com/api/chat.postMessage",
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                 json={
@@ -84,9 +87,11 @@ class AutonomousResponseService:
                         "ts": datetime.utcnow().timestamp()
                     }]
                 },
-                timeout=30
+                timeout=30,
+                # requests followed redirects by default; httpx does not.
+                follow_redirects=True,
             )
-            
+
             if response.status_code == 200 and response.json().get("ok"):
                 logger.info(f"Slack escalation sent to {target_channel}")
                 return True
@@ -102,8 +107,8 @@ class AutonomousResponseService:
         """Send escalation to PagerDuty."""
         try:
             from core.config import get_integration_config
-            import requests
-            
+            import httpx
+
             config = get_integration_config('pagerduty')
             routing_key = config.get('routing_key') or config.get('integration_key')
             
@@ -118,7 +123,9 @@ class AutonomousResponseService:
                 "low": "info"
             }
             
-            response = requests.post(
+            # Blocking POST inside an async method — offload it.
+            response = await asyncio.to_thread(
+                httpx.post,
                 "https://events.pagerduty.com/v2/enqueue",
                 json={
                     "routing_key": routing_key,
@@ -130,7 +137,9 @@ class AutonomousResponseService:
                         "custom_details": {"details": details}
                     }
                 },
-                timeout=30
+                timeout=30,
+                # requests followed redirects by default; httpx does not.
+                follow_redirects=True,
             )
             
             data = response.json()

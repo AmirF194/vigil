@@ -4,16 +4,24 @@ Microsoft Defender Ingestion Service - Ingest alerts from Microsoft Defender for
 Fetches security alerts from Microsoft Defender and converts them to findings.
 """
 
+import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import uuid
-import requests
+import httpx
 
 from core.ingestion.siem_ingestion_service import SIEMIngestionService
 from core.config import get_integration_config
 
 logger = logging.getLogger(__name__)
+
+# Neither call site passed a timeout, and requests defaulted to none.
+DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
+
+# requests followed redirects by default, httpx does not — and Microsoft's
+# login endpoints redirect.
+_FOLLOW_REDIRECTS = True
 
 
 class MicrosoftDefenderIngestion(SIEMIngestionService):
@@ -51,7 +59,12 @@ class MicrosoftDefenderIngestion(SIEMIngestionService):
                 'grant_type': 'client_credentials'
             }
             
-            response = requests.post(token_url, data=token_data)
+            response = httpx.post(
+                token_url,
+                data=token_data,
+                timeout=DEFAULT_TIMEOUT,
+                follow_redirects=_FOLLOW_REDIRECTS,
+            )
             response.raise_for_status()
             
             self.access_token = response.json()['access_token']
@@ -79,8 +92,9 @@ class MicrosoftDefenderIngestion(SIEMIngestionService):
             List of raw alert dictionaries
         """
         try:
-            # Get access token
-            token = self._get_access_token()
+            # Token exchange and the alert fetch below are both blocking
+            # HTTP; this method is async by interface, so offload them.
+            token = await asyncio.to_thread(self._get_access_token)
             if not token:
                 return []
             
@@ -104,7 +118,14 @@ class MicrosoftDefenderIngestion(SIEMIngestionService):
                 '$orderby': 'alertCreationTime desc'
             }
             
-            response = requests.get(api_url, headers=headers, params=params)
+            response = await asyncio.to_thread(
+                httpx.get,
+                api_url,
+                headers=headers,
+                params=params,
+                timeout=DEFAULT_TIMEOUT,
+                follow_redirects=_FOLLOW_REDIRECTS,
+            )
             response.raise_for_status()
             
             alerts = response.json().get('value', [])
@@ -112,7 +133,7 @@ class MicrosoftDefenderIngestion(SIEMIngestionService):
             logger.info(f"Fetched {len(alerts)} alerts from Microsoft Defender")
             return alerts
         
-        except requests.exceptions.RequestException as e:
+        except (httpx.HTTPError, httpx.InvalidURL) as e:
             logger.error(f"Microsoft Defender API error: {e}")
             return []
         except Exception as e:
