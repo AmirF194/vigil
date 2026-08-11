@@ -842,7 +842,7 @@ export class HuntController {
   // The one place an approval reaches a hypothesis, and it applies the patch
   // applyVerdict computed at VALIDATE time. Not a second path to proven: the
   private resolveVerdict(checkpoint: Checkpoint, directive: Directive, approved: boolean): void {
-    const payload = checkpoint.context;
+    const payload = (checkpoint.context ?? {});
 
     if (payload["kind"] === "conclude") {
       if (approved) {
@@ -916,7 +916,7 @@ export class HuntController {
       return;
     }
 
-    this.ledger.patch("hypothesis", hypothesisId, checkpoint.context["patch"] as Record<string, unknown>);
+    this.ledger.patch("hypothesis", hypothesisId, (checkpoint.context ?? {})["patch"] as Record<string, unknown>);
     journalNote(
       this.ledger,
       `${directive.actor} approved the verdict on ${hypothesisId} at ${checkpoint.checkpoint_id}.`,
@@ -924,8 +924,8 @@ export class HuntController {
   }
 
   private resolveScope(checkpoint: Checkpoint, directive: Directive, approved: boolean): void {
-    const question = String(checkpoint.context["question"] ?? "");
-    const entityKey = (checkpoint.context["entity_key"] as string | null) ?? null;
+    const question = String((checkpoint.context ?? {})["question"] ?? "");
+    const entityKey = ((checkpoint.context ?? {})["entity_key"] as string | null) ?? null;
 
     if (!approved) {
       journalNote(

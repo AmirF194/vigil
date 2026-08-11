@@ -96,7 +96,7 @@ function read(ledgerPath: string): Directive[] {
 // between dispatch settlements: an operator who hit abort mid-iteration should
 export function peek(ledger: Journal): Directive[] {
   const recorded = ledger.projection.directives.filter((directive) => directive.origin !== "controller").length;
-  return read(ledger.path).slice(recorded);
+  return read(inboxPath(ledger.runId)).slice(recorded);
 }
 
 // Skips what the ledger already recorded rather than truncating, so the inbox

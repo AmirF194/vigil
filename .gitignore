@@ -248,3 +248,7 @@ claude_analysis_*.txt
 .mcp.json
 index.scip
 slop.toml
+
+# Hunt ledgers and their goldens: real run data, kept out of the tree.
+services/agent/tests/fixtures/runs/
+runs/

@@ -1,7 +1,7 @@
 import { key } from "./entities.js";
 import type { Enricher } from "./ports.js";
-import { SpecError, type RunSpec } from "../../core/spec.js";
-import { DEFAULT_ENRICHMENT, type EnrichmentChain } from "./config.js";
+import { SpecError } from "../../core/spec.js";
+import { DEFAULT_ENRICHMENT, type EnrichmentChain, type HuntSpec } from "./config.js";
 export interface Tool {
   id: string;
   description: string;
@@ -51,7 +51,7 @@ async function run(chain: EnrichmentChain, entity: Entity, tool: Tool): Promise<
 
 // Runs every chain that applies to the entity, so the controller can dedup on the
 // entity alone: once enriched, all of its chains have already run.
-export function createEnricher(spec: RunSpec, tools: readonly Tool[]): Enricher | undefined {
+export function createEnricher(spec: HuntSpec, tools: readonly Tool[]): Enricher | undefined {
   const chains = spec.enrichment.chains;
   if (chains.length === 0) return undefined;
 

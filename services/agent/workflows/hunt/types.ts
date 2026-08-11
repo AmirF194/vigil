@@ -89,7 +89,7 @@ export type LinkRelation = "supports" | "weakens";
 // The harness's limits under the hunt's name, so a spec reads as one thing.
 export type Budgets = BudgetLimits;
 
-export const DEFAULT_BUDGETS: Budgets = { max_iterations: 20, max_cost_usd: 25.0 };
+export const DEFAULT_BUDGETS: Budgets = { max_calls: 20, max_cost_usd: 25.0, max_wall_ms: 1_800_000 };
 
 // Closed, so a typo in an extraction key pattern cannot invent a type, and a
 // seed entity lands in the same namespace as everything the graph extracts.

@@ -5,7 +5,9 @@ import { fold, type HuntEvent, type HuntKinds, type Projection } from "./ledger.
 export type { HuntEvent, HuntKinds, Projection } from "./ledger.js";
 import type { HuntState } from "./types.js";
 
-export type Body = NewEvent<HuntKinds>;
+// run_id and run_kind come from the journal, not from each call site: a caller
+// naming the wrong run would write into someone else's ledger.
+export type Body = Omit<NewEvent<HuntKinds>, "run_id" | "run_kind">;
 
 // The controller's ledger, backed by the State seam. append stays synchronous so
 // the decision logic reads unchanged; flush is what makes an iteration durable.
