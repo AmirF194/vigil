@@ -50,7 +50,7 @@ function emit(verb: "TALLY" | "HALT", note = "carrying on"): ScriptedTurn {
 
 const STOP: ScriptedTurn = { calls: [] };
 
-// Two bumps, two iterations, target reached on the second.
+// Two bumps, six model calls, target reached on the second workflow pass.
 const TO_THREE: ScriptedTurn[] = [bump(2), STOP, emit("TALLY"), bump(1), STOP, emit("TALLY")];
 
 describe("the throwaway workflow", () => {
@@ -61,7 +61,8 @@ describe("the throwaway workflow", () => {
 
     expect(report.status).toBe("completed");
     expect(report.count).toBe(3);
-    expect(report.iterations).toBe(2);
+    // An iteration is a model call, counted by the harness that makes it.
+    expect(report.iterations).toBe(6);
 
     const kinds = (await state.read(RUN)).map((event) => event.kind);
     expect(kinds).toEqual(["run", "spend", "spend", "spend", "tally", "spend", "spend", "spend", "tally", "terminal"]);

@@ -1,5 +1,6 @@
 import type { NewEvent, RunOutcome } from "../../contracts/events.js";
-import { commitTurn, runTurn, type Attempt, type Harness, type Outcome, type TurnConfig } from "../../core/loop.js";
+import { commitTurn, type Attempt, type Harness, type Outcome, type TurnConfig } from "../../core/loop.js";
+import { drain, streamTurn } from "../../core/stream.js";
 import type { State } from "../../core/seams.js";
 import { SYSTEM, TALLY_SCHEMA, TALLY_VERBS, type TallyKinds, type TallyPayload } from "./vocabulary.js";
 
@@ -29,15 +30,10 @@ export async function runTally(harness: Harness<TallyKinds>, options: TallyOptio
   if ((await harness.state.latestSeq(run_id)) === null) await open(harness, options);
 
   for (;;) {
-    // The workflow's iteration, counted against the same pool every model call
-    // draws on. It is the backstop that ends a run whose model never says HALT.
-    const refusal = await harness.budget.beginIteration();
-    if (refusal !== null) {
-      return end(harness, options, "budget_exhausted", `the budget refused another iteration: ${refusal.reason}`);
-    }
-
     const count = await countOf(harness.state, run_id);
-    const outcome = await runTurn<Emission, TallyKinds>(config(options, count), harness);
+    // The harness counts every model call against the pool, so a run whose model
+    // never says HALT is ended by the budget refusing the next one.
+    const outcome = await drain(streamTurn<Emission, TallyKinds>(config(options, count), harness));
 
     if (outcome.status === "waiting_approval") {
       await commitTurn(harness.state, run_id, outcome, []);

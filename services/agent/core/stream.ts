@@ -1,0 +1,350 @@
+import Ajv, { type ValidateFunction } from "ajv";
+import { ZERO_TOKENS, type Refusal, type SpendPayload, type TokenCounts } from "../contracts/budget.js";
+import type { CheckpointPayload, NewEvent, ResolutionPayload, TerminalPayload } from "../contracts/events.js";
+import type { RegisteredTool, ToolResult } from "../contracts/tool.js";
+import {
+  approvalId,
+  TOOL_APPROVAL,
+  type Attempt,
+  type Harness,
+  type Outcome,
+  type Pending,
+  type Status,
+  type TurnConfig,
+} from "./loop.js";
+import { ProviderError, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
+import { scannerFor, wrap } from "./security.js";
+import type { State } from "./seams.js";
+
+// What a run reports as it happens. The first three are the provider's, relayed;
+// the rest are the harness's, and a run ends on exactly one of the last three.
+export type StreamEvent<T = unknown> =
+  | { type: "text_delta"; text: string }
+  | { type: "usage"; payload: SpendPayload }
+  | { type: "tool_call"; call: ToolCall }
+  | { type: "tool_result"; call: ToolCall; attempt: Attempt }
+  | { type: "approval_required"; pending: Pending }
+  | { type: "done"; outcome: Outcome<T> }
+  | { type: "failed"; outcome: Outcome<T> };
+
+export type TurnStream<T> = AsyncGenerator<StreamEvent<T>, Outcome<T>>;
+
+// Generic over the workflow's kinds only so any workflow fits. The loop appends
+// none of them and reads only the domain-free set.
+export function streamTurn<T, Kinds extends Record<string, unknown> = Record<never, never>>(
+  cfg: TurnConfig,
+  harness: Harness<Kinds>,
+): TurnStream<T> {
+  return new Run<T, Kinds>(cfg, harness).execute();
+}
+
+// For a caller that wants the outcome and nothing that happened on the way to it.
+export async function drain<T>(stream: TurnStream<T>): Promise<Outcome<T>> {
+  for (;;) {
+    const next = await stream.next();
+    if (next.done) return next.value;
+  }
+}
+
+class Run<T, Kinds extends Record<string, unknown>> {
+  private readonly scan: ReturnType<typeof scannerFor>;
+  private readonly tools: readonly RegisteredTool[];
+  private readonly events: NewEvent<Record<never, never>>[] = [];
+  private readonly calls: Attempt[] = [];
+  private readonly rejected: string[] = [];
+  private readonly transcript: Message[] = [];
+  private from = 0;
+  private turns = 0;
+  private capped = false;
+
+  constructor(
+    private readonly cfg: TurnConfig,
+    private readonly harness: Harness<Kinds>,
+  ) {
+    this.scan = scannerFor(cfg.verbs);
+    this.tools = harness.registry.granted(cfg.role);
+  }
+
+  async *execute(): TurnStream<T> {
+    this.from = ((await this.harness.state.latestSeq(this.cfg.run_id)) ?? -1) + 1;
+
+    // Recalled once and rendered into the opening turn, never re-recalled per
+    // tool turn: a prefix that changes mid-loop is a prefix that cannot cache.
+    const recalled = await this.harness.memory.recall(this.cfg.task, this.cfg.recall_limit);
+    this.transcript.push({ role: "system", content: this.cfg.system });
+    this.transcript.push({ role: "user", content: opening(this.cfg.task, recalled) });
+
+    const ended = yield* this.toolLoop();
+    return yield* announce(ended ?? (yield* this.emit()));
+  }
+
+  // Returns an outcome only when the run ends here; otherwise the loop stops
+  // because the model asked for no tools or because the cap stopped it.
+  private async *toolLoop(): AsyncGenerator<StreamEvent<T>, Outcome<T> | null> {
+    const schemas = this.tools.map(schemaOf);
+    while (this.turns < this.cfg.max_turns) {
+      const fold = await foldRun(this.harness.state, this.cfg.run_id);
+      const settled = this.settled(fold);
+      if (settled !== null) return settled;
+
+      const refusal = await this.harness.budget.beginIteration();
+      if (refusal !== null) return this.exhausted(refusal);
+
+      const turn = yield* this.burn({ messages: windowed(this.transcript), tools: schemas });
+      this.turns += 1;
+      if (turn.tool_calls.length === 0) return null;
+
+      this.transcript.push({ role: "assistant", content: turn.content, tool_calls: turn.tool_calls });
+      for (const call of turn.tool_calls) {
+        const tool = this.tools.find((granted) => granted.id === call.tool);
+        if (tool === undefined) {
+          yield* this.record(call, refused(`${call.tool} is not granted to ${this.cfg.role}`));
+          continue;
+        }
+        const gate = this.gate(tool, call.args, fold.answered);
+        if (gate.kind === "park") return this.park(gate.checkpoint_id, tool.id, call.args);
+        if (gate.kind === "rejected") {
+          yield* this.record(call, refused("a reviewer rejected this call"));
+          continue;
+        }
+        yield* this.record(call, await this.invoke(tool, call.args));
+      }
+    }
+
+    // The cap stops the tool loop, not the run: a role that gathered something
+    // still answers over what it gathered, and says the set was truncated.
+    this.capped = true;
+    return null;
+  }
+
+  // The store is the authority on whether the run is still going, so one
+  // cancelled or answered out of band is seen on the next pass rather than never.
+  private settled(fold: Fold): Outcome<T> | null {
+    if (fold.terminal !== null) {
+      const status: Status = fold.terminal.outcome === "completed" ? "completed" : "failed";
+      return this.done(status, null, `the ledger already ended this run: ${fold.terminal.reason}`);
+    }
+    if (fold.open === null) return null;
+    const outcome = this.done("waiting_approval", null, `the ledger holds an open checkpoint, ${fold.open}`);
+    return { ...outcome, pending: { checkpoint_id: fold.open, tool: null, args: null } };
+  }
+
+  private gate(
+    tool: RegisteredTool,
+    args: string,
+    answered: ReadonlyMap<string, ResolutionPayload["answer"]>,
+  ): { kind: "allowed" } | { kind: "rejected" } | { kind: "park"; checkpoint_id: string } {
+    if (!this.cfg.approvals.has(tool.id)) return { kind: "allowed" };
+    const checkpoint_id = approvalId(this.cfg.run_id, tool.id, args);
+    const answer = answered.get(checkpoint_id);
+    if (answer === undefined) return { kind: "park", checkpoint_id };
+    return answer === "approve" ? { kind: "allowed" } : { kind: "rejected" };
+  }
+
+  private async invoke(tool: RegisteredTool, rawArgs: string): Promise<ToolResult> {
+    const args = parseArgs(rawArgs);
+    if (args === null) return { ok: false, failure: { kind: "invalid_args", detail: "arguments were not valid JSON" } };
+    return this.harness.dispatch.invoke(tool, args);
+  }
+
+  // The one path a result takes. Wrap scans it, so nothing reaches the transcript
+  // or the stream unscanned whatever the dispatch implementation handed back.
+  private async *record(call: ToolCall, result: ToolResult): AsyncGenerator<StreamEvent<T>, void> {
+    yield { type: "tool_call", call };
+    const wrapped = wrap(call.tool, result, this.scan, this.cfg.result_cap);
+    const attempt: Attempt = { tool: call.tool, args: call.args, result, wrapped };
+    this.calls.push(attempt);
+    this.transcript.push({ role: "tool", call_id: call.id, content: wrapped.text });
+    yield { type: "tool_result", call, attempt };
+  }
+
+  private async *emit(): AsyncGenerator<StreamEvent<T>, Outcome<T>> {
+    const validate = compile(this.cfg.schema);
+    const ask: Message = { role: "user", content: "Emit your answer now as JSON matching the schema." };
+    const messages: Message[] = [...this.transcript, ask];
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const refusal = await this.harness.budget.beginIteration();
+      if (refusal !== null) return this.exhausted(refusal);
+
+      const turn = yield* this.burn({ messages: windowed(messages), tools: [], emit: this.cfg.schema });
+
+      const parsed = tryParse(turn.content);
+      if (parsed !== undefined && validate(parsed)) {
+        return this.done("completed", parsed as T, "the role answered");
+      }
+
+      const reason = parsed === undefined ? "the response was not valid JSON" : errorsOf(validate);
+      this.rejected.push(`${reason}: ${turn.content.slice(0, 400)}`);
+      // The rejected emission goes back as the assistant turn it was, or the model
+      // is asked to correct something it cannot see.
+      messages.push({ role: "assistant", content: turn.content, tool_calls: [] });
+      messages.push({ role: "user", content: `That emission was rejected -- ${reason}. Emit a valid answer.` });
+    }
+
+    return this.done("failed", null, `the role never emitted a valid answer: ${this.rejected.join(" | ")}`);
+  }
+
+  // One model call, journaled as the provider reports it rather than after it
+  // returns: a call that dies mid-turn has still put its spend on the ledger.
+  private async *burn(request: Omit<TurnRequest, "signal">): AsyncGenerator<StreamEvent<T>, Omit<Turn, "tokens">> {
+    const signal = this.cfg.signal ? { signal: this.cfg.signal } : {};
+    const tool_calls: ToolCall[] = [];
+    let content = "";
+    let billed = false;
+
+    try {
+      for await (const event of this.harness.provider.stream({ ...request, ...signal })) {
+        if (event.type === "tool_call") tool_calls.push(event.call);
+        else if (event.type === "text_delta") {
+          content += event.text;
+          yield event;
+        } else {
+          billed = true;
+          yield { type: "usage", payload: this.settle(event.tokens) };
+        }
+      }
+    } catch (error) {
+      // Only when the provider died without reporting: it carries what it burned
+      // precisely so a failure before the usage event is not spend the pool loses.
+      if (!billed) this.settle(error instanceof ProviderError ? error.tokens : ZERO_TOKENS);
+      throw error;
+    }
+
+    return { content, tool_calls };
+  }
+
+  // Cost is the gateway's to report, so it is null until it does.
+  private settle(tokens: TokenCounts): SpendPayload {
+    const payload: SpendPayload = {
+      model_id: this.harness.provider.model,
+      provider_type: this.harness.provider.provider_type,
+      role: this.cfg.role,
+      tokens,
+      cost_usd: null,
+    };
+    this.harness.budget.record(payload);
+    this.events.push({ run_id: this.cfg.run_id, run_kind: this.cfg.run_kind, kind: "spend", payload });
+    return payload;
+  }
+
+  private park(checkpoint_id: string, tool: string, args: string): Outcome<T> {
+    const payload: CheckpointPayload = {
+      checkpoint_id,
+      checkpoint_class: TOOL_APPROVAL,
+      question: `${this.cfg.role} wants to call ${tool} with ${args}. Approve?`,
+      raised_at: new Date().toISOString(),
+    };
+    this.events.push({ run_id: this.cfg.run_id, run_kind: this.cfg.run_kind, kind: "checkpoint", payload });
+    const outcome = this.done("waiting_approval", null, `parked on approval for ${tool}`);
+    return { ...outcome, pending: { checkpoint_id, tool, args } };
+  }
+
+  private exhausted(refusal: Refusal): Outcome<T> {
+    const reason = `the budget refused another iteration: ${refusal.reason}`;
+    return { ...this.done("failed", null, reason), refusal };
+  }
+
+  private done(status: Status, value: T | null, reason: string): Outcome<T> {
+    return {
+      status,
+      value,
+      refusal: null,
+      pending: null,
+      capped: this.capped,
+      transcript: this.transcript,
+      calls: this.calls,
+      turns: this.turns,
+      rejected: this.rejected,
+      events: this.events,
+      from: this.from,
+      reason,
+    };
+  }
+}
+
+// The last event a run yields and the outcome it returns are the same thing, so
+// a caller that reads only the stream and one that awaits it agree.
+async function* announce<T>(outcome: Outcome<T>): TurnStream<T> {
+  if (outcome.pending !== null) yield { type: "approval_required", pending: outcome.pending };
+  else yield { type: outcome.status === "completed" ? "done" : "failed", outcome };
+  return outcome;
+}
+
+interface Fold {
+  answered: ReadonlyMap<string, ResolutionPayload["answer"]>;
+  // A checkpoint with no approving or rejecting resolution, which is what keeps
+  // a run parked whether or not this harness is the one that raised it.
+  open: string | null;
+  terminal: TerminalPayload | null;
+}
+
+// One read answering the three questions the loop asks of the store each pass.
+async function foldRun<Kinds extends Record<string, unknown>>(state: State<Kinds>, runId: string): Promise<Fold> {
+  const answered = new Map<string, ResolutionPayload["answer"]>();
+  const raised: string[] = [];
+  let terminal: TerminalPayload | null = null;
+
+  for (const event of await state.read(runId)) {
+    if (event.kind === "resolution") {
+      const payload = event.payload as ResolutionPayload;
+      answered.set(payload.checkpoint_id, payload.answer);
+    }
+    if (event.kind === "checkpoint") raised.push((event.payload as CheckpointPayload).checkpoint_id);
+    if (event.kind === "terminal") terminal = event.payload as TerminalPayload;
+  }
+
+  return { answered, open: raised.find((id) => !answered.has(id)) ?? null, terminal };
+}
+
+// The overflow arm, stubbed: the transcript goes whole until byte-stable window
+// assembly lands, and what summarising drops is that work's to decide.
+function windowed(messages: readonly Message[]): readonly Message[] {
+  return messages;
+}
+
+function opening(task: string, recalled: readonly string[]): string {
+  if (recalled.length === 0) return task;
+  return `${task}\n\nRecalled from earlier work:\n${recalled.map((note) => `- ${note}`).join("\n")}`;
+}
+
+function schemaOf(tool: RegisteredTool): ToolSchema {
+  return { id: tool.id, description: tool.description, parameters: tool.parameters };
+}
+
+function refused(detail: string): ToolResult {
+  return { ok: false, failure: { kind: "refused", detail } };
+}
+
+function parseArgs(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(raw === "" ? "{}" : raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function tryParse(content: string): unknown {
+  try {
+    return JSON.parse(content);
+  } catch {
+    return undefined;
+  }
+}
+
+const ajv = new Ajv({ allErrors: true, strict: false });
+const compiled = new Map<string, ValidateFunction>();
+
+function compile(schema: Record<string, unknown>): ValidateFunction {
+  const key = JSON.stringify(schema);
+  const existing = compiled.get(key);
+  if (existing !== undefined) return existing;
+  const validate = ajv.compile(schema);
+  compiled.set(key, validate);
+  return validate;
+}
+
+function errorsOf(validate: ValidateFunction): string {
+  return (validate.errors ?? []).map((error) => `${error.instancePath || "/"} ${error.message ?? ""}`).join("; ");
+}

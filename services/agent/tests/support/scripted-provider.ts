@@ -1,10 +1,12 @@
 import { ZERO_TOKENS, type TokenCounts } from "../../contracts/budget.js";
-import { ProviderError, type Provider, type Turn, type TurnRequest } from "../../core/provider.js";
+import { ProviderError, type Provider, type ProviderEvent, type TurnRequest } from "../../core/provider.js";
 
 export interface ScriptedTurn {
   // What the model asks for on a tool turn.
   calls?: readonly { tool: string; args: string }[];
   content?: string;
+  // Sent as separate deltas, so a test can watch the loop accumulate them.
+  deltas?: readonly string[];
   // What the model answers with on the emission turn. A string is sent verbatim,
   // so a test can hand back something the schema will reject.
   emit?: unknown;
@@ -24,23 +26,34 @@ export function scriptedProvider(script: readonly ScriptedTurn[], model = "scrip
     model,
     provider_type: "scripted",
     requests,
-    turn: async (request: TurnRequest): Promise<Turn> => {
+    stream: async function* (request: TurnRequest): AsyncGenerator<ProviderEvent> {
       requests.push(request);
       const next = script[step];
       step += 1;
       if (next === undefined) throw new Error(`the script ran out at turn ${step}`);
 
       const tokens = { ...ZERO_TOKENS, ...next.tokens };
-      if (next.fail !== undefined) throw new ProviderError(next.fail, tokens);
+      // Usage before the failure, as a real surface reports it: what a dying call
+      // burned is spend the ledger has to carry.
+      if (next.fail !== undefined) {
+        yield { type: "usage", tokens };
+        throw new ProviderError(next.fail, tokens);
+      }
 
       if (request.emit !== undefined) {
         if (next.emit === undefined) throw new Error(`turn ${step} was asked for an emission the script does not have`);
-        const content = typeof next.emit === "string" ? next.emit : JSON.stringify(next.emit);
-        return { content, tool_calls: [], tokens };
+        yield { type: "text_delta", text: typeof next.emit === "string" ? next.emit : JSON.stringify(next.emit) };
+        yield { type: "usage", tokens };
+        return;
       }
 
-      const calls = (next.calls ?? []).map((call, index) => ({ id: `c${step}-${index}`, ...call }));
-      return { content: next.content ?? "", tool_calls: calls, tokens };
+      for (const text of next.deltas ?? (next.content === undefined ? [] : [next.content])) {
+        yield { type: "text_delta", text };
+      }
+      yield { type: "usage", tokens };
+      for (const [index, call] of (next.calls ?? []).entries()) {
+        yield { type: "tool_call", call: { id: `c${step}-${index}`, ...call } };
+      }
     },
   };
 }

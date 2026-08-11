@@ -28,18 +28,27 @@ export interface TurnRequest {
   signal?: AbortSignal;
 }
 
+// One model call assembled from its stream. Nothing on the wire returns this; it
+// is what a consumer holds once the stream has ended.
 export interface Turn {
   content: string;
   tool_calls: readonly ToolCall[];
   tokens: TokenCounts;
 }
 
-// Exactly one model call. The loop belongs to the harness, which keeps the turn
-// cap, approval gate and injection scan out of a component a workflow can swap.
+// Usage arrives before the stream ends, so a call that dies afterwards has still
+// reported what it spent. Tool calls come last, once the model has asked for them.
+export type ProviderEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "usage"; tokens: TokenCounts }
+  | { type: "tool_call"; call: ToolCall };
+
+// Exactly one model call, streamed. The loop belongs to the harness, which keeps
+// the turn cap, approval gate and injection scan out of a component a workflow can swap.
 export interface Provider {
   readonly model: string;
   readonly provider_type: string;
-  turn(request: TurnRequest): Promise<Turn>;
+  stream(request: TurnRequest): AsyncIterable<ProviderEvent>;
 }
 
 // Carries what was already burned, so a call that fails does not drop spend the

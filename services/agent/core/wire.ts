@@ -5,6 +5,7 @@ import {
   ProviderError,
   type Message,
   type Provider,
+  type ProviderEvent,
   type ToolCall,
   type ToolSchema,
   type Turn,
@@ -41,8 +42,16 @@ class OpenAiSurface implements Provider {
     readonly provider_type: string,
   ) {}
 
-  async turn(request: TurnRequest): Promise<Turn> {
-    if (request.emit !== undefined) return this.emit(request, request.emit);
+  // The gateway's completion is one shot, so the events are emitted once it
+  // returns. Usage precedes the tool calls, which is the order the loop needs.
+  async *stream(request: TurnRequest): AsyncGenerator<ProviderEvent> {
+    const turn = request.emit === undefined ? await this.ask(request) : await this.emit(request, request.emit);
+    if (turn.content !== "") yield { type: "text_delta", text: turn.content };
+    yield { type: "usage", tokens: turn.tokens };
+    for (const call of turn.tool_calls) yield { type: "tool_call", call };
+  }
+
+  private async ask(request: TurnRequest): Promise<Turn> {
     const tools = request.tools.length === 0 ? {} : { tools: wireTools(request.tools) };
     return turnOf(await this.call({ model: this.model, messages: wire(request.messages), ...tools }, request.signal));
   }
