@@ -1,7 +1,7 @@
-import { newId } from "./ids.js";
 import { appendFileSync, readFileSync } from "node:fs";
 import { actorName } from "./lease.js";
-import { newId, type Journal } from "./journal.js";
+import { newId } from "./ids.js";
+import type { Journal } from "./journal.js";
 import type { BudgetGrant, Directive, DirectiveKind } from "./types.js";
 
 // The controller's own voice in the directive stream. Named rather than borrowed

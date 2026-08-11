@@ -1,3 +1,4 @@
+import type { BudgetLimits } from "../../contracts/budget.js";
 // Type-only, so the cycle with the spec loader is erased at compile time.
 import type { RunSpec } from "../../core/spec.js";
 
@@ -85,10 +86,8 @@ export type HypothesisStatus =
 export type Salience = "routine" | "notable" | "anomalous";
 export type LinkRelation = "supports" | "weakens";
 
-export interface Budgets {
-  max_iterations: number;
-  max_cost_usd: number;
-}
+// The harness's limits under the hunt's name, so a spec reads as one thing.
+export type Budgets = BudgetLimits;
 
 export const DEFAULT_BUDGETS: Budgets = { max_iterations: 20, max_cost_usd: 25.0 };
 

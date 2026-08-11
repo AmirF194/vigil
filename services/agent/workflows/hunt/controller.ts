@@ -1,6 +1,6 @@
+import type { State } from "../../core/seams.js";
+import type { HuntKinds } from "./journal.js";
 import { newId } from "./ids.js";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   AUTO_ACTOR,
   DEFAULT_CHECKPOINTS,
@@ -11,6 +11,7 @@ import {
   type Checkpoint,
   type CheckpointClass,
   type Checkpoints,
+  type Resolution,
 } from "./checkpoints.js";
 import { buildDigest, focusOf, rankFrontier, suppressedEntities } from "./digest.js";
 import { buildEntityGraph, entitiesOf, fromText, key } from "./entities.js";
@@ -254,11 +255,11 @@ function withRejection(digest: Digest, reason: string): Digest {
   };
 }
 
-export function startHunt(spec: RunSpec, dir: string): Journal {
+export async function startHunt(state: State<HuntKinds>, runId: string, spec: RunSpec): Promise<Journal> {
   const now = new Date().toISOString();
   const huntId = newId("hunt");
   const policy = (spec.checkpoints ?? DEFAULT_CHECKPOINTS).hypothesis_approval;
-  const ledger = Journal.create(join(dir, `${huntId}.jsonl`), {
+  const ledger = await Journal.create(state, runId, {
     hunt_id: huntId,
     name: spec.name,
     spec,
@@ -297,7 +298,6 @@ export function startHunt(spec: RunSpec, dir: string): Journal {
   // Raised whichever way the policy falls, so the approval is a ledger fact
   // rather than something the CLI remembers: an approval that isn't on the
   const checkpoint = raiseCheckpoint(
-    ledger,
     "hypothesis_approval",
     0,
     `Approve and start this hunt on ${spec.hypotheses.length} hypothesis(es)?`,
@@ -311,15 +311,17 @@ export function startHunt(spec: RunSpec, dir: string): Journal {
     },
   );
   if (policy === "auto") {
-    resolveCheckpoint(ledger, checkpoint, "approved", AUTO_ACTOR, "checkpoint policy hypothesis_approval=auto");
+    const resolution = resolveCheckpoint(checkpoint, "approve", AUTO_ACTOR, "checkpoint policy hypothesis_approval=auto");
+    ledger.append({ kind: "resolution", payload: resolution });
   }
+  await ledger.flush();
   return ledger;
 }
 
 // The ledger is the resume point: the spec came with it, so nothing is re-read
 // from disk and a mid-run edit to an arch file cannot change a hunt in flight.
-export function resumeHunt(path: string): { ledger: Journal; spec: RunSpec } {
-  const ledger = Journal.open(path);
+export async function resumeHunt(state: State<HuntKinds>, runId: string): Promise<{ ledger: Journal; spec: RunSpec }> {
+  const ledger = await Journal.open(state, runId);
   const { hunt } = ledger.projection;
   if (hunt.status === "terminal") throw new HuntAlreadyTerminal(`${hunt.hunt_id} already ended as ${hunt.outcome}`);
   return { ledger, spec: hunt.spec };
@@ -355,6 +357,29 @@ export class HuntController {
   // class stops and asks was settled when the hunt started, so an edited config
   private get checkpoints(): Checkpoints {
     return this.ledger.projection.hunt.spec.checkpoints ?? DEFAULT_CHECKPOINTS;
+  }
+
+  private raiseAsk(
+    checkpointClass: CheckpointClass,
+    raisedIteration: number,
+    question: string,
+    context: Record<string, unknown> = {},
+  ): Checkpoint {
+    const checkpoint = raiseCheckpoint(checkpointClass, raisedIteration, question, context);
+    this.ledger.append({ kind: "checkpoint", payload: checkpoint });
+    return checkpoint;
+  }
+
+  private resolve(
+    checkpoint: Checkpoint,
+    answer: Resolution["answer"],
+    actor: string,
+    text: string,
+    directive: Directive | null = null,
+  ): Resolution {
+    const resolution = resolveCheckpoint(checkpoint, answer, actor, text, directive);
+    this.ledger.append({ kind: "resolution", payload: resolution });
+    return resolution;
   }
 
   async advanceIteration(): Promise<IterationResult> {
@@ -507,7 +532,7 @@ export class HuntController {
     for (const evidenceId of ids) {
       const record = this.ledger.projection.evidence.get(evidenceId);
       if (record === undefined) continue;
-      const payload = JSON.stringify(record.context, null, 2);
+      const payload = JSON.stringify(record.payload, null, 2);
       if (payload.length > budget) {
         dropped.push(evidenceId);
         continue;
@@ -718,7 +743,7 @@ export class HuntController {
     question: string,
     payload: Record<string, unknown>,
   ): { checkpoint: Checkpoint; parked: boolean } {
-    const checkpoint = raiseCheckpoint(this.ledger, checkpointClass, iteration, question, payload);
+    const checkpoint = this.raiseAsk(checkpointClass, iteration, question, payload);
     if (this.checkpoints[checkpointClass] !== "ask") return { checkpoint, parked: false };
 
     const hunt = this.ledger.projection.hunt;
@@ -733,7 +758,7 @@ export class HuntController {
   }
 
   private autoResolved(checkpoint: Checkpoint, reason: string): void {
-    resolveCheckpoint(this.ledger, checkpoint, "approved", AUTO_ACTOR, reason);
+    this.resolve(checkpoint, "approve", AUTO_ACTOR, reason);
   }
 
   // Lifted only when nothing is left to answer. Keying on the checkpoint id in
@@ -770,10 +795,9 @@ export class HuntController {
     }
 
     const approved = directive.kind === "approve";
-    resolveCheckpoint(
-      this.ledger,
+    this.resolve(
       checkpoint,
-      approved ? "approved" : "rejected",
+      approved ? "approve" : "reject",
       directive.actor,
       directive.text,
       directive,
@@ -948,7 +972,7 @@ export class HuntController {
   private park(): string {
     const hunt = this.ledger.projection.hunt;
     const reason =
-      `budget exhausted at iteration ${hunt.iteration} of ${hunt.budgets.max_iterations}, ` +
+      `budget exhausted at iteration ${hunt.iteration} of ${hunt.budgets.max_calls}, ` +
       `$${hunt.cost_usd.toFixed(4)} of $${hunt.budgets.max_cost_usd.toFixed(2)}`;
 
     this.ledger.patch("hunt", hunt.hunt_id, {
@@ -975,21 +999,21 @@ export class HuntController {
     }
 
     const asked: Budgets = {
-      max_iterations: hunt.budgets.max_iterations + grant.iterations,
+      max_calls: hunt.budgets.max_calls + grant.iterations,
       max_cost_usd: Number((hunt.budgets.max_cost_usd + grant.cost_usd).toFixed(6)),
     };
-    const { hard_max_iterations, hard_max_cost_usd } = this.termination;
+    const { hard_max_calls, hard_max_cost_usd } = this.termination;
     const budgets: Budgets = {
-      max_iterations: Math.min(asked.max_iterations, hard_max_iterations),
+      max_calls: Math.min(asked.max_calls, hard_max_calls),
       max_cost_usd: Math.min(asked.max_cost_usd, hard_max_cost_usd),
     };
     this.ledger.patch("hunt", hunt.hunt_id, { budgets });
 
-    if (budgets.max_iterations < asked.max_iterations || budgets.max_cost_usd < asked.max_cost_usd) {
+    if (budgets.max_calls < asked.max_calls || budgets.max_cost_usd < asked.max_cost_usd) {
       journalNote(
         this.ledger,
-        `${directive.actor} extended the hunt to ${asked.max_iterations} iterations / ` +
-          `$${asked.max_cost_usd.toFixed(2)}; clamped to the hard ceiling of ${hard_max_iterations} iterations / ` +
+        `${directive.actor} extended the hunt to ${asked.max_calls} iterations / ` +
+          `$${asked.max_cost_usd.toFixed(2)}; clamped to the hard ceiling of ${hard_max_calls} iterations / ` +
           `$${hard_max_cost_usd.toFixed(2)}.`,
       );
     }
@@ -997,7 +1021,7 @@ export class HuntController {
     if (this.budgetExhausted()) {
       journalNote(
         this.ledger,
-        `the extension leaves no room at ${budgets.max_iterations} iterations / $${budgets.max_cost_usd.toFixed(2)}, ` +
+        `the extension leaves no room at ${budgets.max_calls} iterations / $${budgets.max_cost_usd.toFixed(2)}, ` +
           "so the hunt stays parked; conclude or abort it.",
       );
       return;
@@ -1413,7 +1437,6 @@ export class HuntController {
     }
 
     const caseId = newId("case", 4);
-    const caseFile = caseFilePath(this.ledger.path, caseId);
     this.ledger.patch("hypothesis", hypothesisId, { status: "handed_off", spawned_case_id: caseId });
 
     const handoff = {
@@ -1421,13 +1444,10 @@ export class HuntController {
       hypothesis_id: hypothesisId,
       iteration,
       rationale: decision.rationale,
-      case_file: caseFile,
       created_at: new Date().toISOString(),
     };
     this.ledger.append({ kind: "handoff", payload: handoff });
-    // A deliverable, like the report: derived from the projection, never read back.
-    writeFileSync(caseFile, renderCaseFile(this.ledger.projection, handoff));
-    return `${hypothesisId} handed off to incident response as ${caseId} — ${caseFile}`;
+    return `${hypothesisId} handed off to incident response as ${caseId}`;
   }
 
   // Corroboration is counted over source systems, so a label the hunt never
@@ -1435,11 +1455,11 @@ export class HuntController {
   private attributeSource(record: WorkerEvidence): Pick<EvidenceRecord, "source_system" | "payload"> {
     const declared = this.ledger.projection.hunt.spec.data_domains;
     if (record.provenance !== "worker" || declared.length === 0 || declared.includes(record.source_system)) {
-      return { source_system: record.source_system, payload: record.context };
+      return { source_system: record.source_system, payload: record.payload };
     }
     return {
       source_system: UNDECLARED_SOURCE,
-      payload: { ...record.context, claimed_source_system: record.source_system },
+      payload: { ...record.payload, claimed_source_system: record.source_system },
     };
   }
 
@@ -1579,7 +1599,7 @@ export class HuntController {
   private enrichedEntities(): Set<string> {
     const done = new Set<string>();
     for (const record of this.ledger.projection.evidence.values()) {
-      if (record.provenance.startsWith("enrichment:")) done.add(String(record.context["entity"] ?? ""));
+      if (record.provenance.startsWith("enrichment:")) done.add(String(record.payload["entity"] ?? ""));
     }
     return done;
   }
@@ -1699,16 +1719,16 @@ export class HuntController {
 
   // The deliverable. Journaled structured so the fold stays the source of truth,
   // and rendered beside the ledger so an operator has something to read — the
+  // Journaled, not written: the report is a fold over the ledger, so rendering it
+  // to a file beside one would be a second copy that can disagree.
   private finalize(): void {
-    const report = buildReport(this.ledger.projection);
-    this.ledger.append({ kind: "finalize", report });
-    writeFileSync(reportPath(this.ledger.path), renderReport(report));
+    this.ledger.append({ kind: "finalize", payload: buildReport(this.ledger.projection) });
   }
 
   private budgetExhausted(): boolean {
     const hunt = this.ledger.projection.hunt;
     return (
-      hunt.iteration >= hunt.budgets.max_iterations || hunt.cost_usd >= hunt.budgets.max_cost_usd
+      hunt.iteration >= hunt.budgets.max_calls || hunt.cost_usd >= hunt.budgets.max_cost_usd
     );
   }
 }

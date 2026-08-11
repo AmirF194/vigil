@@ -202,7 +202,7 @@ export function renderReport(report: HuntReport): string {
     "",
     `- **Outcome:** ${report.outcome ?? "not terminated"}`,
     `- **Hunt:** ${report.hunt_id}`,
-    `- **Iterations:** ${report.iterations} of ${report.budgets.max_iterations}`,
+    `- **Iterations:** ${report.iterations} of ${report.budgets.max_calls}`,
     `- **Cost:** $${report.cost_usd.toFixed(4)} of $${report.budgets.max_cost_usd.toFixed(2)}`,
     `- **Started:** ${report.created_at}`,
     `- **Ended:** ${report.terminated_at ?? "still running"}`,

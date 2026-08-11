@@ -1,7 +1,14 @@
 import { key } from "./entities.js";
 import type { Enricher } from "./ports.js";
-import { SpecError, type EnrichmentChain, type RunSpec } from "../../core/spec.js";
-import type { Tool } from "./tools.js";
+import { SpecError, type RunSpec } from "../../core/spec.js";
+import { DEFAULT_ENRICHMENT, type EnrichmentChain } from "./config.js";
+export interface Tool {
+  id: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  run(args: Record<string, unknown>): Promise<string>;
+  close?(): Promise<void>;
+}
 import type { Entity, WorkerEvidence } from "./types.js";
 
 // The value is telemetry an adversary wrote and it is going into SQL. The

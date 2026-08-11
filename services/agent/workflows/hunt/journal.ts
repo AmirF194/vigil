@@ -1,6 +1,8 @@
 import { EVENT_SCHEMA_VERSION, type NewEvent, type RunKind } from "../../contracts/events.js";
 import type { State } from "../../core/seams.js";
 import { fold, type HuntEvent, type HuntKinds, type Projection } from "./ledger.js";
+
+export type { HuntEvent, HuntKinds, Projection } from "./ledger.js";
 import type { HuntState } from "./types.js";
 
 export type Body = NewEvent<HuntKinds>;
