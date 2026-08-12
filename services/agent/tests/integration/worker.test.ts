@@ -2,13 +2,13 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { LedgerRepository } from "../ledger/repository.js";
-import { advance, resolveSpec } from "../worker.js";
-import type { RunJob } from "../contracts/job.js";
-import type { ScriptedTurn } from "./support/scripted-provider.js";
-import { scriptedHarness } from "./support/scripted-harness.js";
+import { LedgerRepository } from "../../ledger/repository.js";
+import { advance, resolveSpec } from "../../worker.js";
+import type { RunJob } from "../../contracts/job.js";
+import type { ScriptedTurn } from "../support/scripted-provider.js";
+import { scriptedHarness } from "../support/scripted-harness.js";
 
-const FIXTURES = join(import.meta.dirname, "fixtures");
+const FIXTURES = join(import.meta.dirname, "..", "fixtures");
 
 const pool = new pg.Pool({
   connectionString: process.env["DATABASE_URL"] ?? "postgres://vigil:vigil@localhost:55432/vigil_test",

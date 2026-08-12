@@ -1,7 +1,7 @@
 import { resolutionOf, type Checkpoint, type Resolution } from "./checkpoints.js";
 import { suppressedEntities } from "./digest.js";
 import type { Projection } from "./ledger.js";
-import { isGap } from "./strength.js";
+import { isGap, unruledObservations } from "./strength.js";
 import type {
   Budgets,
   EvidenceRecord,
@@ -75,6 +75,9 @@ export interface HuntReport {
   // list, because the report says what the hunt ran under, not what it was told.
   suppressions: Suppression[];
   handoffs: Handoff[];
+  // Observations that reached no hypothesis at all. Absent on a legacy run,
+  // which never asked the lead to rule on anything.
+  unruled?: number;
 }
 
 export function reportPath(ledgerPath: string): string {
@@ -150,6 +153,7 @@ export function buildReport(projection: Projection): HuntReport {
     })),
     suppressions: [...suppressedEntities(projection)].map(([entity_key, actor]) => ({ entity_key, actor })),
     handoffs: [...projection.handoffs],
+    ...(projection.hunt.spec.hypothesis_loop ? { unruled: unruledObservations(projection) } : {}),
   };
 }
 
@@ -252,13 +256,15 @@ export function renderReport(report: HuntReport): string {
     lines.push("");
   }
 
+  if (report.unruled !== undefined && report.unruled > 0) {
+    lines.push(`## Unruled observations (${report.unruled})`, "", "Evidence the hunt ended before ruling on.", "");
+  }
+
   if (report.handoffs.length > 0) {
     lines.push("## Escalated to incident response", "");
     for (const handoff of report.handoffs) {
-      lines.push(
-        `- ${handoff.case_id} (${handoff.hypothesis_id}, iteration ${handoff.iteration}) — ${handoff.rationale}`,
-        `  case file: ${handoff.case_file}`,
-      );
+      lines.push(`- ${handoff.case_id} (${handoff.hypothesis_id}, iteration ${handoff.iteration}) — ${handoff.rationale}`);
+      if (handoff.case_file) lines.push(`  case file: ${handoff.case_file}`);
     }
     lines.push("");
   }

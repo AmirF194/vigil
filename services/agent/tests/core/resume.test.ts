@@ -2,15 +2,15 @@ import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import type { RunJob } from "../contracts/job.js";
-import { InProcessState } from "../core/state.js";
-import { advance, resolveSpec, specOf } from "../worker.js";
-import { scriptedHarness } from "./support/scripted-harness.js";
-import type { ScriptedTurn } from "./support/scripted-provider.js";
+import type { RunJob } from "../../contracts/job.js";
+import { InProcessState } from "../../core/state.js";
+import { advance, resolveSpec, specOf } from "../../worker.js";
+import { scriptedHarness } from "../support/scripted-harness.js";
+import type { ScriptedTurn } from "../support/scripted-provider.js";
 
 const CONCLUDE: ScriptedTurn[] = [{ calls: [] }, { emit: { action: "CONCLUDE", rationale: "done", evidence_citations: [] } }];
 
-const FIXTURES = join(import.meta.dirname, "fixtures");
+const FIXTURES = join(import.meta.dirname, "..", "fixtures");
 const RUN = "7d3c2d3e-0000-4000-8000-000000000619";
 
 let config: string;
@@ -62,7 +62,7 @@ describe("resolving a run", () => {
 
   it("lets an explicit arch path override the registry's default", async () => {
     const job = startJob();
-    job.request.arch = join(import.meta.dirname, "..", "arch", "threathunt.yaml");
+    job.request.arch = join(import.meta.dirname, "..", "..", "arch", "threathunt.yaml");
     expect((await resolveSpec(job)).dispatch.max_workers).toBe(4);
   });
 });

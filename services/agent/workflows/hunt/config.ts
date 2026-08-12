@@ -1,6 +1,6 @@
-import type { Counts, RunSpec } from "../../core/spec.js";
+import type { BudgetLimits } from "../../contracts/budget.js";
+import { SpecError, type Counts, type RunSpec } from "../../core/spec.js";
 import { DEFAULT_CHECKPOINTS, type Checkpoints } from "./checkpoints.js";
-import type { Hypothesis } from "./types.js";
 
 // The core spec carries domain config as untyped numeric bags, so what a
 // threshold means is stated here rather than in a harness the hunt shares.
@@ -61,6 +61,16 @@ function over<T extends object>(defaults: T, held: Counts): T {
   return merged as T;
 }
 
+// Checked against the union because verdicts and termination share one bag: a
+// threshold of zero locks or proves everything, and a misspelled key is silent.
+export function validateThresholds(held: Counts): void {
+  const known = { ...DEFAULT_VERDICTS, ...DEFAULT_TERMINATION } as Record<string, number>;
+  for (const [key, value] of Object.entries(held)) {
+    if (!(key in known)) throw new SpecError(`unknown thresholds key: ${key}`);
+    if (!Number.isFinite(value) || value <= 0) throw new SpecError(`thresholds.${key} must be a positive number`);
+  }
+}
+
 export function verdictsOf(spec: RunSpec): Verdicts {
   return over(DEFAULT_VERDICTS, spec.thresholds);
 }
@@ -88,10 +98,15 @@ export interface EnrichmentPolicy {
 
 export const DEFAULT_ENRICHMENT: EnrichmentPolicy = { max_depth: 1, max_entities: 8, chains: [] };
 
+// The p.6 hypothesis loop: null seeded at base rate, frontier ranked by
+// discrimination, termination on dominance. Per run, so a ledger replays as ranked.
+export const DEFAULT_HYPOTHESIS_LOOP = false;
+
 // Typed rather than a bag: a hypothesis is shaped by results and reshaped again,
 // so it has to be a first-class record everywhere the workflow touches it.
 export interface HuntSpec extends RunSpec {
-  hypotheses: Hypothesis[];
+  hypothesis_loop: boolean;
+  hypotheses: string[];
   attack_techniques: string[];
   data_domains: string[];
   enrichment: EnrichmentPolicy;
@@ -99,11 +114,23 @@ export interface HuntSpec extends RunSpec {
   termination: Termination;
 }
 
+// A ceiling under the budget it caps would clamp every extension to less than
+// the hunt already had, so an operator could never buy headroom.
+function validateCeilings(termination: Termination, budgets: BudgetLimits): void {
+  if (termination.hard_max_calls < budgets.max_calls)
+    throw new SpecError(`thresholds.hard_max_calls is below budgets.max_calls (${budgets.max_calls})`);
+  if (termination.hard_max_cost_usd < budgets.max_cost_usd)
+    throw new SpecError(`thresholds.hard_max_cost_usd is below budgets.max_cost_usd (${budgets.max_cost_usd})`);
+}
+
 export function huntSpec(spec: RunSpec): HuntSpec {
   const held = spec.sections;
+  validateThresholds(spec.thresholds);
+  validateCeilings(terminationOf(spec), spec.budgets);
   return {
     ...spec,
-    hypotheses: Array.isArray(held["hypotheses"]) ? (held["hypotheses"] as Hypothesis[]) : [],
+    hypothesis_loop: held["hypothesis_loop"] === true,
+    hypotheses: Array.isArray(held["hypotheses"]) ? (held["hypotheses"] as string[]) : [],
     attack_techniques: Array.isArray(held["attack_techniques"]) ? (held["attack_techniques"] as string[]) : [],
     data_domains: Array.isArray(held["data_domains"]) ? (held["data_domains"] as string[]) : [],
     enrichment: { ...DEFAULT_ENRICHMENT, ...(held["enrichment"] as object | undefined) },

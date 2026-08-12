@@ -40,14 +40,14 @@ import {
   NULL_CHECK_PROVENANCE,
   OPERATOR_GAP_PROVENANCE,
   UNDECLARED_SOURCE,
-  unmetPredicates,
-} from "./strength.js";
+  unmetPredicates, pairKey, unclassified } from "./strength.js";
 import {
   ACTIONS_REQUIRING_CITATION,
   DECISION_ACTIONS,
   OUTCOME_PRECEDENCE,
   type Budgets,
   type Decision,
+  type Handoff,
   type DecisionAction,
   type DecisionResult,
   type Digest,
@@ -92,6 +92,11 @@ export const DEFAULT_WORKER_AGENT_ID = "threat_hunter";
 // One emission plus two re-asks. Bounded because a Hunt Lead that cannot obey
 // the vocabulary will not learn to on the tenth try, and every ask costs money.
 export const MAX_DECISION_ATTEMPTS = 3;
+
+// Seeded at its base rate: most activity that looks like this is not an attack,
+// so the benign account starts as the hypothesis to beat rather than an objection.
+export const BASE_RATE_PROVENANCE = "base_rate";
+export const NULL_HYPOTHESIS = "the activity has a benign explanation and no attack occurred";
 
 // EXPAND does not advance the iteration, so only this stops a lead reading forever.
 export const MAX_EXPANSIONS = 3;
@@ -146,6 +151,20 @@ function nullCheckInput(projection: Projection, hypothesis: Hypothesis): NullChe
   };
 }
 
+// Evidence may only ever accrue to the hypothesis it was gathered for unless the
+// lead is made to rule on all of them, which is what confirmation drift is.
+function validateCoverage(decision: Decision, projection: Projection): void {
+  if (!projection.hunt.spec.hypothesis_loop) return;
+  const covered = new Set((decision.evidence_relations ?? []).map((r) => pairKey(r.evidence_id, r.hypothesis_id)));
+  const missing = unclassified(projection).filter((pair) => !covered.has(pairKey(pair.evidence_id, pair.hypothesis_id)));
+  if (missing.length === 0) return;
+  const [first] = missing;
+  throw new InvalidDecision(
+    `${decision.action} leaves ${missing.length} observation(s) unruled: evidence ${first!.evidence_id} ` +
+      `against hypothesis ${first!.hypothesis_id}. Every active hypothesis needs supports, weakens or neither.`,
+  );
+}
+
 // The controller rejects anything outside the closed vocabulary, so the Hunt
 // Lead cannot widen its own action space by emitting a new verb or a worker
 export function validateDecision(decision: Decision, projection: Projection): void {
@@ -179,6 +198,7 @@ export function validateDecision(decision: Decision, projection: Projection): vo
     }
   }
   validateFocus(decision, projection);
+  validateCoverage(decision, projection);
   if (decision.action === "ABANDON") validateAbandon(decision, projection);
 
   // A verdict is about one claim. Without the target there is nothing to argue
@@ -296,8 +316,25 @@ export async function startHunt(state: State<HuntKinds>, runId: string, spec: Hu
     });
   }
 
+  // The null on the board before anything is argued. Without it the benign
+  // explanation is only ever an objection, never a competing claim.
+  if (spec.hypothesis_loop) {
+    ledger.append({
+      kind: "hypothesis",
+      payload: {
+        hypothesis_id: newId("h", 4),
+        statement: NULL_HYPOTHESIS,
+        status: "active",
+        attack_technique: null,
+        provenance: BASE_RATE_PROVENANCE,
+        resolution_reason: null,
+        evidence_strength: null,
+      },
+    });
+  }
+
   // Raised whichever way the policy falls, so the approval is a ledger fact
-  // rather than something the CLI remembers: an approval that isn't on the
+  // rather than something a caller remembers. An ask with nothing pending deadlocks.
   const checkpoint = raiseCheckpoint(
     "hypothesis_approval",
     0,
@@ -311,6 +348,7 @@ export async function startHunt(state: State<HuntKinds>, runId: string, spec: Hu
       scope: spec.scope,
     },
   );
+  ledger.append({ kind: "checkpoint", payload: checkpoint });
   if (policy === "auto") {
     const resolution = resolveCheckpoint(checkpoint, "approve", AUTO_ACTOR, "checkpoint policy hypothesis_approval=auto");
     ledger.append({ kind: "resolution", payload: resolution });
@@ -1442,13 +1480,16 @@ export class HuntController {
     const caseId = newId("case", 4);
     this.ledger.patch("hypothesis", hypothesisId, { status: "handed_off", spawned_case_id: caseId });
 
-    const handoff = {
+    const handoff: Handoff = {
       case_id: caseId,
       hypothesis_id: hypothesisId,
       iteration,
       rationale: decision.rationale,
       created_at: new Date().toISOString(),
     };
+    // The deliverable, not a pointer to one: what IR is handed is the claim, the
+    // strength numbers, the cited records and what the hunt could not see.
+    handoff.case_markdown = renderCaseFile(this.ledger.projection, handoff);
     this.ledger.append({ kind: "handoff", payload: handoff });
     return `${hypothesisId} handed off to incident response as ${caseId}`;
   }
@@ -1464,6 +1505,17 @@ export class HuntController {
       source_system: UNDECLARED_SOURCE,
       payload: { ...record.payload, claimed_source_system: record.source_system },
     };
+  }
+
+  // One observation against every active hypothesis, "neither" included: the
+  // ruling is what makes the update auditable, not just the supports and weakens.
+  private applyRelations(decision: Decision): void {
+    const known = this.ledger.projection.hypotheses;
+    for (const relation of decision.evidence_relations ?? []) {
+      if (!this.ledger.projection.evidence.has(relation.evidence_id)) continue;
+      if (!known.has(relation.hypothesis_id)) continue;
+      this.ledger.append({ kind: "link", payload: { ...relation } });
+    }
   }
 
   private async write(
@@ -1486,6 +1538,10 @@ export class HuntController {
         created_at: new Date().toISOString(),
       },
     });
+
+    // Applied before this iteration's own dispatches append anything, so the
+    // rulings land against the observations the lead was actually shown.
+    this.applyRelations(result.decision);
 
     // Every paid call in the iteration lands in the budget counter: the workers
     // are the largest share of a real hunt's spend, and a max_cost_usd that only
@@ -1720,10 +1776,8 @@ export class HuntController {
     this.finalize();
   }
 
-  // The deliverable. Journaled structured so the fold stays the source of truth,
-  // and rendered beside the ledger so an operator has something to read — the
-  // Journaled, not written: the report is a fold over the ledger, so rendering it
-  // to a file beside one would be a second copy that can disagree.
+  // Journaled, not written: the report is a fold over the ledger, so a file
+  // beside one would be a second copy that can disagree with it.
   private finalize(): void {
     this.ledger.append({ kind: "finalize", payload: buildReport(this.ledger.projection) });
   }
