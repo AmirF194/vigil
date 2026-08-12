@@ -91,6 +91,7 @@ NOT_SETTINGS = {
     "GRAFANA_PASSWORD",
     "VITE_EXTENSION_ORIGIN_ALLOWLIST",
     # Read by the TypeScript agent worker's own process, not by Settings.
+    "AGENT_HTTP_PORT",
     "VIGIL_PLAYBOOKS_URL",
     "VIGIL_RUNS_URL",
     "VIGIL_TOOLS_URL",
@@ -118,7 +119,9 @@ def _documented_keys() -> set:
 
 @pytest.mark.unit
 def test_every_setting_is_documented():
-    undocumented = sorted({n.upper() for n in Settings.model_fields} - _documented_keys())
+    undocumented = sorted(
+        {n.upper() for n in Settings.model_fields} - _documented_keys()
+    )
     assert not undocumented, (
         "Settings fields missing from env.example. Every knob must be "
         "discoverable there:\n  " + "\n  ".join(undocumented)
