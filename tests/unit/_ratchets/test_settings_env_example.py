@@ -90,8 +90,14 @@ NOT_SETTINGS = {
     "BIND_HOST",
     "GRAFANA_PASSWORD",
     "VITE_EXTENSION_ORIGIN_ALLOWLIST",
-    # Read by the TypeScript agent worker's own process, not by Settings.
+    # Read by the TypeScript agent processes themselves, not by Settings.
+    "AGENT_HEALTH_PORT",
     "AGENT_HTTP_PORT",
+    # The agent worker's Redis parts. Python has no equivalent -- it reads
+    # REDIS_URL, which is a Setting.
+    "REDIS_HOST",
+    "REDIS_PORT",
+    "REDIS_DB",
     "VIGIL_PLAYBOOKS_URL",
     "VIGIL_PRICING_URL",
     "VIGIL_RUNS_URL",

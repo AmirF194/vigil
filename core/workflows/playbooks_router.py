@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from core.agents.internal_auth import authorise
@@ -20,7 +20,8 @@ ROUTER_META = RouterMeta(
     tags=["internal-playbooks"],
     auth=Auth.ROUTER_MANAGED,
     reason=(
-        "Loopback plus a shared secret: the caller is the agent layer, not a session."
+        "A shared secret: the caller is the agent layer, not a session. Reachability\n"
+        "is the NetworkPolicy's job since ADR 0014, not a loopback check."
     ),
 )
 logger = logging.getLogger(__name__)
@@ -34,10 +35,9 @@ class ResolvedPlaybook(BaseModel):
 @router.get("/{workflow_id}", response_model=ResolvedPlaybook)
 def get_playbook(
     workflow_id: str,
-    request: Request,
     authorization: Optional[str] = Header(default=None),
 ) -> ResolvedPlaybook:
-    authorise(request, authorization, "playbook resolution")
+    authorise(authorization, "playbook resolution")
 
     try:
         playbook, config = resolve(workflow_id)

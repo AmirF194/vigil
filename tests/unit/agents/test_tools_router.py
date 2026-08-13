@@ -15,7 +15,8 @@ def client(monkeypatch):
     monkeypatch.setattr(internal_auth, "get_secret", lambda name: "shhh")
     app = FastAPI()
     app.include_router(tools_router.router, prefix=tools_router.ROUTER_META.prefix)
-    return TestClient(app, client=("127.0.0.1", 50000))
+    # No `client=` address: nothing reads the peer since ADR 0014.
+    return TestClient(app)
 
 
 def _answers(monkeypatch, result, handled=True):
@@ -53,11 +54,9 @@ class TestAuthorisation:
         assert response.status_code == 503
         assert "AGENT_INTERNAL_TOKEN" in response.json()["detail"]
 
-    def test_refuses_a_caller_that_is_not_loopback(self, client, monkeypatch):
-        monkeypatch.setattr(internal_auth, "_loopback", lambda request: False)
-        assert _invoke(client).status_code == 403
-
-    def test_a_loopback_bearer_gets_through(self, client, monkeypatch):
+    def test_a_valid_bearer_gets_through(self, client, monkeypatch):
+        """No longer loopback-gated: ADR 0014 left the token as the only check,
+        because the agent layer now calls in from its own pods."""
         _answers(monkeypatch, [])
         assert _invoke(client).status_code == 200
 
