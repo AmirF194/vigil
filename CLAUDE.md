@@ -14,7 +14,12 @@ This file provides guidance for AI assistants (Claude Code and similar tools) wo
   mitre_analyst, forensics, threat_intel, compliance, malware_analyst,
   network_analyst, auto_responder. (The README says "12" — it omits
   `auto_responder`.)
-- **Workflows** — Multi-agent orchestrated playbooks (Incident Response, Full Investigation, Threat Hunt, Forensic Analysis)
+- **Workflows** — Multi-agent orchestrated playbooks (Incident Response, Full
+  Investigation, Threat Hunt, Forensic Analysis, Cloud Incident). Four are
+  **compose** playbooks and walk their `phases:` in order. `threat-hunt` declares
+  `run_kind: hunt` and runs the **hypothesis loop** instead — a Hunt Lead picks
+  each move from what the evidence did to each belief, so its `phases:` block is
+  a dispatch roster rather than an order.
 - **Integrations** — 40 MCP servers in `mcp-config.json` (Splunk, CrowdStrike, VirusTotal, Shodan, Timesketch, Jira, Slack, etc.). Count only dict-valued keys: the `mcpServers` object also holds 7 `_comment_*` string keys used as section separators.
 
 **Ports:**
@@ -48,8 +53,6 @@ vigil/
 │       ├── services/     # Axios API client services
 │       └── contexts/     # React Context (auth, theme)
 ├── tools/                # MCP tool implementations (15+ integrations)
-├── mcp-servers/          # Git submodule: MCP server implementations
-├── deeptempo-core/       # Git submodule: core AI/detection library
 ├── core/                 # Shared library: capability domains + a storage/platform tier; API routers colocate at core/<domain>/*_router.py
 │   ├── llm/              # The LLM layer: router/, harness/, providers/, cost/ — see core/llm/README.md
 │   └── workflows/definitions/  # Workflow definitions as WORKFLOW.md files (incident-response, full-investigation, threat-hunt, forensic-analysis, cloud-incident)
@@ -391,7 +394,7 @@ No registration step — discovery mounts every module that exports a `router` a
 
 ### New MCP Integration
 
-1. Implement the MCP server in `tools/your_tool.py` or `mcp-servers/`
+1. Implement the MCP server in `tools/your_tool.py` (or `tools/mcp/` for one that talks to Vigil's own services)
 2. Add the server definition to `mcp-config.json`
 3. Expose via `services/mcp_service.py` if needed
 4. Document in `docs/INTEGRATIONS.md`
@@ -405,9 +408,15 @@ No registration step — discovery mounts every module that exports a `router` a
 
 ### New Workflow
 
-1. Create `workflows/your-workflow/WORKFLOW.md` following existing format
+1. Create `core/workflows/definitions/your-workflow/WORKFLOW.md` following existing format
 2. Define agent sequence, tools, and phase instructions
 3. Register in workflow service if needed
+
+For a hypothesis-driven hunt instead of a phase chain, declare `run_kind: hunt`
+and state `hypotheses` (required — a hunt with nothing to test is refused),
+`attack_techniques` and `data_domains`. `playbook_resolver.resolve_hunt()` binds
+the capabilities `services/agent/arch/threathunt.yaml` declares to whatever tools
+the deployment carries, dropping any it has none for.
 
 ### New API Endpoint
 
@@ -466,7 +475,7 @@ All CI checks must pass before merging.
 
 ## Submodules
 
-This repo uses three Git submodules:
+This repo uses one Git submodule:
 
 ```bash
 # Initialize after cloning
@@ -478,11 +487,15 @@ git submodule update --remote
 
 | Submodule | Path | Purpose |
 |-----------|------|---------|
-| `deeptempo-core` | `./deeptempo-core` | Core AI and detection library |
-| `mcp-servers` | `./mcp-servers` | MCP server implementations |
 | `mempalace` | `./mempalace` | Agent memory / knowledge palace |
 
-All three are installed as editable packages (`-e ./deeptempo-core`, `-e ./mcp-servers`, `-e ./mempalace`) in `requirements.txt`. If submodules aren't initialized, `start.sh` skips their installation gracefully.
+Installed as an editable package (`-e ./mempalace`) in `requirements.txt`. If it
+is not initialized, `start.sh` skips the install gracefully.
+
+`deeptempo-core` and `mcp-servers` were submodules until they were dropped: the
+former had **no production importer** in this repo, and the latter's four servers
+are vendored at `tools/mcp/`, reading Vigil's own approval service, data service,
+`DatabaseService` and `get_integration_config` rather than `deeptempo_core`'s.
 
 `mempalace` ships its own `tests/benchmarks/`, which a bare `pytest` from the
 repo root tries to collect and fails on. Scope your runs the way CI does
