@@ -1,1 +1,0 @@
-"""azure-ad integration slice."""

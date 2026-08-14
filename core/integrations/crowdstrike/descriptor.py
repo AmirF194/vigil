@@ -10,7 +10,7 @@ CROWDSTRIKE = register_descriptor(
     IntegrationDescriptor(
         id="crowdstrike",
         category="EDR",
-        mcp_server_names=("crowdstrike",),
+        mcp_server_name="crowdstrike-server",
         fields=(
             IntegrationField("client_id"),
             IntegrationField("client_secret", secret=True),

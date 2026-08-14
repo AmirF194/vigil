@@ -6,8 +6,7 @@ from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
 import mcp.server.stdio
-from core.integrations._base.config import resolve
-from core.integrations.anyrun.descriptor import ANYRUN
+from core.config import get_integration_config
 
 logger = logging.getLogger(__name__)
 server = Server("anyrun")
@@ -29,7 +28,7 @@ async def handle_list_tools():
 
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict | None):
-    config = resolve(ANYRUN)
+    config = get_integration_config('anyrun')
     api_key = config.get('api_key')
     if not api_key:
         return result({"error": "Any.Run not configured"})

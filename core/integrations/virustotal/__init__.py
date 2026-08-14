@@ -1,1 +1,0 @@
-"""virustotal integration slice."""

@@ -1,1 +1,0 @@
-"""carbon-black integration slice."""

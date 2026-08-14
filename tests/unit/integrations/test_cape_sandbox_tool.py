@@ -1,4 +1,4 @@
-"""Unit tests for core/integrations/cape_sandbox/tool.py.
+"""Unit tests for tools/cape_sandbox.py.
 
 We test the pure helpers (IOC extraction from a CAPE report) and the tool
 dispatcher with ``requests`` fully mocked. No CAPE instance required.
@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-import core.integrations.cape_sandbox.tool as cape
+import tools.cape_sandbox as cape
 
 
 @pytest.mark.unit

@@ -1,1 +1,0 @@
-"""misp integration slice."""

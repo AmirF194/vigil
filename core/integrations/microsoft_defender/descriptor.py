@@ -1,4 +1,4 @@
-"""Microsoft Defender descriptor — source of truth for its registry entries."""
+"""Microsoft Defender integration descriptor — source of truth for registry entries."""
 
 from core.integrations._base.descriptor import (
     IntegrationDescriptor,
@@ -10,11 +10,7 @@ MICROSOFT_DEFENDER = register_descriptor(
     IntegrationDescriptor(
         id="microsoft-defender",
         category="EDR",
-        mcp_server_names=("microsoft-defender",),
-        fields=(
-            IntegrationField("tenant_id"),
-            IntegrationField("client_id"),
-            IntegrationField("client_secret", secret=True),
-        ),
+        mcp_server_name="microsoft-defender-server",
+        fields=(IntegrationField("client_secret", secret=True),),
     )
 )

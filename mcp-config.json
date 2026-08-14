@@ -232,7 +232,7 @@
 
     "alienvault-otx": {
       "command": "python3",
-      "args": ["core/integrations/alienvault_otx/tool.py"],
+      "args": ["tools/alienvault_otx.py"],
       "cwd": "${workspaceFolder}",
       "env": {
         "_note": "Kept as custom tool. Consider consolidating with FastMCP ThreatIntel (multi-source: OTX + VT + AbuseIPDB + IPinfo) when available as a stable package."
@@ -243,7 +243,7 @@
 
     "palo-alto": {
       "command": "python3",
-      "args": ["core/integrations/palo_alto/tool.py"],
+      "args": ["tools/palo_alto.py"],
       "cwd": "${workspaceFolder}",
       "env": {
         "_note": "Kept as custom tool. Prisma AIRS MCP (official, Jan 2026) focuses on securing AI agents, not PAN-OS firewall management. Evaluate if it covers block_ip/get_threats use cases."
@@ -263,7 +263,7 @@
 
     "carbon-black": {
       "command": "python3",
-      "args": ["core/integrations/carbon_black/tool.py"],
+      "args": ["tools/carbon_black.py"],
       "cwd": "${workspaceFolder}"
     },
 
@@ -290,13 +290,13 @@
 
     "microsoft-teams": {
       "command": "python3",
-      "args": ["core/integrations/microsoft_teams/tool.py"],
+      "args": ["tools/microsoft_teams.py"],
       "cwd": "${workspaceFolder}"
     },
 
     "azure-ad": {
       "command": "python3",
-      "args": ["core/integrations/azure_ad/tool.py"],
+      "args": ["tools/azure_ad.py"],
       "cwd": "${workspaceFolder}",
       "env": {
         "_note": "Microsoft Entra (Azure AD rebrand) may be accessible via Sentinel MCP or Okta MCP for identity use cases. Evaluate."
@@ -305,25 +305,25 @@
 
     "misp": {
       "command": "python3",
-      "args": ["core/integrations/misp/tool.py"],
+      "args": ["tools/misp.py"],
       "cwd": "${workspaceFolder}"
     },
 
     "hybrid-analysis": {
       "command": "python3",
-      "args": ["core/integrations/hybrid_analysis/tool.py"],
+      "args": ["tools/hybrid_analysis.py"],
       "cwd": "${workspaceFolder}"
     },
 
     "anyrun": {
       "command": "python3",
-      "args": ["core/integrations/anyrun/tool.py"],
+      "args": ["tools/anyrun.py"],
       "cwd": "${workspaceFolder}"
     },
 
     "cape-sandbox": {
       "command": "python3",
-      "args": ["core/integrations/cape_sandbox/tool.py"],
+      "args": ["tools/cape_sandbox.py"],
       "cwd": "${workspaceFolder}",
       "env": {
         "CAPE_SANDBOX_URL": "${CAPE_SANDBOX_URL}",
@@ -333,13 +333,13 @@
 
     "ip-geolocation": {
       "command": "python3",
-      "args": ["core/integrations/ip_geolocation/tool.py"],
+      "args": ["tools/ip_geolocation.py"],
       "cwd": "${workspaceFolder}"
     },
 
     "url-analysis": {
       "command": "python3",
-      "args": ["core/integrations/url_analysis/tool.py"],
+      "args": ["tools/url_analysis.py"],
       "cwd": "${workspaceFolder}"
     },
 

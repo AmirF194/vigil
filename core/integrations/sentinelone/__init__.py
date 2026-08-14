@@ -1,1 +1,0 @@
-"""sentinelone integration slice."""
