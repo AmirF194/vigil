@@ -12,17 +12,24 @@ export interface Memory {
   remember(note: string): Promise<void>;
 }
 
-// Deliberately the ledger repository's public surface, so Postgres satisfies it
-// with no adapter. seq is assigned here: no caller picks its position in the log.
+// Snapshots are excluded unless asked for, and `since` reads only what is new.
+// The fold runs once per tool turn, so a full read there is quadratic in a run.
+export interface ReadOptions {
+  since?: number;
+  snapshots?: boolean;
+}
+
+// Deliberately the ledger repository's public surface, so Postgres satisfies it with
+// no adapter. The store assigns seq: a position read before a turn is stale after it.
 export interface State<Kinds extends Record<string, unknown> = Record<never, never>> {
   latestSeq(runId: string): Promise<number | null>;
-  read(runId: string): Promise<AgentEvent<Kinds>[]>;
-  append(runId: string, from: number, events: readonly NewEvent<Kinds>[]): Promise<number>;
+  read(runId: string, opts?: ReadOptions): Promise<AgentEvent<Kinds>[]>;
+  append(runId: string, events: readonly NewEvent<Kinds>[]): Promise<number>;
   terminal(runId: string): Promise<TerminalPayload | null>;
 }
 
-// How a call reaches its adapter, nothing more. It never scans or renders, so no
-// implementation of this port can opt a result out of being scanned.
+// How a call reaches its adapter, nothing more; it never scans or renders. The
+// signal is the run's: a worker that lost its lease drops the calls in flight.
 export interface ToolDispatch {
-  invoke(tool: RegisteredTool, args: Record<string, unknown>): Promise<ToolResult>;
+  invoke(tool: RegisteredTool, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult>;
 }

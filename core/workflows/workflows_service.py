@@ -15,7 +15,14 @@ logger = logging.getLogger(__name__)
 # What a workflow definition runs as, and how a job names one. Both belong to the
 # agent layer's vocabulary, so they are stated here once rather than inline.
 COMPOSE_RUN_KIND = "compose"
+HUNT_RUN_KIND = "hunt"
 WORKFLOW_SCHEME = "workflow:"
+
+
+def _nothing_to_run(workflow: "WorkflowDefinition") -> str:
+    if workflow.run_kind == HUNT_RUN_KIND:
+        return "" if workflow.metadata.get("hypotheses") else "hypotheses"
+    return "" if workflow.phases else "phases"
 
 
 # Real YAML rather than the regex reader this replaced. That reader could not carry
@@ -91,6 +98,14 @@ class WorkflowDefinition:
                 if tool not in seen:
                     seen.append(tool)
         return seen
+
+    # Which loop drives this definition. compose walks the phases in order; hunt
+    # runs the hypothesis loop over what the definition states. Declared, because
+    # a definition that states hypotheses is asking for a different thing.
+    @property
+    def run_kind(self) -> str:
+        declared = self.metadata.get("run_kind")
+        return str(declared) if declared else COMPOSE_RUN_KIND
 
     @property
     def use_case(self) -> str:
@@ -331,11 +346,13 @@ class WorkflowsService:
         if not workflow:
             return {"success": False, "error": f"Workflow not found: {workflow_id}"}
         # Caught here as well as in the resolver, so a definition with nothing to
-        # run is refused before it leaves a run record behind.
-        if not workflow.phases:
+        # run is refused before it leaves a run record behind. The two loops read
+        # different sections, so they are empty in different ways.
+        missing = _nothing_to_run(workflow)
+        if missing:
             return {
                 "success": False,
-                "error": f"Workflow declares no phases: {workflow_id}",
+                "error": f"Workflow declares no {missing}: {workflow_id}",
             }
 
         workflow_dict = workflow.to_dict(include_body=False)
@@ -356,7 +373,9 @@ class WorkflowsService:
 
         job = build_start_job(
             run_id=run_id,
-            run_kind=COMPOSE_RUN_KIND,
+            # The definition's, not a constant: threat-hunt drives the hypothesis
+            # loop and the other four walk their phases, from one entry point.
+            run_kind=workflow.run_kind,
             request={
                 # A reference, not a path: the agent layer asks for the resolved
                 # layers at run start, so an edited definition reaches the next run.

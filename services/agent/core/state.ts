@@ -1,15 +1,13 @@
 import { EVENT_SCHEMA_VERSION, type AgentEvent, type NewEvent, type TerminalPayload } from "../contracts/events.js";
-import { SeqConflict } from "../ledger/repository.js";
-import type { State } from "./seams.js";
+import type { ReadOptions, State } from "./seams.js";
 
 // The State seam without Postgres. It reproduces rather than approximates the
 // composite key's guarantees, so a caller cannot tell the two implementations apart.
 export class InProcessState<Kinds extends Record<string, unknown> = Record<never, never>> implements State<Kinds> {
   private readonly runs = new Map<string, AgentEvent<Kinds>[]>();
 
-  // The store's clock, injectable for the same reason the lease's is: a run parked
-  // past its TTL is behaviour that only exists in the past, and no caller may
-  // supply a ts, so a test has to move the store's clock to reach it.
+  // The store's clock, injectable like the lease's: no caller may supply a ts, so
+  // reaching a run parked past its TTL means moving this.
   constructor(private readonly now: () => number = Date.now) {}
 
   private log(runId: string): AgentEvent<Kinds>[] {
@@ -25,22 +23,26 @@ export class InProcessState<Kinds extends Record<string, unknown> = Record<never
     return log.length === 0 ? null : Math.max(...log.map((event) => event.seq));
   }
 
-  async read(runId: string): Promise<AgentEvent<Kinds>[]> {
-    return structuredClone(this.log(runId)).sort((left, right) => left.seq - right.seq);
+  async read(runId: string, opts: ReadOptions = {}): Promise<AgentEvent<Kinds>[]> {
+    const since = opts.since ?? 0;
+    const rows = structuredClone(this.log(runId).filter((event) => event.seq >= since));
+    rows.sort((left, right) => left.seq - right.seq);
+    if (opts.snapshots === true) return rows;
+    return rows.map(({ snapshot: _dropped, ...rest }) => rest as AgentEvent<Kinds>);
   }
 
-  async append(runId: string, from: number, events: readonly NewEvent<Kinds>[]): Promise<number> {
-    if (events.length === 0) return from;
+  // The position comes from the log, never from the caller. Nothing is awaited
+  // inside the loop, so a batch lands as atomically as the Postgres transaction.
+  async append(runId: string, events: readonly NewEvent<Kinds>[]): Promise<number> {
     const log = this.log(runId);
-    const end = from + events.length;
-    if (log.some((event) => event.seq >= from && event.seq < end)) throw new SeqConflict(runId, from);
+    let seq = log.reduce((highest, event) => Math.max(highest, event.seq), -1);
+    if (events.length === 0) return seq + 1;
 
     const ts = new Date(this.now()).toISOString();
-    let seq = from;
     for (const event of events) {
-      log.push({ ...event, seq: seq++, ts, schema_version: EVENT_SCHEMA_VERSION } as AgentEvent<Kinds>);
+      log.push({ ...event, seq: ++seq, ts, schema_version: EVENT_SCHEMA_VERSION } as AgentEvent<Kinds>);
     }
-    return seq;
+    return seq + 1;
   }
 
   async terminal(runId: string): Promise<TerminalPayload | null> {

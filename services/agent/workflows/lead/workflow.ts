@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import pLimit from "p-limit";
 import type { DispatchPayload, NewEvent, RunKind, RunOutcome } from "../../contracts/events.js";
 import { journalAnswers, noAnswers, type Answers } from "../../core/answers.js";
+import { announceOpen, noAnnounce, type Announce } from "../../core/checkpoints.js";
 import { commitTurn, type Harness, type Outcome, type TurnConfig } from "../../core/loop.js";
 import { drain, streamTurn } from "../../core/stream.js";
 import { SpecError, type RoleSpec, type RunSpec } from "../../core/spec.js";
@@ -40,6 +41,9 @@ export interface LeadOptions {
   // Where an answer to a parked call comes from. Defaults to nobody, so a run
   // with no source parks and stays parked rather than proceeding unapproved.
   answers?: Answers;
+  // How a human is told a run has parked. Defaults to nobody, and a checkpoint
+  // nobody is told about is one nobody answers.
+  announce?: Announce;
   // Aborted when this worker loses its lease. The provider request carries it, so
   // a worker that has been declared dead stops paying for a call nobody records.
   signal?: AbortSignal;
@@ -77,25 +81,27 @@ export async function runLead(harness: Harness<LeadKinds>, options: LeadOptions)
   const topology = topologyFor(spec.dispatch.topology);
   const rounds: Round[] = [];
   for (;;) {
-    // Per iteration, not once per resume. The loop reads the ledger to decide
-    // whether it is still parked, so an answer journaled after that check used to
-    // wait for a whole resume; now it waits for one iteration boundary.
+    // Per iteration, not once per resume: an answer journaled after the parked check
+    // waits for one iteration boundary rather than a whole resume.
     await journalAnswers(harness.state, run_id, options.run_kind, options.answers ?? noAnswers);
 
     const outcome = await drain(streamTurn<Decision, LeadKinds>(turnFor(options, "lead", lead, brief(spec)), harness));
     if (outcome.status === "waiting_approval") {
-      await commitTurn(harness.state, run_id, outcome, []);
+      // Announced every time the run is looked at, not only when it first parks:
+      // the far side is idempotent, and a notice lost to a restart is re-sent.
+      if (outcome.pending !== null) {
+        await announceOpen(harness.state, run_id, options.run_kind, outcome.pending.checkpoint_id, options.announce ?? noAnnounce);
+      }
       return { ...(await report(harness, options)), status: "waiting_approval", reason: outcome.reason, pending: outcome.pending };
     }
     if (outcome.status === "failed" || outcome.value === null) {
-      await commitTurn(harness.state, run_id, outcome, []);
       return end(harness, options, outcome.refusal === null ? "failed" : "budget_exhausted", outcome.reason);
     }
 
     const decision = outcome.value;
     const selection = { worker: named(spec, decision), task: decision.query_intent ?? decision.rationale };
     const assignments = topology.assign(selection, spec);
-    await commitTurn(harness.state, run_id, outcome, [
+    await commitTurn(harness.state, run_id, [
       event(options, "decision", { action: decision.action, rationale: decision.rationale, worker: selection.worker }),
     ]);
 
@@ -118,9 +124,8 @@ function named(spec: RunSpec, decision: Decision): string | null {
   return typeof id === "string" && id in spec.roles.workers ? id : null;
 }
 
-// The model turns may overlap; the ledger may not. A parallel round runs its
-// turns together, then writes them one after another from a single position, so
-// the run is still the only writer and a second one still collides.
+// Turns may overlap and so may their writes; every position is the store's. What a
+// round owes is order, so it commits in assignment order once the turns are in.
 async function dispatchAll(harness: Harness<LeadKinds>, options: LeadOptions, assignments: readonly Assignment[]): Promise<void> {
   if (assignments.length === 0) return;
   if (options.spec.dispatch.mode === "serial") {
@@ -131,11 +136,7 @@ async function dispatchAll(harness: Harness<LeadKinds>, options: LeadOptions, as
   // Capped at what the arch allows to run at once, not at how many were assigned.
   const gate = pLimit(options.spec.dispatch.max_workers);
   const done = await Promise.all(assignments.map((assignment) => gate(() => turn(harness, options, assignment))));
-
-  // One read for the batch: a writer that moved the ledger between the round
-  // starting and this line collides here, which is the guard doing its job.
-  let at = ((await harness.state.latestSeq(options.run_id)) ?? -1) + 1;
-  for (const result of done) at = await write(harness, options, result, at);
+  for (const result of done) await write(harness, options, result);
 }
 
 interface Dispatched {
@@ -161,11 +162,8 @@ async function turn(harness: Harness<LeadKinds>, options: LeadOptions, assignmen
   return { outcome, own };
 }
 
-// at is the position this write claims. Absent, the outcome's own is used, which
-// is what a serial round wants: one turn, committed where it started.
-async function write(harness: Harness<LeadKinds>, options: LeadOptions, result: Dispatched, at?: number): Promise<number> {
-  const from = at ?? result.outcome.from;
-  return commitTurn(harness.state, options.run_id, { from }, result.own);
+async function write(harness: Harness<LeadKinds>, options: LeadOptions, result: Dispatched): Promise<number> {
+  return commitTurn(harness.state, options.run_id, result.own);
 }
 
 function turnFor(options: LeadOptions, role: string, spec: RoleSpec, task: string): TurnConfig {
@@ -199,7 +197,7 @@ function event(options: LeadOptions, kind: Event["kind"], payload: Event["payloa
 }
 
 async function open(harness: Harness<LeadKinds>, options: LeadOptions): Promise<void> {
-  await harness.state.append(options.run_id, 0, [
+  await harness.state.append(options.run_id, [
     event(options, "run", {
       run_kind: options.run_kind,
       spec: options.spec,
@@ -212,8 +210,7 @@ async function open(harness: Harness<LeadKinds>, options: LeadOptions): Promise<
 }
 
 async function end(harness: Harness<LeadKinds>, options: LeadOptions, outcome: RunOutcome, reason: string): Promise<LeadReport> {
-  const from = ((await harness.state.latestSeq(options.run_id)) ?? -1) + 1;
-  await harness.state.append(options.run_id, from, [event(options, "terminal", { outcome, reason })]);
+  await harness.state.append(options.run_id, [event(options, "terminal", { outcome, reason })]);
   return { ...(await report(harness, options)), status: outcome, reason, pending: null };
 }
 

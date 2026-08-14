@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { archFor } from "./arch/registry.js";
 import { httpAnswers, journalAnswers, noAnswers, type Answers } from "./core/answers.js";
+import { httpAnnounce, noAnnounce, type Announce } from "./core/checkpoints.js";
 import { harnessFor, internalToken, type HarnessFactory } from "./harness.js";
 import { poolConfig, redisConfig } from "./core/db.js";
 import { healthPort, healthServer } from "./core/health.js";
@@ -26,6 +27,11 @@ import { httpMirror, nullMirror, type Mirror } from "./workflows/compose/mirror.
 import { runCompose } from "./workflows/compose/workflow.js";
 import type { ComposeKinds } from "./workflows/compose/vocabulary.js";
 import { runLead, type LeadKinds } from "./workflows/lead/workflow.js";
+import { runHunt } from "./workflows/hunt/workflow.js";
+import type { HuntKinds } from "./workflows/hunt/ledger.js";
+import type { DirectiveQueue } from "./workflows/hunt/ports.js";
+import { InProcessDirectiveQueue } from "./workflows/hunt/directives.js";
+import { DirectiveRepository } from "./ledger/directives.js";
 
 type StartJob = Extract<RunJob, { reason: "start" }>;
 
@@ -69,6 +75,13 @@ function answersFor(): Answers {
   return url === undefined || url === "" ? noAnswers : httpAnswers({ url, token: internalToken() });
 }
 
+// Where a parked run's question goes. The same endpoint the answer comes back
+// from, so a deployment that can answer is one that can be told there is one.
+function announceFor(): Announce {
+  const url = process.env["VIGIL_RUNS_URL"];
+  return url === undefined || url === "" ? noAnnounce : httpAnnounce({ url, token: internalToken() });
+}
+
 function defaultResolver(): PlaybookResolver {
   return httpPlaybooks({
     url: process.env["VIGIL_PLAYBOOKS_URL"] ?? "http://localhost:6987/internal/playbooks",
@@ -106,6 +119,7 @@ async function drive(
   spec: RunSpec,
   build: HarnessFactory,
   signal: AbortSignal,
+  directives: DirectiveQueue,
 ): Promise<void> {
   const { run_kind: kind, run_id, enqueued_by: started_by } = job;
   // Folded off the ledger, so a resumed run continues its allowance instead of
@@ -114,13 +128,18 @@ async function drive(
   const seed = seedFrom(await state.read(run_id));
 
   if (kind === "compose") {
-    await runCompose(build(kind, spec, as<ComposeKinds>(state), undefined, seed), { run_id, spec, started_by, mirror: mirrorFor() });
+    await runCompose(build(kind, spec, as<ComposeKinds>(state), undefined, seed), { run_id, spec, started_by, mirror: mirrorFor(), signal });
+    return;
+  }
+  const entry = archFor(kind);
+  if (entry.workflow === "hunt") {
+    const harness = build(kind, spec, as<HuntKinds>(state), undefined, seed);
+    await runHunt(harness, { run_id, spec, actions: entry.actions, queue: directives, started_by, announce: announceFor(), signal });
     return;
   }
   if (kind === "hunt" || kind === "investigate") {
-    const entry = archFor(kind);
     const harness = build(kind, spec, as<LeadKinds>(state), undefined, seed);
-    await runLead(harness, { run_id, run_kind: kind, spec, actions: entry.actions, halts: entry.halts, started_by, answers: answersFor(), signal });
+    await runLead(harness, { run_id, run_kind: kind, spec, actions: entry.actions, halts: entry.halts, started_by, answers: answersFor(), announce: announceFor(), signal });
     return;
   }
   throw new SpecError(`no workflow is wired for run_kind ${kind}`);
@@ -139,6 +158,7 @@ export async function advance(
   leases: Leases,
   job: RunJob,
   build: HarnessFactory = harnessFor,
+  directives: DirectiveQueue = new InProcessDirectiveQueue(),
 ): Promise<void> {
   if ((await state.terminal(job.run_id)) !== null) {
     await leases.finish(job.run_id);
@@ -175,7 +195,7 @@ export async function advance(
     await journalAnswers(state, job.run_id, job.run_kind, answersFor());
 
     if (await abandonIfParkedOut(state, leases, job, spec)) return;
-    await drive(state, job, spec, build, halt.signal);
+    await drive(state, job, spec, build, halt.signal, directives);
     await settle(state, leases, job, spec, owner);
   } catch (error) {
     await abandon(job, error);
@@ -239,8 +259,7 @@ async function abandonIfParkedOut(state: State, leases: Leases, job: RunJob, spe
   if (waited === null || waited < spec.budgets.max_park_ms) return false;
 
   const days = (waited / 86_400_000).toFixed(1);
-  const from = ((await state.latestSeq(job.run_id)) ?? -1) + 1;
-  await state.append(job.run_id, from, [
+  await state.append(job.run_id, [
     {
       run_id: job.run_id,
       run_kind: job.run_kind,
@@ -347,9 +366,9 @@ export async function sweepOnce(leases: Leases, queue: Enqueue, limit = 50): Pro
 //
 // Only here, not inside advance(): what a failure means to the queue is the queue's
 // business, and advance() is driven without one by the tests and by run-once.ts.
-async function handle(state: State, leases: Leases, job: RunJob): Promise<void> {
+async function handle(state: State, leases: Leases, job: RunJob, directives: DirectiveQueue, build: HarnessFactory = harnessFor): Promise<void> {
   try {
-    await advance(state, leases, job);
+    await advance(state, leases, job, build, directives);
   } catch (error) {
     if (error instanceof SpecError) throw new UnrecoverableError(error.message);
     throw error;
@@ -366,7 +385,9 @@ export interface Running {
 // The queue drains durable runs and the HTTP surface serves chat, which is
 // synchronous and would gain nothing from a queue hop but latency. One process,
 // one pool, two ways in.
-export function startWorker(): Running {
+// The factory is a parameter so a test can stand the model in and leave the
+// queue, the ledger and the leases real, which is what the seam is made of.
+export function startWorker(build: HarnessFactory = harnessFor): Running {
   const pool = new pg.Pool(poolConfig());
   const ledger = new LedgerRepository(pool);
   const leases = new LeaseRepository(pool);
@@ -376,7 +397,8 @@ export function startWorker(): Running {
   // disagreed with it would either double-process a run or wedge one. BullMQ's
   // stalled sweep still retires a dead worker's job eventually, and the lease
   // refuses it if it comes back around.
-  const worker = new Worker<RunJob>(RUN_QUEUE, (job) => handle(ledger, leases, job.data), {
+  const directives = new DirectiveRepository(pool);
+  const worker = new Worker<RunJob>(RUN_QUEUE, (job) => handle(ledger, leases, job.data, directives, build), {
     connection,
     lockDuration: LEASE_TTL_MS * 10,
   });

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from weakref import WeakKeyDictionary
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -83,17 +85,32 @@ def build_resume_job(
     }
 
 
+_queues: "WeakKeyDictionary[asyncio.AbstractEventLoop, Queue]" = WeakKeyDictionary()
+
+
+# One per event loop, not per call: a Queue per enqueue costs a Redis connection.
+# Keyed by loop because its connection is bound to the one that made it.
+def _run_queue() -> Queue:
+    loop = asyncio.get_running_loop()
+    queue = _queues.get(loop)
+    if queue is None:
+        queue = Queue(RUN_QUEUE, {"connection": _redis_url()})
+        _queues[loop] = queue
+    return queue
+
+
+# Called on shutdown, so the connection does not outlive the loop that made it.
+async def close_run_queue() -> None:
+    queue = _queues.pop(asyncio.get_running_loop(), None)
+    if queue is not None:
+        await queue.close()
+
+
 async def enqueue_run(job: Dict[str, Any], job_id: Optional[str] = None) -> str:
-    queue = Queue(RUN_QUEUE, {"connection": _redis_url()})
+    queue = _run_queue()
     try:
-        # jobId is the run id for a start, so a double POST dedupes inside BullMQ.
-        #
-        # A resume gets its own id every time and deliberately does not dedupe. The
-        # run id is already taken by the start, and a parked run's ledger position
-        # never advances, so any id derived from either would repeat and the queue
-        # would silently drop every resume after the first -- leaving the run parked
-        # forever, which is the thing a resume exists to prevent. Run-level exclusion
-        # is the lease's, in agent_run_leases, and it is stronger than a job id.
+        # jobId is the run id for a start, so a double POST dedupes in BullMQ. A
+        # resume takes a fresh id: any derived one repeats, and the queue drops it.
         enqueued = await queue.add(
             "run",
             job,
@@ -105,8 +122,11 @@ async def enqueue_run(job: Dict[str, Any], job_id: Optional[str] = None) -> str:
         )
         logger.info("enqueued agent run %s (%s)", job["run_id"], job["run_kind"])
         return str(enqueued.id)
-    finally:
-        await queue.close()
+    except Exception:
+        # A queue that failed is not reused: the next call builds a fresh one
+        # rather than inheriting a connection that may already be gone.
+        await close_run_queue()
+        raise
 
 
 def _default_job_id(job: Dict[str, Any]) -> str:

@@ -1,4 +1,4 @@
-import { EVENT_SCHEMA_VERSION, type NewEvent, type RunKind } from "../../contracts/events.js";
+import { EVENT_SCHEMA_VERSION, type NewEvent, type RunKind, type RunPayload } from "../../contracts/events.js";
 import type { State } from "../../core/seams.js";
 import { fold, type HuntEvent, type HuntKinds, type Projection } from "./ledger.js";
 
@@ -10,10 +10,8 @@ import type { HuntState } from "./types.js";
 // naming the wrong run would write into someone else's ledger.
 export type Body = Omit<NewEvent<HuntKinds>, "run_id" | "run_kind">;
 
-// The controller's ledger, backed by the State seam. append stays synchronous so
-// the decision logic reads unchanged; flush is what makes an iteration durable.
-// It carries the directive queue as well: the two stores are both scoped to this
-// run, and holding them together is what lets a drain keep its signature.
+// The controller's ledger over the State seam. append stays synchronous so the
+// decision logic reads unchanged; flush is what makes an iteration durable.
 export class Journal {
   private events: HuntEvent[] = [];
   private pending: Body[] = [];
@@ -39,27 +37,24 @@ export class Journal {
     return journal;
   }
 
+  // The run event carries the domain-free RunPayload as well as the hunt's own
+  // state: resume reads the spec off it without knowing which workflow wrote it.
   static async create(
     state: State<HuntKinds>,
     queue: DirectiveQueue,
     runId: string,
     hunt: HuntState,
     runKind: RunKind = "hunt",
+    envelope: Partial<RunPayload> = {},
   ): Promise<Journal> {
     const journal = new Journal(state, queue, runId, runKind);
-    journal.append({ kind: "run", payload: { hunt } } as unknown as Body);
+    journal.append({ kind: "run", payload: { ...envelope, hunt } } as unknown as Body);
     await journal.flush();
     return journal;
   }
 
-  // Buffered, not written: an iteration lands as one transaction, so a crash
-  // between two of its events cannot leave half an iteration on the ledger.
-  //
-  // ts is empty rather than stamped. Only the store stamps, so an unflushed event
-  // has no time yet, and inventing one here meant this log and the persisted one
-  // disagreed about when an event happened whenever the millisecond ticked
-  // between the two. Nothing folds ts, so the value is unread until flush
-  // replaces the whole log with what the store recorded.
+  // Buffered so an iteration lands as one transaction. ts stays empty: only the
+  // store stamps, and inventing one here would disagree with what it recorded.
   append(body: Body): HuntEvent {
     const event = {
       ...body,
@@ -80,14 +75,13 @@ export class Journal {
   }
 
   // Read back rather than trusted: what the store recorded, with the seq and ts it
-  // assigned, becomes this log. Nothing here can then drift from the ledger, which
-  // is the same guarantee open() gets by loading it in the first place.
+  // assigned, becomes this log, so nothing here can drift from the ledger.
   async flush(): Promise<void> {
     if (this.pending.length === 0) return;
     const batch = this.pending;
     this.pending = [];
     const owned = batch.map((body) => ({ ...body, run_id: this.runId, run_kind: this.runKind }) as NewEvent<HuntKinds>);
-    this.written = await this.state.append(this.runId, this.written, owned);
+    this.written = await this.state.append(this.runId, owned);
     this.events = await this.state.read(this.runId);
     this.view = null;
   }

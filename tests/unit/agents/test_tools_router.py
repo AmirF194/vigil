@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from core.agents import internal_auth, tools_router
+from core.agents.mcp_tools import MCPFailure
 
 BOUNDS = {"max_rows": 2, "timeout_ms": 500}
 AUTH = {"Authorization": "Bearer shhh"}
@@ -47,8 +48,8 @@ class TestAuthorisation:
             _invoke(client, headers={"Authorization": "Bearer nope"}).status_code == 401
         )
 
+    # A deployment that never set the token must not read as a bad caller.
     def test_says_so_when_no_secret_is_configured(self, client, monkeypatch):
-        """A deployment that never set the token must not read as a bad caller."""
         monkeypatch.setattr(internal_auth, "get_secret", lambda name: None)
         response = _invoke(client)
         assert response.status_code == 503
@@ -97,13 +98,21 @@ class TestFailureKinds:
         body = _invoke(client, tool="no_such_tool").json()
         assert body["failure"]["kind"] == "refused"
 
-    def test_an_in_band_error_is_read_back_out_as_refused(self, client, monkeypatch):
-        _answers(monkeypatch, {"error": "Unknown tool: list_findings"})
-        assert _invoke(client).json()["failure"]["kind"] == "refused"
+    # backend_error, not refused: the tool ran and could not answer, which is a
+    # different thing from a name nothing implements.
+    def test_an_in_band_error_is_a_backend_error(self, client, monkeypatch):
+        _answers(monkeypatch, {"error": "the index is rebuilding"})
+        assert _invoke(client).json()["failure"]["kind"] == "backend_error"
 
     def test_bad_arguments_are_invalid_args(self, client, monkeypatch):
         _raises(monkeypatch, TypeError("unexpected keyword argument 'nope'"))
         assert _invoke(client).json()["failure"]["kind"] == "invalid_args"
+
+    # A TypeError from inside a tool is not a bad call. Reported as invalid_args it
+    # tells the model to retry with different arguments, which it does until the cap.
+    def test_a_typeerror_from_inside_the_tool_is_a_backend_error(self, client, monkeypatch):
+        _raises(monkeypatch, TypeError("unsupported operand type(s) for +: 'int' and 'str'"))
+        assert _invoke(client).json()["failure"]["kind"] == "backend_error"
 
     def test_anything_else_is_a_backend_error(self, client, monkeypatch):
         _raises(monkeypatch, RuntimeError("the database went away"))
@@ -114,3 +123,106 @@ class TestFailureKinds:
             _invoke(client, bounds={"max_rows": 0, "timeout_ms": 500}).status_code
             == 422
         )
+
+
+class TestBoundsReachTheTool:
+    # Sliced after the fact the cap never reaches the source: the tool still fetches
+    # everything and is billed for it. Anything paging on limit gets it up front.
+    def test_the_row_cap_is_pushed_into_the_call(self, client, monkeypatch):
+        seen: dict = {}
+
+        async def _capture(tool, args):
+            seen.update(args)
+            return [], True
+
+        monkeypatch.setattr("core.agents.tools_router.execute_backend_tool", _capture)
+        _invoke(client, args={"query": "x"})
+        assert seen["limit"] == BOUNDS["max_rows"]
+
+    def test_a_tighter_limit_the_caller_asked_for_is_left_alone(self, client, monkeypatch):
+        seen: dict = {}
+
+        async def _capture(tool, args):
+            seen.update(args)
+            return [], True
+
+        monkeypatch.setattr("core.agents.tools_router.execute_backend_tool", _capture)
+        _invoke(client, args={"limit": 1})
+        assert seen["limit"] == 1
+
+
+def _no_backend(monkeypatch):
+    async def fake(name, args, **kwargs):
+        return None, False
+
+    monkeypatch.setattr(tools_router, "execute_backend_tool", fake)
+
+
+def _mcp(monkeypatch, result=None, handled=True, error=None):
+    async def fake(name, args, timeout_s):
+        if error is not None:
+            raise error
+        return result, handled
+
+    monkeypatch.setattr(tools_router, "execute_mcp_tool", fake)
+
+
+# The bridge reached 23 backend tools and none of the 40 configured MCP servers,
+# so every integration the deployment carries was unreachable from an agent.
+class TestMCPFallthrough:
+    def test_serves_a_tool_no_backend_implements(self, client, monkeypatch):
+        _no_backend(monkeypatch)
+        _mcp(monkeypatch, [{"indicator": "1.2.3.4", "verdict": "malicious"}])
+
+        body = _invoke(client, tool="virustotal_lookup_ip").json()
+        assert body["ok"] is True
+        assert body["rows"][0]["verdict"] == "malicious"
+
+    # A backend tool must not reach MCP: the near side answers or nothing does.
+    def test_does_not_reach_mcp_when_the_backend_handled_it(self, client, monkeypatch):
+        _answers(monkeypatch, [{"finding_id": "f-1"}])
+
+        def _boom(name, args, timeout_s):
+            raise AssertionError("MCP was called for a backend tool")
+
+        monkeypatch.setattr(tools_router, "execute_mcp_tool", _boom)
+        assert _invoke(client).status_code == 200
+
+    # refused, not unavailable: a name nothing implements is a defect in the call,
+    # and the hunt records a visibility gap only for the other kind.
+    def test_a_name_nobody_carries_is_still_refused(self, client, monkeypatch):
+        _no_backend(monkeypatch)
+        _mcp(monkeypatch, None, handled=False)
+
+        body = _invoke(client, tool="no_such_tool").json()
+        assert body["failure"]["kind"] == "refused"
+
+    def test_a_server_that_cannot_be_reached_is_a_visibility_gap(self, client, monkeypatch):
+        _no_backend(monkeypatch)
+        _mcp(monkeypatch, error=MCPFailure("unavailable", "Unknown server: splunk"))
+
+        body = _invoke(client, tool="splunk_search").json()
+        assert body["failure"]["kind"] == "unavailable"
+
+    def test_a_slow_server_reports_the_bound_it_broke(self, client, monkeypatch):
+        _no_backend(monkeypatch)
+        _mcp(monkeypatch, error=MCPFailure("timeout", "Tool call timed out after 0.5 seconds"))
+
+        body = _invoke(client, tool="splunk_search").json()
+        assert body["failure"] == {"kind": "timeout", "timeoutMs": BOUNDS["timeout_ms"]}
+
+    def test_a_server_that_answered_badly_is_a_defect_not_a_gap(self, client, monkeypatch):
+        _no_backend(monkeypatch)
+        _mcp(monkeypatch, error=MCPFailure("backend_error", "Error: index does not exist"))
+
+        assert _invoke(client, tool="splunk_search").json()["failure"]["kind"] == "backend_error"
+
+    # The bound is the bridge's, not the near side's: an MCP tool is capped the
+    # same way a backend one is.
+    def test_caps_rows_from_an_mcp_server(self, client, monkeypatch):
+        _no_backend(monkeypatch)
+        _mcp(monkeypatch, [{"n": 1}, {"n": 2}, {"n": 3}])
+
+        body = _invoke(client, tool="splunk_search").json()
+        assert body["rowCount"] == BOUNDS["max_rows"]
+        assert body["capped"] is True

@@ -227,9 +227,8 @@ describe("an arch drives the loop", () => {
     const { spec, state, harness } = peers("parallel");
     await runLead(harness, options("hunt", spec));
 
-    // The failure this guards is silent: three turns claiming one ledger
-    // position means two collide, and a round that lost two findings still
-    // reads as a round that ran three.
+    // The failure this guards is silent: a round that lost two findings to a
+    // collision still reads as a round that ran three.
     const events = await state.read(RUN);
     expect(events.filter((event) => event.kind === "dispatch")).toHaveLength(3);
     expect(events.filter((event) => event.kind === "finding")).toHaveLength(3);
@@ -243,15 +242,15 @@ describe("an arch drives the loop", () => {
     expect(seqs).toEqual(seqs.map((_, at) => at));
   });
 
-  // The two arches grant different tools to different roles, and the registry is
-  // built from the arch: a role gets what its arch declared and nothing else.
-  it("grants each role only the tools its arch declares", () => {
+  // A role gets what its arch declared and nothing else -- either named outright
+  // or asked for as a capability the config says what provides.
+  it("grants each role the tools its arch declares or asked for by capability", () => {
     expect(grantsOf(specFor("hunt", "hunt.playbook.yaml", "hunt.config.yaml"))).toEqual({
       lead: ["expand"],
       critic: [],
-      threat_hunter: ["duckdb_query"],
-      network_analyst: ["duckdb_query"],
-      threat_intel: ["intel_lookup", "web_intel"],
+      threat_hunter: ["search_findings", "nearest_neighbors", "splunk_search"],
+      network_analyst: ["splunk_search", "search_findings"],
+      threat_intel: ["lookup_indicators"],
     });
     expect(grantsOf(specFor("investigate", "case.playbook.yaml", "case.config.yaml"))).toEqual({
       lead: ["case_records"],

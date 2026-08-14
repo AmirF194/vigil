@@ -29,7 +29,7 @@ export const INVESTIGATE: Decision = { action: "INVESTIGATE", rationale: "look",
 export const CONCLUDE: Decision = { action: "CONCLUDE", rationale: "nothing further to run" };
 export const SEED_IP: Entity = { type: "ip", value: "45.77.53.176" };
 
-const LEAD = { prompt: "lead", description: "the hunt lead", output_schema: {}, tools: [] };
+const LEAD = { prompt: "lead", description: "the hunt lead", output_schema: {}, tools: [], needs: [] };
 
 export interface SpecOverrides {
   hypotheses?: string[];
@@ -92,9 +92,8 @@ export async function newLedger(overrides: SpecOverrides = {}): Promise<Started>
   return { ledger, state, queue, runId, hypothesisIds: [...ledger.projection.hypotheses.keys()] };
 }
 
-// What an operator answering a checkpoint hours later does: nothing of the
-// writing process carries over, the ledger is the whole state — and the queue is
-// re-read, so a directive queued while nobody held the ledger is still waiting.
+// What answering a checkpoint hours later does: nothing of the writing process
+// carries over, and a directive queued while nobody held the ledger still waits.
 export async function reopen(started: Started, from?: Journal): Promise<Journal> {
   await (from ?? started.ledger).flush();
   return Journal.open(started.state, started.queue, started.runId);

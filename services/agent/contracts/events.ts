@@ -55,6 +55,9 @@ export interface DispatchPayload {
   target_hypothesis_id?: string | null;
   cost_usd?: number;
   calls?: unknown[];
+  // What a gated call returned. Written by the harness and by nothing else, and
+  // what makes an approved call run once however many times the run resumes.
+  result?: unknown;
 }
 
 // checkpoint_class and directive kind are workflow vocabulary, so they stay
@@ -68,6 +71,21 @@ export interface CheckpointPayload {
   // harness raises checkpoints too, and its approval gate carries neither.
   raised_iteration?: number;
   context?: Record<string, unknown>;
+}
+
+// The one a resolution must answer for a run to go on -- the only question a
+// supervisor actually asks of one, so every projection reports it the same way.
+export interface OpenCheckpoint {
+  checkpoint_id: string;
+  checkpoint_class: string;
+  question: string;
+  raised_at: string;
+  context: Record<string, unknown>;
+}
+
+export function openCheckpoint(checkpoint: CheckpointPayload): OpenCheckpoint {
+  const { checkpoint_id, checkpoint_class, question, raised_at } = checkpoint;
+  return { checkpoint_id, checkpoint_class, question, raised_at, context: checkpoint.context ?? {} };
 }
 
 // The resolution event is what unblocks a run, and nothing else does.

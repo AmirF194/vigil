@@ -8,13 +8,8 @@ export interface TokenCounts {
   cache_write: number;
 }
 
-// Calls, not decisions: one workflow decision costs several model calls, so a
-// deployment meaning decisions must say so where decisions are counted.
-//
-// max_park_ms is the one the pool does not enforce: how long a run may *wait* is
-// the sweeper's to hold, where the other three are the pool's. It lives here
-// because it is a ceiling on the run, journaled with the rest into the run event,
-// and tightened per run through the same overrides path.
+// Calls, not decisions: one decision costs several model calls. max_park_ms is the
+// sweeper's rather than the pool's, but it is a ceiling on the run like the rest.
 export interface BudgetLimits {
   max_calls: number;
   max_cost_usd: number;
@@ -22,12 +17,8 @@ export interface BudgetLimits {
   max_park_ms: number;
 }
 
-// Seven days to answer a checkpoint. Long, because abandoning a run journals a
-// terminal and no answer reaches it afterwards -- but not unbounded, because a
-// checkpoint answered three weeks late resumes a run whose transcript describes
-// a world that has moved on. Required rather than optional so that a deployment
-// abandoning runs after a week is something a config said, not something it
-// inherited without being asked.
+// Seven days to answer a checkpoint: abandoning is irreversible, but an answer
+// three weeks late resumes a run whose transcript describes a world that has moved.
 export const DEFAULT_PARK_MS = 604_800_000;
 
 export interface Spend {
@@ -36,28 +27,30 @@ export interface Spend {
   tokens: TokenCounts;
 }
 
-// One model call, journaled. Tokens come from the provider and are exact here; cost
-// is the backend catalog's rates applied to them, and null when nothing could be
-// asked -- an unpriced call is still a call, and losing the tokens to a pricing
-// outage would be worse than not knowing the dollars.
+// One model call, journaled. Tokens are the provider's and exact; cost is the
+// catalog's rates over them, null when nothing could price it.
 export interface SpendPayload {
   model_id: string;
   provider_type: string;
   role: string;
   tokens: TokenCounts;
   cost_usd: number | null;
-  // How the rates resolved -- "exact", "heuristic", "zero", "unknown" -- or null
-  // when nothing priced it. A $0.00 from a real catalog entry and a $0.00 nobody
-  // could price are the same number and nothing alike, and a record of money should
-  // say which it is holding.
+  // How the rates resolved, or null when nothing priced it: a $0.00 from a catalog
+  // entry and a $0.00 nobody could price are the same number and nothing alike.
   pricing_source: string | null;
 }
 
 // A value, never a throw: the exhaustiveness argument applies here or nowhere.
+// unpriced is a ceiling that cannot be measured rather than one that was reached.
 export type Refusal =
   | { reason: "calls_exhausted"; used: number; limit: number }
   | { reason: "cost_exhausted"; used_usd: number; limit_usd: number }
-  | { reason: "wall_exhausted"; used_ms: number; limit_ms: number };
+  | { reason: "wall_exhausted"; used_ms: number; limit_ms: number }
+  | { reason: "unpriced"; calls: number };
+
+// How many calls may go unpriced before a run holding a dollar ceiling stops.
+// Not one: a single blip is what the price memo already rides out.
+export const UNPRICED_TOLERANCE = 3;
 
 // What the gateway says has been spent against this run's key. Returning null
 // means it could not be read, which is not a refusal: the gateway still caps.
@@ -72,9 +65,8 @@ export interface Budget {
   readonly spent: Spend;
   beginCall(): Promise<Refusal | null>;
   record(payload: SpendPayload): void;
-  // What a call cost, so the loop can journal it and the pool can hold it against
-  // max_cost_usd. Here rather than on the harness because money is the budget's:
-  // this is the object that already owns the ceiling and the running total.
+  // What a call cost, for the ledger and for max_cost_usd. Here rather than on the
+  // harness because this object already owns the ceiling and the running total.
   priceOf(modelId: string, providerType: string, tokens: TokenCounts): Promise<Priced>;
 }
 

@@ -84,6 +84,14 @@ function requestsOf(harness: Harness): number {
 
 const HALT: ScriptedTurn = { emit: { verb: "HALT" } };
 
+// Fails the test rather than the call: nothing should reach a dispatch when the
+// ledger already holds what the call returned.
+const refusing: ToolDispatch = {
+  invoke: async () => {
+    throw new Error("the tool was invoked again after it had already run");
+  },
+};
+
 describe("the tool loop", () => {
   it("runs tools and then answers against the schema", async () => {
     const harness = harnessOf([{ calls: [{ tool: "bump", args: "{}" }] }, { calls: [] }, HALT]);
@@ -264,6 +272,41 @@ describe("the approval gate", () => {
     expect(outcome.calls[0]?.wrapped.failure).toBeNull();
   });
 
+  // The bug this closes: on a resume the transcript is empty, so the model asks for
+  // the approved call again and it goes through again -- twice, for a tool that acts.
+  it("makes an approved call once, however many times the run resumes", async () => {
+    const state = new InProcessState();
+    await seed(state, resolution("approve", approvalId(RUN, "bump", "{}")));
+    let dispatched = 0;
+    const counting: ToolDispatch = {
+      invoke: async (tool, args) => {
+        dispatched += 1;
+        return localDispatch.invoke(tool, args);
+      },
+    };
+    const script: ScriptedTurn[] = [{ calls: [{ tool: "bump", args: "{}" }] }, { calls: [] }, HALT];
+
+    for (const attempt of [1, 2, 3]) {
+      const outcome = await outcomeOf(gated, harnessOf(script, { state, dispatch: counting }));
+      expect(outcome.status).toBe("completed");
+      expect(dispatched, `attempt ${attempt} ran the tool again`).toBe(1);
+    }
+  });
+
+  // Served from the ledger, not fabricated: the model reads what the call actually
+  // returned the first time, so its reasoning is over the same rows.
+  it("serves the journaled result back to the model on a resume", async () => {
+    const state = new InProcessState();
+    await seed(state, resolution("approve", approvalId(RUN, "bump", "{}")));
+    const script: ScriptedTurn[] = [{ calls: [{ tool: "bump", args: "{}" }] }, { calls: [] }, HALT];
+
+    await outcomeOf(gated, harnessOf(script, { state }));
+    const replayed = await outcomeOf(gated, harnessOf(script, { state, dispatch: refusing }));
+
+    expect(replayed.calls[0]?.result).toEqual({ ok: true, rows: [{ n: 1 }], rowCount: 1, capped: false, sourceSystem: "test" });
+    expect(replayed.status).toBe("completed");
+  });
+
   it("treats a rejection as a refused call rather than as a park or a crash", async () => {
     const state = new InProcessState();
     await seed(state, resolution("reject", approvalId(RUN, "bump", "{}")));
@@ -429,10 +472,8 @@ describe("the status the store holds", () => {
   });
 });
 
-// The loop used to return its events for a workflow to append, so a workflow that
-// dropped them dropped the record of what the run had already spent -- invisible
-// on a resume, and a ledger that under-reports its own spend lets a resumed run
-// spend the same allowance twice.
+// The loop used to return its events for a workflow to append, so a dropped batch
+// lost the spend record -- and a resumed run spends the same allowance twice.
 describe("a workflow cannot discard what the harness burned", () => {
   it("has the spend on the ledger before the workflow is handed anything", async () => {
     const state = new InProcessState();
@@ -468,24 +509,36 @@ describe("commitTurn", () => {
     const own: NewEvent<Record<never, never>>[] = [
       { run_id: RUN, run_kind: "tally", kind: "terminal", payload: { outcome: "completed", reason: "done" } },
     ];
-    const next = await commitTurn(state, RUN, outcome, own);
+    const next = await commitTurn(state, RUN, own);
 
     const kinds = (await state.read(RUN)).map((event) => event.kind);
     expect(kinds).toEqual(["spend", "spend", "terminal"]);
     expect(next).toBe(3);
   });
 
-  // The harness's own events are already on the ledger by the time a turn ends,
-  // so from is the position after them rather than where the turn began.
-  it("starts after what the harness already wrote", async () => {
+  // The store assigns the position, so what a workflow commits lands after
+  // whatever reached the ledger while its turn was running, not on top of it.
+  it("numbers contiguously over what was already there", async () => {
     const state = new InProcessState();
     await seed(state, resolution("approve", "apr-unrelated"));
     const harness = harnessOf([{ calls: [] }, HALT], { state });
-    const outcome = await outcomeOf(config(), harness);
+    await outcomeOf(config(), harness);
 
-    expect(outcome.from).toBe(3);
-    await commitTurn(state, RUN, outcome, []);
+    await commitTurn(state, RUN, []);
     expect((await state.read(RUN)).map((event) => event.seq)).toEqual([0, 1, 2]);
+  });
+
+  // The case the parallel round hits: several turns burning against one run at
+  // once. Every position is the store's, so none of them collide.
+  it("gives concurrent turns distinct positions", async () => {
+    const state = new InProcessState();
+    const turns = Array.from({ length: 4 }, () =>
+      outcomeOf(config(), harnessOf([{ calls: [] }, HALT], { state })),
+    );
+    await Promise.all(turns);
+
+    const seqs = (await state.read(RUN)).map((event) => event.seq);
+    expect(seqs).toEqual([...seqs.keys()]);
   });
 });
 
@@ -612,5 +665,5 @@ function terminal(outcome: TerminalPayload["outcome"], reason: string): Seeded {
 
 async function seed(state: State, ...events: readonly Seeded[]): Promise<void> {
   const from = ((await state.latestSeq(RUN)) ?? -1) + 1;
-  await state.append(RUN, from, events);
+  await state.append(RUN, events);
 }

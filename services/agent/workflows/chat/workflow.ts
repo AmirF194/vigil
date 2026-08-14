@@ -31,9 +31,8 @@ export function grantsOf(spec: RunSpec): Record<string, readonly string[]> {
   return { lead: spec.tools.map((tool) => tool.id) };
 }
 
-// The client is stateless and posts the whole conversation each turn, so the
-// opening message is what the prefix caches on and the rest is history the fold
-// may take from the middle.
+// The client is stateless and posts the whole conversation each turn: the opening
+// message is what the prefix caches on, the rest is history the fold may take.
 export function conversationOf(turns: readonly Turn[]): { task: string; history: Message[] } {
   const [opening, ...rest] = turns;
   if (opening === undefined) throw new SpecError("a chat turn needs at least one message");
@@ -47,15 +46,13 @@ export async function* runChat(harness: Harness, options: ChatOptions): AsyncGen
   const turn = turnFor(options, lead);
   if ((await harness.state.latestSeq(options.run_id)) === null) await open(harness, options);
 
-  // A reader who walks away mid-answer does not un-bill the calls already made.
-  // This workflow used to catch that in a finally and journal the spend itself;
-  // the loop now writes each spend before yielding it, so there is nothing left
-  // here to compensate for and no second copy to write.
+  // A reader who walks away mid-answer does not un-bill the calls already made. The
+  // loop writes each spend before yielding it, so there is nothing to compensate.
   const stream = streamTurn<string>(turn, harness);
   for (;;) {
     const next = await stream.next();
     if (next.done) {
-      await commitTurn(harness.state, options.run_id, next.value, []);
+      await commitTurn(harness.state, options.run_id, []);
       return reportOf(next.value);
     }
     yield next.value;
@@ -108,7 +105,7 @@ function event(options: ChatOptions, kind: Event["kind"], payload: Event["payloa
 // A conversation is the run, so it opens once and stays open. Nothing writes a
 // terminal: the person may always say something else.
 async function open(harness: Harness, options: ChatOptions): Promise<void> {
-  await harness.state.append(options.run_id, 0, [
+  await harness.state.append(options.run_id, [
     event(options, "run", {
       run_kind: KIND,
       spec: options.spec,
