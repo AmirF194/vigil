@@ -255,7 +255,7 @@ class TestPhaseApprovalAcrossTheBridge:
             run_id,
             TerminalUpdate(outcome="completed", reason="all 2 phases ran", summary="s"),
             token,
-            _services()[0],
+            *_services(),
         )
 
         run = WorkflowRunService().get_run(run_id)
