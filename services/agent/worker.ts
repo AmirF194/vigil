@@ -10,6 +10,7 @@ import { poolConfig, redisConfig } from "./core/db.js";
 import { healthPort, healthServer } from "./core/health.js";
 import { jobIdFor, RUN_QUEUE, JOB_SCHEMA_VERSION, type RunJob } from "./contracts/job.js";
 import type { AgentEvent, CheckpointPayload, ResolutionPayload, RunKind, RunPayload } from "./contracts/events.js";
+import type { SpendPayload } from "./contracts/budget.js";
 import {
   LEASE_TTL_MS,
   PARK_EVERY_MS,
@@ -195,6 +196,7 @@ export async function advance(
     await journalAnswers(state, job.run_id, job.run_kind, answersFor());
 
     if (await abandonIfParkedOut(state, leases, job, spec)) return;
+    if (latest !== null) await markResumed(state, job, owner, latest);
     await drive(state, job, spec, build, halt.signal, directives);
     await settle(state, leases, job, spec, owner);
   } catch (error) {
@@ -224,6 +226,18 @@ async function forget(state: State, leases: Leases, runId: string, owner: string
   await leases.release(runId, owner, 0);
 }
 
+// Where a run was picked back up, so a crash and its recovery are readable rather
+// than a silent gap. Skipped when the last event is itself a resume: a parked run
+// is swept on every interval, and a mark per sweep would say nothing happened
+// several hundred times.
+async function markResumed(state: State, job: RunJob, owner: string, latest: number): Promise<void> {
+  const [last] = await state.read(job.run_id, { since: latest - 1 });
+  if (last?.kind === "resumed") return;
+  await state.append(job.run_id, [
+    { run_id: job.run_id, run_kind: job.run_kind, kind: "resumed", payload: { worker: owner, enqueued_by: job.enqueued_by } } as never,
+  ]);
+}
+
 export const LOST_LEASE = "the lease was reclaimed by another worker";
 
 // Which process, not which person: a directive's actor is who steered a run and
@@ -236,18 +250,42 @@ function workerName(): string {
 // run that reached terminal is nobody's; one that parked stays on the list and is
 // looked at again when its interval passes or the console pulls it forward.
 async function settle(state: State, leases: Leases, job: RunJob, spec: RunSpec, owner: string): Promise<void> {
-  if ((await state.terminal(job.run_id)) !== null) {
+  const terminal = await state.terminal(job.run_id);
+  if (terminal !== null) {
+    // Only compose was ever handed a mirror, so every other kind reached its end
+    // with nobody to tell: the console read workflow_runs and showed a finished
+    // hunt as running forever, with no duration and no cost. Off the terminal
+    // this already read, so one place reports for every kind there is.
+    if (job.run_kind !== "compose") {
+      await mirrorFor().terminal(job.run_id, {
+        outcome: terminal.outcome,
+        reason: terminal.reason,
+        summary: terminal.summary ?? "",
+        cost_usd: await spentOn(state, job.run_id),
+        handoffs: terminal.handoffs ?? [],
+      });
+    }
     await reap(leases, job.run_id);
     return;
   }
   await leases.release(job.run_id, owner, Math.min(PARK_EVERY_MS, spec.budgets.max_park_ms));
 }
 
+// What the run cost, summed from the spend events every kind writes. Nothing was
+// summing them, so a finished run showed a dash where its dollars should be.
+// A call nobody could price contributes nothing rather than a fabricated zero.
+export async function spentOn(state: State, runId: string): Promise<number> {
+  const events = (await state.read(runId)) as readonly AgentEvent<Record<never, never>>[];
+  return events
+    .filter((event) => event.kind === "spend")
+    .reduce((total, event) => total + ((event.payload as SpendPayload).cost_usd ?? 0), 0);
+}
+
 // A run that dies before it journals a terminal leaves its record open, and a
 // resolution failure dies before there is a ledger to journal one onto.
 async function abandon(job: RunJob, error: unknown): Promise<void> {
   if (job.run_kind !== "compose") return;
-  await mirrorFor().terminal(job.run_id, "failed", error instanceof Error ? error.message : String(error), "");
+  await mirrorFor().terminal(job.run_id, { outcome: "failed", reason: error instanceof Error ? error.message : String(error), summary: "" });
 }
 
 // A checkpoint nobody answered for max_park_ms. Saying so beats leaving the run
@@ -259,14 +297,13 @@ async function abandonIfParkedOut(state: State, leases: Leases, job: RunJob, spe
   if (waited === null || waited < spec.budgets.max_park_ms) return false;
 
   const days = (waited / 86_400_000).toFixed(1);
+  const reason = `parked ${days} days without an answer`;
   await state.append(job.run_id, [
-    {
-      run_id: job.run_id,
-      run_kind: job.run_kind,
-      kind: "terminal",
-      payload: { outcome: "abandoned", reason: `parked ${days} days without an answer` },
-    },
+    { run_id: job.run_id, run_kind: job.run_kind, kind: "terminal", payload: { outcome: "abandoned", reason } },
   ]);
+  // This path returns before settle, so nobody reported it: the console showed the
+  // run paused forever and its question stayed in the approvals queue for good.
+  await mirrorFor().terminal(job.run_id, { outcome: "abandoned", reason, summary: "" });
   await reap(leases, job.run_id);
   return true;
 }
@@ -375,6 +412,15 @@ async function handle(state: State, leases: Leases, job: RunJob, directives: Dir
   }
 }
 
+// How many runs one worker drives at once. Tunable because the right number is a
+// deployment's model quota divided by what a run asks of it, which this cannot know.
+export const DEFAULT_RUN_CONCURRENCY = 4;
+
+export function runConcurrency(): number {
+  const asked = Number(process.env["VIGIL_RUN_CONCURRENCY"]);
+  return Number.isInteger(asked) && asked > 0 ? asked : DEFAULT_RUN_CONCURRENCY;
+}
+
 export interface Running {
   worker: Worker<RunJob>;
   ledger: LedgerRepository;
@@ -398,8 +444,13 @@ export function startWorker(build: HarnessFactory = harnessFor): Running {
   // stalled sweep still retires a dead worker's job eventually, and the lease
   // refuses it if it comes back around.
   const directives = new DirectiveRepository(pool);
+  // BullMQ defaults to one, so a single hunt held the queue for its whole life and
+  // every other run waited it out. A run is almost entirely waiting on a model, so
+  // the ceiling is the provider's rate limit rather than this process's CPU -- the
+  // limiter already holds that line, and the lease keeps two workers off one run.
   const worker = new Worker<RunJob>(RUN_QUEUE, (job) => handle(ledger, leases, job.data, directives, build), {
     connection,
+    concurrency: runConcurrency(),
     lockDuration: LEASE_TTL_MS * 10,
   });
 
@@ -412,9 +463,11 @@ export function startWorker(build: HarnessFactory = harnessFor): Running {
   // enqueues it.
   const producer = new Queue<RunJob>(RUN_QUEUE, { connection });
   const sweeping = setInterval(() => {
-    void sweepOnce(leases, producer).catch(() => {
+    void sweepOnce(leases, producer).catch((error: unknown) => {
       // A sweep that could not read the table tries again next tick. Throwing here
-      // would take the process down with every run on it.
+      // would take the process down with every run on it. Said out loud because a
+      // watchdog failing every tick looks exactly like one with nothing to do.
+      console.warn(`sweep failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   }, SWEEP_EVERY_MS);
 

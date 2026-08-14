@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from core.agents.internal_auth import authorise
 from core.deps import provide_approvals, provide_workflow_runs
 from core.response.approval_service import ApprovalService
-from core.response.checkpoints import raise_for_checkpoint
+from core.response.checkpoints import raise_for_checkpoint, withdraw_for_run
 from core.routing import Auth, RouterMeta
 from core.workflows.workflow_run_service import WorkflowRunService
 
@@ -36,6 +36,14 @@ WAITING = "pending_approval"
 # the only one that says anything about the run as a whole.
 RUN_STATUS = {WAITING: "paused", "running": "running", "completed": "running"}
 
+# A run nobody stopped and nothing broke. Aborted and abandoned both read as
+# crashes under "failed", and only one of the three is worth paging over.
+TERMINAL_STATUS = {
+    "completed": "completed",
+    "aborted": "cancelled",
+    "abandoned": "cancelled",
+}
+
 
 class PhaseUpdate(BaseModel):
     phase_id: str
@@ -50,10 +58,18 @@ class PhaseUpdate(BaseModel):
     question: Optional[str] = None
 
 
+class TerminalHandoff(BaseModel):
+    case_id: str
+    title: str
+    markdown: str = ""
+
+
 class TerminalUpdate(BaseModel):
     outcome: str
     reason: str = ""
     summary: str = ""
+    cost_usd: Optional[float] = None
+    handoffs: List[TerminalHandoff] = Field(default_factory=list)
 
 
 class CheckpointRaised(BaseModel):
@@ -115,15 +131,42 @@ def record_terminal(
     update: TerminalUpdate,
     authorization: Optional[str] = Header(default=None),
     run_service: WorkflowRunService = Depends(provide_workflow_runs),
+    approvals: ApprovalService = Depends(provide_approvals),
 ) -> None:
     authorise(authorization, "run outcome")
 
+    withdraw_for_run(
+        run_id,
+        f"the run ended before this was answered: {update.reason or update.outcome}",
+        approvals,
+    )
+
     run_service.finalize_run(
         run_id,
-        status="completed" if update.outcome == "completed" else "failed",
+        status=TERMINAL_STATUS.get(update.outcome, "failed"),
         result_summary=update.summary or None,
         error=None if update.outcome == "completed" else update.reason,
+        cost_usd=update.cost_usd,
     )
+
+    for handoff in update.handoffs:
+        _open_case(run_id, handoff)
+
+
+# A run that ended by handing work over opens the case that receives it. The agent
+# layer holds no case table, so the document travels and this side files it.
+def _open_case(run_id: str, handoff: TerminalHandoff) -> None:
+    from core.storage.database_data_service import DatabaseDataService
+
+    try:
+        DatabaseDataService().create_case(
+            title=handoff.title[:200],
+            finding_ids=[],
+            priority="high",
+            description=handoff.markdown,
+        )
+    except Exception:  # noqa: BLE001 — the run ended either way
+        logger.exception("could not open %s handed off by %s", handoff.case_id, run_id)
 
 
 # A run parked on a checkpoint, as a question in the approvals inbox. Only the

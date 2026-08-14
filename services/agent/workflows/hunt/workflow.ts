@@ -1,14 +1,16 @@
 import { announceOpen, noAnnounce, type Announce } from "../../core/checkpoints.js";
 import type { Harness } from "../../core/loop.js";
-import type { RunOutcome } from "../../contracts/events.js";
+import type { RunOutcome, TerminalHandoff } from "../../contracts/events.js";
 import type { RunSpec } from "../../core/spec.js";
-import { disconfirmationCritic, decisionProvider, workerDispatcher } from "./adapters.js";
+import { BudgetRefused, disconfirmationCritic, decisionProvider, workerDispatcher } from "./adapters.js";
 import { huntSpec } from "./config.js";
 import { pendingCheckpoints } from "./checkpoints.js";
 import { HuntAlreadyTerminal, HuntController, HuntParked, resumeHunt, startHunt } from "./controller.js";
 import { createEnricher, type Tool } from "./enrich.js";
-import type { HuntKinds } from "./ledger.js";
+import type { HuntKinds, Projection } from "./ledger.js";
 import type { DirectiveQueue } from "./ports.js";
+import { buildReport, renderReport } from "./report.js";
+import type { Handoff } from "./types.js";
 import { expandFrom } from "./expand.js";
 import { registryOf } from "../../core/registry.js";
 import { toolsFrom } from "../../tools/remote.js";
@@ -74,7 +76,11 @@ export async function runHunt(harness: Harness<HuntKinds>, options: HuntOptions)
   );
 
   for (;;) {
-    if (options.signal?.aborted === true) return await end(harness, options, ledger, "aborted", "the worker lost its lease");
+    // Handing the run back, not ending it. This signal fires for exactly one
+    // reason -- renewal found another worker holding the lease -- so that worker
+    // is driving the run now, and a terminal written here would end the run it is
+    // in the middle of. An operator's abort is a directive and terminates above.
+    if (options.signal?.aborted === true) return report(ledger, "aborted", "the worker lost its lease");
     try {
       const iteration = await controller.advanceIteration();
       // The controller buffers an iteration and the caller makes it durable: a
@@ -89,6 +95,13 @@ export async function runHunt(harness: Harness<HuntKinds>, options: HuntOptions)
       if (error instanceof HuntParked) {
         await ledger.flush();
         return await parked(harness, options, ledger, error.message);
+      }
+      // A run that spent its allowance has ended, not failed to start. Without a
+      // terminal it stays "running" to the API and the watchdog re-enqueues it
+      // every sweep to refuse the same call again.
+      if (error instanceof BudgetRefused) {
+        await ledger.flush();
+        return await end(harness, options, ledger, "budget_exhausted", error.message);
       }
       if (error instanceof HuntAlreadyTerminal) return report(ledger, "completed", error.message);
       throw error;
@@ -106,11 +119,27 @@ async function end(
   reason: string,
 ): Promise<HuntReport> {
   if ((await harness.state.terminal(options.run_id)) === null) {
+    const summary = renderReport(buildReport(ledger.projection));
+    const handoffs = await handoffsOf(harness, options.run_id, ledger.projection);
     await harness.state.append(options.run_id, [
-      { run_id: options.run_id, run_kind: "hunt", kind: "terminal", payload: { outcome, reason } } as never,
+      { run_id: options.run_id, run_kind: "hunt", kind: "terminal", payload: { outcome, reason, summary, handoffs } } as never,
     ]);
   }
   return report(ledger, outcome, reason);
+}
+
+// The case files the hunt wrote, carried out on the terminal. Read off the events
+// rather than the fold, which keeps a handoff only as a mark on its hypothesis.
+async function handoffsOf(harness: Harness<HuntKinds>, runId: string, projection: Projection): Promise<TerminalHandoff[]> {
+  const events = await harness.state.read(runId);
+  return events
+    .filter((event) => event.kind === "handoff")
+    .map((event) => event.payload as Handoff)
+    .map((handoff) => ({
+      case_id: handoff.case_id,
+      title: projection.hypotheses.get(handoff.hypothesis_id)?.statement ?? handoff.rationale,
+      markdown: handoff.case_markdown ?? handoff.case_file ?? handoff.rationale,
+    }));
 }
 
 // What the workers were granted and nothing else: a chain runs with no decision

@@ -22,6 +22,7 @@ export const RUN_EVENT_KINDS = [
   "resolution",
   "directive",
   "patch",
+  "resumed",
   "terminal",
 ] as const;
 export type RunEventKind = (typeof RUN_EVENT_KINDS)[number];
@@ -116,9 +117,32 @@ export interface PatchPayload {
 
 // Its own kind rather than a patch to run status, so Python can report an
 // outcome with one indexed query and never reimplements the fold.
+// A run picked back up. Nothing marked one, so a run that died and recovered read
+// as one that never stopped: the gap in the record had no explanation in it.
+// Written only where the run then made progress, so a parked run swept every
+// interval leaves one mark rather than one per sweep.
+export interface ResumedPayload {
+  worker: string;
+  // Who put it back on the queue -- the watchdog, the console, an answered
+  // checkpoint. Which of those it was is the whole question a reader is asking.
+  enqueued_by: string;
+}
+
 export interface TerminalPayload {
   outcome: RunOutcome;
   reason: string;
+  // What the run leaves behind. Written by the workflow, because only it knows
+  // what its deliverable is, and read from here by whoever reports the run out.
+  summary?: string;
+  handoffs?: TerminalHandoff[];
+}
+
+// Work the run finished by giving away, each carrying the document it hands over
+// rather than a pointer to one: the receiver has no access to this ledger.
+export interface TerminalHandoff {
+  case_id: string;
+  title: string;
+  markdown: string;
 }
 
 export interface RunEventPayloads {
@@ -129,6 +153,7 @@ export interface RunEventPayloads {
   resolution: ResolutionPayload;
   directive: DirectivePayload;
   patch: PatchPayload;
+  resumed: ResumedPayload;
   terminal: TerminalPayload;
 }
 

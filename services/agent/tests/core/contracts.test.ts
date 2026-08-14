@@ -107,7 +107,7 @@ describe("the Tool port cannot be opted out of", () => {
 
 describe("event kinds are closed", () => {
   it("recognises exactly the domain-free set", () => {
-    expect(RUN_EVENT_KINDS).toHaveLength(8);
+    expect(RUN_EVENT_KINDS).toHaveLength(9);
     expect(isRunEventKind("terminal")).toBe(true);
     expect(isRunEventKind("hypothesis")).toBe(false);
   });
@@ -134,7 +134,10 @@ describe("a resume job carries nothing but its identity", () => {
   // does not, or the queue would drop every check after the first.
   it("dedupes a start on run_id and gives every resume its own id", () => {
     expect(jobIdFor(START, "unused")).toBe(START.run_id);
-    expect(jobIdFor(RESUME, "a1b2")).toBe(`${START.run_id}:a1b2`);
+    // No colon: BullMQ refuses a custom id holding one, and the sweeper is the
+    // only caller, so the throw would take every resume with it.
+    expect(jobIdFor(RESUME, "a1b2")).toBe(`${START.run_id}-a1b2`);
+    expect(jobIdFor(RESUME, "a1b2")).not.toContain(":");
     expect(jobIdFor(RESUME, "c3d4")).not.toBe(jobIdFor(RESUME, "a1b2"));
   });
 
