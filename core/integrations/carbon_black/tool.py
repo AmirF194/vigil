@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-import requests
+import httpx
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
@@ -50,7 +50,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
     
     try:
         if name == "cb_get_alerts":
-            resp = requests.post(f"{url}/appservices/v6/orgs/{org_key}/alerts/_search", headers=headers,
+            resp = httpx.post(f"{url}/appservices/v6/orgs/{org_key}/alerts/_search", headers=headers,
                 json={"rows": args.get("limit", 10)}, timeout=30)
             resp.raise_for_status()
             data = resp.json()
@@ -69,7 +69,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
             if not query:
                 return result({"error": "ip or hostname required"})
             
-            resp = requests.post(f"{url}/appservices/v6/orgs/{org_key}/devices/_search", headers=headers,
+            resp = httpx.post(f"{url}/appservices/v6/orgs/{org_key}/devices/_search", headers=headers,
                 json={"query": " OR ".join(query)}, timeout=30)
             resp.raise_for_status()
             data = resp.json()
@@ -79,7 +79,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
             did = args.get("device_id")
             if not did:
                 return result({"error": "device_id required"})
-            resp = requests.post(f"{url}/appservices/v6/orgs/{org_key}/device_actions", headers=headers,
+            resp = httpx.post(f"{url}/appservices/v6/orgs/{org_key}/device_actions", headers=headers,
                 json={"action_type": "QUARANTINE", "device_id": [did]}, timeout=30)
             resp.raise_for_status()
             return result({"success": True, "device_id": did, "action": "quarantined"})

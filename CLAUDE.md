@@ -52,7 +52,7 @@ vigil/
 │       ├── components/   # Cross-console components (auth, setup)
 │       ├── services/     # Axios API client services
 │       └── contexts/     # React Context (auth, theme)
-├── tools/                # MCP tool implementations (15+ integrations)
+├── tools/mcp/            # The MCP servers that talk to Vigil's own services
 ├── core/                 # Shared library: capability domains + a storage/platform tier; API routers colocate at core/<domain>/*_router.py
 │   ├── llm/              # The LLM layer: router/, harness/, providers/, cost/ — see core/llm/README.md
 │   └── workflows/definitions/  # Workflow definitions as WORKFLOW.md files (incident-response, full-investigation, threat-hunt, forensic-analysis, cloud-incident)
@@ -279,7 +279,7 @@ Business logic lives in `services/`, not in API route handlers. A router lives w
 
 ### MCP Tool Access
 
-Agents access external tools through the MCP protocol. Tool definitions live in `mcp-config.json`. New integrations go in `tools/` as MCP server implementations. The `services/mcp_service.py` coordinates tool access.
+Agents access external tools through the MCP protocol. Tool definitions live in `mcp-config.json`, which spawns each in-repo server as its own `python3` subprocess. A vendor's server lives in that vendor's slice as `core/integrations/<vendor>/tool.py` (see [core/integrations/README.md](core/integrations/README.md) for the inventory and the outbound-HTTP conventions); `tools/mcp/` holds the servers that talk to Vigil's own services; the rest of the 40 entries are external servers. `services/mcp_service.py` coordinates tool access.
 
 ### Database
 
@@ -394,7 +394,7 @@ No registration step — discovery mounts every module that exports a `router` a
 
 ### New MCP Integration
 
-1. Implement the MCP server in `tools/your_tool.py` (or `tools/mcp/` for one that talks to Vigil's own services)
+1. Implement the MCP server as `core/integrations/<vendor>/tool.py` (or `tools/mcp/` for one that talks to Vigil's own services) — `core/integrations/README.md` has the HTTP conventions
 2. Add the server definition to `mcp-config.json`
 3. Expose via `services/mcp_service.py` if needed
 4. Document in `docs/INTEGRATIONS.md`

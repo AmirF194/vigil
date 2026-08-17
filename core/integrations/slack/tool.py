@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-import requests
+import httpx
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
@@ -67,7 +67,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
         }
 
         try:
-            resp = requests.post(
+            resp = httpx.post(
                 "https://slack.com/api/chat.postMessage",
                 headers={
                     "Authorization": f"Bearer {token}",
