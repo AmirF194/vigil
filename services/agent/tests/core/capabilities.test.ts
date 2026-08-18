@@ -46,3 +46,53 @@ describe("binding what a role needs to what a deployment has", () => {
     expect(specWith(BASE).roles.lead?.tools).toEqual(["expand"]);
   });
 });
+
+// A reader that counts distinct values of an unconstrained string counts a value
+// nobody declared as a source of its own. The playbook states the vocabulary and
+// the schema enforces it, so a role cannot answer outside it.
+describe("constraining a worker's declared vocabulary", () => {
+  const PLAYBOOK = readFileSync(join(FIXTURES, "hunt.playbook.yaml"), "utf8");
+
+  function withDomains(domains: string[]) {
+    const entry = archFor("hunt");
+    const declared = domains.map((one) => `  - ${one}`).join("\n");
+    return assembleSpec({
+      arch: loadArch(entry.arch, entry.actions),
+      playbook: parsePlaybook(PLAYBOOK.replace("---\n", `---\ndata_domains:\n${declared}\n`), entry.owned),
+      config: parseConfig(BASE, entry.owned),
+      prompt: "go",
+    });
+  }
+
+  const dig = (value: unknown, ...path: string[]): Record<string, unknown> =>
+    path.reduce((held, key) => (held as Record<string, unknown>)[key], value) as Record<string, unknown>;
+
+  const sourceField = (spec: ReturnType<typeof withDomains>, worker: string) =>
+    dig(spec.roles.workers[worker]?.output_schema, "properties", "results", "items", "properties", "source_system");
+
+  it("narrows the field to what the playbook declared", () => {
+    const spec = withDomains(["net_flow", "dns"]);
+    expect(sourceField(spec, "network_analyst")["enum"]).toEqual(["net_flow", "dns"]);
+  });
+
+  it("narrows it for every worker, not just the one that queries", () => {
+    const spec = withDomains(["net_flow"]);
+    for (const worker of Object.keys(spec.roles.workers)) {
+      expect(sourceField(spec, worker)["enum"]).toEqual(["net_flow"]);
+    }
+  });
+
+  it("leaves the rest of the schema alone", () => {
+    const spec = withDomains(["net_flow"]);
+    expect(sourceField(spec, "network_analyst")["type"]).toBe("string");
+    const schema = spec.roles.workers["network_analyst"]?.output_schema as Record<string, never>;
+    expect(schema["required"]).toEqual(["results"]);
+  });
+
+  // A playbook that declares no vocabulary constrains nothing, which is what
+  // every compose run and every legacy hunt does.
+  it("constrains nothing when the playbook declared no vocabulary", () => {
+    const spec = specWith(BASE);
+    expect(sourceField(spec, "network_analyst")["enum"]).toBeUndefined();
+  });
+});

@@ -30,6 +30,10 @@ export interface HypothesisStanding {
   status: HypothesisStatus;
   attack_technique: string | null;
   resolution_reason: string | null;
+  // Where the belief came from: the definition, the caller, or the base rate.
+  // A console that cannot say which is which cannot show an operator that the
+  // thing they asked about is the thing being tested.
+  provenance: string;
 }
 
 export function huntProjection(runId: string, events: readonly HuntEvent[]): HuntProjection {
@@ -69,6 +73,6 @@ function why(hunt: HuntState): string {
 }
 
 function standing(hypothesis: Hypothesis): HypothesisStanding {
-  const { hypothesis_id, statement, status, attack_technique, resolution_reason } = hypothesis;
-  return { hypothesis_id, statement, status, attack_technique, resolution_reason };
+  const { hypothesis_id, statement, status, attack_technique, resolution_reason, provenance } = hypothesis;
+  return { hypothesis_id, statement, status, attack_technique, resolution_reason, provenance };
 }

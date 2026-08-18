@@ -20,10 +20,21 @@ hypotheses:
 attack_techniques:
   - T1071.001
   - T1078
+# The telemetry vocabulary, and a contract rather than a hint: a worker's
+# source_system is constrained to this list at spec build, and corroboration is
+# counted over distinct entries. A domain missing here is one no worker can name,
+# so this must describe the telemetry the deployment actually carries.
 data_domains:
-  - network
-  - authentication
+  - net_flow
+  - dns
+  - http
+  - proxy
   - endpoint
+  - process_lineage
+  - win_events
+  - auth
+  - email
+  - cloud
 
 objectives:
   - "State a hypothesis and the scope that would test it"

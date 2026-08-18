@@ -116,6 +116,9 @@ class SOCDaemon:
         self._kafka_ingestor.set_output_queue(self._processor.input_queue)
         self._processor.set_response_queue(self._responder.input_queue)
         self._processor.set_investigation_queue(self._orchestrator.investigation_queue)
+        # The scheduled hunt goes through the same intake as an alert-driven
+        # investigation, so it inherits the orchestrator's budget and reconcile.
+        self._scheduler.set_investigation_queue(self._orchestrator.investigation_queue)
 
         # Wire up metrics server with component references
         if self._metrics_server:

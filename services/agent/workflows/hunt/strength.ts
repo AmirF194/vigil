@@ -10,10 +10,21 @@ export const UNDECLARED_SOURCE = "undeclared";
 // no EDR on that subnet" is a fact about visibility that no query would ever
 export const OPERATOR_GAP_PROVENANCE = "operator_gap";
 
+// A capability the arch's roles asked for that this deployment binds no tool to.
+// Neither an operator's declaration nor a tool that failed: nothing was ever
+// installed to fail, and no query will discover it.
+export const DEPLOYMENT_GAP_PROVENANCE = "deployment_gap";
+
+// Stated rather than discovered. Both kinds name a blind spot no dispatch can
+// close, which is what separates them from a tool_failure that a retry might.
+function declaredGap(record: EvidenceRecord): boolean {
+  return record.provenance === OPERATOR_GAP_PROVENANCE || record.provenance === DEPLOYMENT_GAP_PROVENANCE;
+}
+
 // The one gap reader over evidence, which is why a new kind of blind spot
 // updates exactly this function and the count below it.
 export function isGap(record: EvidenceRecord): boolean {
-  return record.provenance === "tool_failure" || record.provenance === OPERATOR_GAP_PROVENANCE;
+  return record.provenance === "tool_failure" || declaredGap(record);
 }
 
 // What went unanswered, not how many times it failed: three retries of one query
@@ -35,8 +46,12 @@ export function openGaps(projection: Projection, hypothesisId: string): number {
   }
 
   for (const record of projection.evidence.values()) {
-    if (record.provenance !== OPERATOR_GAP_PROVENANCE) continue;
-    if (record.payload["hypothesis_id"] !== hypothesisId) continue;
+    if (!declaredGap(record)) continue;
+    // Naming no hypothesis is not naming none: a blind spot the hunt cannot
+    // attribute is one it carries into every claim it tries to settle. Nothing
+    // can answer these, so they are a floor on open_gaps for the whole run.
+    const bears = record.payload["hypothesis_id"];
+    if (bears !== null && bears !== undefined && bears !== hypothesisId) continue;
     unanswered.add(record.summary);
   }
 
