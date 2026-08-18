@@ -75,6 +75,17 @@ function boundary(history: readonly Message[], from: number): number {
   return at;
 }
 
+// The same rule on the other edge, which it did not used to have. A tail opening
+// on a tool result has lost the turn that asked for it to the summary, and the
+// provider refuses the request outright: "unexpected tool_use_id ... each
+// tool_result block must have a corresponding tool_use block in the previous
+// message". It only bites past max_messages, so a short run never sees it.
+function opening(history: readonly Message[], from: number): number {
+  let at = from;
+  while (at > 0 && history[at]?.role === "tool") at -= 1;
+  return at;
+}
+
 export function foldHistory(
   history: readonly Message[],
   summarise: Summarise,
@@ -86,7 +97,7 @@ export function foldHistory(
   // skipping those messages in both slices would drop them from the context.
   const start = boundary(history, policy.head);
   const head = history.slice(0, start);
-  const end = Math.max(start, history.length - policy.tail);
+  const end = Math.max(start, opening(history, history.length - policy.tail));
   const middle = history.slice(start, end);
   if (middle.length === 0) return { messages: history, folded: 0 };
 

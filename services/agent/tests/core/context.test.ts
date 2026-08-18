@@ -132,3 +132,41 @@ describe("the transient tail", () => {
     expect(one).toEqual(two);
   });
 });
+
+// The bug a live run died on: a 400 from the provider, "unexpected tool_use_id
+// found in tool_result blocks". boundary() protected the head edge and nothing
+// protected the tail, so a fold could open the tail on a tool result whose
+// asking turn had just been replaced by the summary note.
+describe("a fold never strands a tool result", () => {
+  const policy = { head: 2, tail: 8, max_messages: 40 };
+  const summarise = () => "…";
+
+  // Every assistant turn asks for three tools, so a raw index counted back from
+  // the end lands mid-run more often than not.
+  const history: Message[] = [];
+  for (let turn = 0; turn < 20; turn += 1) {
+    history.push({ role: "assistant", content: "", tool_calls: [{ id: `c${turn}`, tool: "search", args: "{}" }] });
+    for (const part of [0, 1, 2]) history.push({ role: "tool", call_id: `c${turn}-${part}`, content: "rows" });
+  }
+
+  it("opens the tail on the turn that asked, not on its results", () => {
+    const { messages } = foldHistory(history, summarise, policy);
+    const note = messages.findIndex((message) => message.role === "user");
+
+    expect(messages[note + 1]?.role).not.toBe("tool");
+  });
+
+  it("leaves no tool result anywhere without an assistant turn before it", () => {
+    const { messages } = foldHistory(history, summarise, policy);
+
+    messages.forEach((message, at) => {
+      if (message.role !== "tool") return;
+      const before = messages.slice(0, at).reverse().find((one) => one.role !== "tool");
+      expect(before?.role).toBe("assistant");
+    });
+  });
+
+  it("still folds something rather than giving up on the whole history", () => {
+    expect(foldHistory(history, summarise, policy).folded).toBeGreaterThan(0);
+  });
+});
