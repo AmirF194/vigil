@@ -105,9 +105,20 @@ uvicorn services.api.main:app --host 0.0.0.0 --port 6987 --reload
 # 3. Frontend
 cd clients/web && npm run dev
 
-# 4. (Optional) Daemon
+# 4. Agent layer — required for workflow runs
+./scripts/agent_up.sh
+
+# 5. (Optional) Daemon
 ./start.sh --daemon
 ```
+
+> **`start.sh` does not launch the agent layer.** Nothing else drains the BullMQ
+> `agent-runs` queue the backend enqueues to, so without `scripts/agent_up.sh` the
+> console accepts a run, reports it queued, and nothing ever picks it up — no
+> error anywhere. It starts `worker` (health :6990) and `serve` (:6989) with the
+> same environment as docker-compose's `x-agent-env` anchor; logs and pidfiles
+> land in `logs/`. Stop with
+> `kill $(cat logs/agent-worker.pid logs/agent-serve.pid)`.
 
 ### Desktop (Electron)
 
