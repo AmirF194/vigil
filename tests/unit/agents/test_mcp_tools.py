@@ -119,3 +119,28 @@ class TestIndicatorLookup:
         run = self._lookup(monkeypatch, {})
         with pytest.raises(TypeError):
             run({"indicator_type": "ip"})
+
+
+# The one branch nothing exercised: every router test monkeypatches
+# execute_mcp_tool away, so the client import inside it was never run and a name
+# that does not exist there read as a working dispatch until a real tool call.
+class TestReachingTheClient:
+    class _Registry:
+        def get_active_servers(self):
+            return ["splunk-selfhosted"]
+
+        def get_tool_names(self):
+            return ["splunk-selfhosted_splunk_nl_search"]
+
+    @pytest.mark.asyncio
+    async def test_names_the_accessor_the_client_module_actually_exports(self, monkeypatch):
+        from core.agents.mcp_tools import MCPFailure, UNAVAILABLE, execute_mcp_tool
+        import core.integrations.mcp.client as client
+
+        monkeypatch.setattr(client, "_process_client", None)
+        with pytest.raises(MCPFailure) as raised:
+            await execute_mcp_tool(
+                "splunk-selfhosted_splunk_nl_search", {}, 5.0, self._Registry()
+            )
+
+        assert raised.value.kind == UNAVAILABLE
