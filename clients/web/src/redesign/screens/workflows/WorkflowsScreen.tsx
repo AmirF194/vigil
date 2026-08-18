@@ -754,20 +754,22 @@ export function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => v
       {!!d.phases?.length && (
         <div className="modal-section" style={{ marginTop: 12 }}>
           <h4>Phases</h4>
-          <table className="tbl">
-            <thead><tr><th>#</th><th>Agent</th><th>Status</th><th>Duration</th><th>Cost</th></tr></thead>
-            <tbody>
-              {d.phases.map((p) => (
-                <tr key={p.phase_id}>
-                  <td className="muted">{p.phase_order}</td>
-                  <td>{agentMeta(p.agent_id).label}{p.error && <span className="ml-2" style={{ color: 'var(--crit)' }} title={p.error}>⚠</span>}</td>
-                  <td><span style={{ color: runStatusColor(p.status) }}>{p.status}</span></td>
-                  <td className="muted">{fmtDuration(p.duration_ms)}</td>
-                  <td className="muted">{p.cost_usd ? `$${p.cost_usd.toFixed(3)}` : '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="table-wrap">
+            <table className="tbl">
+              <thead><tr><th>#</th><th>Agent</th><th>Status</th><th>Duration</th><th>Cost</th></tr></thead>
+              <tbody>
+                {d.phases.map((p) => (
+                  <tr key={p.phase_id}>
+                    <td className="muted">{p.phase_order}</td>
+                    <td>{agentMeta(p.agent_id).label}{p.error && <span className="ml-2" style={{ color: 'var(--crit)' }} title={p.error}>⚠</span>}</td>
+                    <td><span style={{ color: runStatusColor(p.status) }}>{p.status}</span></td>
+                    <td className="muted">{fmtDuration(p.duration_ms)}</td>
+                    <td className="muted">{p.cost_usd ? `$${p.cost_usd.toFixed(3)}` : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
       {d.hunt && <HuntStandings hunt={d.hunt} />}
@@ -907,26 +909,28 @@ function HuntStandings({ hunt }: { hunt: HuntView }) {
       </div>
       {hunt.hypotheses.length === 0 && <div className="muted" style={{ padding: '4px 0' }}>No hypotheses on the board yet.</div>}
       {hunt.hypotheses.length > 0 && (
-        <table className="tbl">
-          <thead><tr><th>Statement</th><th>Technique</th><th>Standing</th></tr></thead>
-          <tbody>
-            {hunt.hypotheses.map((h) => {
-              const strength = strengthOf(h.hypothesis_id)
-              return (
-                <tr key={h.hypothesis_id}>
-                  <td>
-                    {h.statement}
-                    {h.provenance === 'operator' && <span className="chip ml-2" style={{ fontSize: 10 }}>yours</span>}
-                    {h.resolution_reason && <div className="muted text-[11px]">{h.resolution_reason}</div>}
-                    {strength && <div className="muted text-[11px]">{strengthLine(strength)}</div>}
-                  </td>
-                  <td className="muted">{h.attack_technique || '—'}</td>
-                  <td><span style={{ color: hypothesisColor(h.status) }}>{h.status}</span></td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+        <div className="table-wrap">
+          <table className="tbl">
+            <thead><tr><th>Statement</th><th>Technique</th><th>Standing</th></tr></thead>
+            <tbody>
+              {hunt.hypotheses.map((h) => {
+                const strength = strengthOf(h.hypothesis_id)
+                return (
+                  <tr key={h.hypothesis_id}>
+                    <td>
+                      {h.statement}
+                      {h.provenance === 'operator' && <span className="chip ml-2" style={{ fontSize: 10 }}>yours</span>}
+                      {h.resolution_reason && <div className="muted text-[11px]">{h.resolution_reason}</div>}
+                      {strength && <div className="muted text-[11px]">{strengthLine(strength)}</div>}
+                    </td>
+                    <td className="muted">{h.attack_technique || '—'}</td>
+                    <td><span style={{ color: hypothesisColor(h.status) }}>{h.status}</span></td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
       )}
       <OpenCheckpoint hunt={hunt} />
       <HuntGaps hunt={hunt} />
@@ -994,24 +998,26 @@ function HuntGaps({ hunt }: { hunt: HuntView }) {
     <div style={{ marginTop: 14 }}>
       <h4>Visibility gaps ({gaps.length})</h4>
       <div className="muted text-[11.5px] mb-2">Each is a blind spot, not a finding.</div>
-      <table className="tbl">
-        <thead><tr><th>Iteration</th><th>Bears on</th><th>What went unanswered</th></tr></thead>
-        <tbody>
-          {asked.map((g) => (
-            <tr key={g.key}>
-              <td className="muted">{g.iteration}</td>
-              <td className="muted">{g.hypothesis_id || 'unattributed'}</td>
-              <td>
-                {g.query_intent || g.reasons[0]}
-                {g.query_intent && g.reasons.map((reason) => (
-                  <div key={reason} className="muted text-[11px]">{reason}</div>
-                ))}
-                {g.workers > 1 && <div className="muted text-[11px]">{g.workers} workers, same question.</div>}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <div className="table-wrap">
+        <table className="tbl">
+          <thead><tr><th>Iteration</th><th>Bears on</th><th>What went unanswered</th></tr></thead>
+          <tbody>
+            {asked.map((g) => (
+              <tr key={g.key}>
+                <td className="muted">{g.iteration}</td>
+                <td className="muted">{g.hypothesis_id || 'unattributed'}</td>
+                <td>
+                  {g.query_intent || g.reasons[0]}
+                  {g.query_intent && g.reasons.map((reason) => (
+                    <div key={reason} className="muted text-[11px]">{reason}</div>
+                  ))}
+                  {g.workers > 1 && <div className="muted text-[11px]">{g.workers} workers, same question.</div>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -1048,18 +1054,20 @@ function HuntEscalations({ hunt }: { hunt: HuntView }) {
   return (
     <div style={{ marginTop: 14 }}>
       <h4>Escalated to incident response ({handoffs.length})</h4>
-      <table className="tbl">
-        <thead><tr><th>Case</th><th>Hypothesis</th><th>Why</th></tr></thead>
-        <tbody>
-          {handoffs.map((h) => (
-            <tr key={h.case_id}>
-              <td className="mono" style={{ fontSize: 11 }}>{h.case_id}</td>
-              <td className="muted">{h.hypothesis_id}</td>
-              <td>{h.rationale}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <div className="table-wrap">
+        <table className="tbl">
+          <thead><tr><th>Case</th><th>Hypothesis</th><th>Why</th></tr></thead>
+          <tbody>
+            {handoffs.map((h) => (
+              <tr key={h.case_id}>
+                <td className="mono" style={{ fontSize: 11 }}>{h.case_id}</td>
+                <td className="muted">{h.hypothesis_id}</td>
+                <td>{h.rationale}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -1071,20 +1079,22 @@ function HuntCheckpoints({ hunt }: { hunt: HuntView }) {
   return (
     <div style={{ marginTop: 14 }}>
       <h4>Checkpoints ({checkpoints.length})</h4>
-      <table className="tbl">
-        <thead><tr><th>Class</th><th>Question</th><th>Answer</th></tr></thead>
-        <tbody>
-          {checkpoints.map((c) => (
-            <tr key={c.checkpoint_id}>
-              <td className="muted">{c.class}</td>
-              <td>{c.question}</td>
-              <td className="muted">
-                {c.resolution ? `${c.resolution.answer} by ${c.resolution.actor}${c.resolution.text ? ` — ${c.resolution.text}` : ''}` : 'still pending'}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <div className="table-wrap">
+        <table className="tbl">
+          <thead><tr><th>Class</th><th>Question</th><th>Answer</th></tr></thead>
+          <tbody>
+            {checkpoints.map((c) => (
+              <tr key={c.checkpoint_id}>
+                <td className="muted">{c.class}</td>
+                <td>{c.question}</td>
+                <td className="muted">
+                  {c.resolution ? `${c.resolution.answer} by ${c.resolution.actor}${c.resolution.text ? ` — ${c.resolution.text}` : ''}` : 'still pending'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }

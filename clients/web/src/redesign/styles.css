@@ -4838,6 +4838,14 @@
    .modal-body {
       padding: 18px;
       overflow-y: auto;
+      overflow-x: hidden;
+      /* .modal-body is a flex child of the column-flex .modal; without this its
+         default min-height:auto lets it grow to its content's intrinsic size
+         instead of the space .modal actually has left, so long content pushed
+         past the modal's edge (clipped by .modal's overflow:hidden) rather than
+         scrolling inside overflow-y:auto here. */
+      flex: 1 1 auto;
+      min-height: 0;
    }
 
    /* dropdown filter menu */
