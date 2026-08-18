@@ -23,6 +23,17 @@ _FOLLOW_REDIRECTS = True
 _HTTP_ERRORS = (httpx.HTTPError, httpx.InvalidURL)
 
 
+# The REST API needs a leading command, but adding one to a query that already
+# has it makes "search" a keyword filter that silently narrows the results, and
+# breaks a generating command like tstats outright.
+def _as_search(query: str) -> str:
+    stripped = query.strip()
+    leading = stripped.split(maxsplit=1)[0].lower() if stripped else ""
+    if leading == "search" or stripped.startswith("|"):
+        return stripped
+    return f"search {stripped}"
+
+
 class SplunkService:
     """Service for interacting with Splunk API."""
     
@@ -142,7 +153,7 @@ class SplunkService:
             # Create search job
             search_url = f"{self.server_url}/services/search/jobs"
             search_data = {
-                'search': f"search {query}",
+                'search': _as_search(query),
                 'earliest_time': earliest_time,
                 'latest_time': latest_time,
                 'output_mode': 'json'

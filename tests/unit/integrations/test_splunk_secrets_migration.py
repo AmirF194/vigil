@@ -34,6 +34,10 @@ def splunk_mod(monkeypatch):
     spec.loader.exec_module(module)
     for key in ("SPLUNK_URL", "SPLUNK_USERNAME", "SPLUNK_PASSWORD", "SPLUNK_VERIFY_SSL"):
         monkeypatch.delenv(key, raising=False)
+    # Clearing the env is not clearing the credential: _read_credential asks the
+    # encrypted store first, so on a machine with Splunk configured these tests
+    # read the operator's real value. Each test that wants a store sets its own.
+    monkeypatch.setattr(module, "_get_secret", lambda key: None)
     return module
 
 
