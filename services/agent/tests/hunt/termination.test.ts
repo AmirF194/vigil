@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { BudgetLimits } from "../../contracts/budget.js";
+import { callsPerIteration, DEFAULT_BUDGETS, type Budgets } from "../../workflows/hunt/types.js";
 import { scoredFrontier } from "../../workflows/hunt/digest.js";
 import {
   DEFAULT_TERMINATION,
@@ -31,7 +31,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const CAPPED: BudgetLimits = { max_calls: 1, max_cost_usd: 10, max_wall_ms: 1_800_000, max_park_ms: 604_800_000 };
+const CAPPED: Budgets = { max_iterations: 1, max_calls: 12, max_cost_usd: 10, max_wall_ms: 1_800_000, max_park_ms: 604_800_000 };
 
 describe("the predicate, not the recommendation", () => {
   it("refuses CONCLUDE while a hypothesis is active, without spending a re-prompt", async () => {
@@ -184,7 +184,7 @@ describe("the budget checkpoint", () => {
 
   it("takes the outcome from the predicate, not from having run out of money", async () => {
     const { ledger, hypothesisIds } = await newLedger({
-      budgets: { max_calls: 2, max_cost_usd: 10, max_wall_ms: 1_800_000, max_park_ms: 604_800_000 },
+      budgets: { max_iterations: 2, max_calls: 24, max_cost_usd: 10, max_wall_ms: 1_800_000, max_park_ms: 604_800_000 },
     });
     await gapLock(ledger, hypothesisIds[0]!);
 
@@ -198,18 +198,18 @@ describe("the budget checkpoint", () => {
 
     const result = await controllerFor(ledger, [INVESTIGATE]).advanceIteration();
 
-    expect(ledger.projection.hunt.budgets.max_calls).toBe(4);
+    expect(ledger.projection.hunt.budgets.max_iterations).toBe(4);
     expect(result.iteration).toBe(2);
     expect(result.hunt_status).toBe("active");
   });
 
   it("clamps an extend to the hard ceiling and says that it clamped", async () => {
-    const { ledger, queue, runId } = await parkedHunt({ termination: { hard_max_calls: 3, hard_max_cost_usd: 12 } });
+    const { ledger, queue, runId } = await parkedHunt({ termination: { hard_max_iterations: 3, hard_max_calls: 36, hard_max_cost_usd: 12 } });
     await steer(queue, runId, "extend", "+50 iterations and $500");
 
     await controllerFor(ledger, [INVESTIGATE]).advanceIteration();
 
-    expect(ledger.projection.hunt.budgets.max_calls).toBe(3);
+    expect(ledger.projection.hunt.budgets.max_iterations).toBe(3);
     expect(ledger.projection.hunt.budgets.max_cost_usd).toBe(12);
     expect(ledger.projection.directives.map((directive) => directive.text).join(" ")).toMatch(
       /clamped to the hard ceiling/,
@@ -217,7 +217,7 @@ describe("the budget checkpoint", () => {
   });
 
   it("stays parked when the clamp leaves no room to run", async () => {
-    const { ledger, queue, runId } = await parkedHunt({ termination: { hard_max_calls: 1, hard_max_cost_usd: 10 } });
+    const { ledger, queue, runId } = await parkedHunt({ termination: { hard_max_iterations: 1, hard_max_calls: 12, hard_max_cost_usd: 10 } });
     await steer(queue, runId, "extend", "+5 iterations");
 
     await expect(controllerFor(ledger, [INVESTIGATE]).advanceIteration()).rejects.toThrow(HuntParked);
@@ -229,7 +229,7 @@ describe("the budget checkpoint", () => {
     await steer(queue, runId, "extend", "give it a bit more room");
 
     await expect(controllerFor(ledger, [INVESTIGATE]).advanceIteration()).rejects.toThrow(HuntParked);
-    expect(ledger.projection.hunt.budgets.max_calls).toBe(1);
+    expect(ledger.projection.hunt.budgets.max_iterations).toBe(1);
     expect(ledger.projection.directives.map((directive) => directive.text).join(" ")).toMatch(/granted nothing/);
   });
 
@@ -403,7 +403,7 @@ describe("Finalize runs on every terminal path", () => {
 });
 
 describe("termination is config", () => {
-  const specWith = (thresholds: Record<string, number>, budgets?: BudgetLimits) =>
+  const specWith = (thresholds: Record<string, number>, budgets?: Budgets) =>
     huntSpec({ ...huntSpecFor(), thresholds, ...(budgets ? { budgets } : {}) });
 
   it("ships the documented defaults and honours an override", () => {
@@ -415,10 +415,72 @@ describe("termination is config", () => {
   });
 
   it("refuses a ceiling under the budget it is meant to cap", () => {
-    expect(() => specWith({ hard_max_calls: 10 }, { max_calls: 30, max_cost_usd: 5, max_wall_ms: 1, max_park_ms: 604_800_000 })).toThrow(
-      /below budgets.max_calls/,
+    const over = { max_iterations: 30, max_calls: 360, max_cost_usd: 5, max_wall_ms: 1, max_park_ms: 604_800_000 };
+    expect(() => specWith({ hard_max_calls: 10 }, over)).toThrow(/below budgets.max_calls/);
+    expect(() => specWith({ hard_max_iterations: 10, max_iterations: 30 }, over)).toThrow(
+      /below budgets.max_iterations/,
     );
     expect(() => specWith({ priority_floor: 0 })).toThrow(/must be a positive number/);
     expect(() => specWith({ floor: 5 })).toThrow(/unknown thresholds key/);
+  });
+});
+
+// The regression this restores. The port aliased the hunt's budget onto the
+// harness's, so one number bounded both turns and model calls; the call meter
+// always won and a hunt spent 24 calls reaching iteration 2 of a "24" budget.
+describe("turns and model calls are different budgets", () => {
+  const specWith = (thresholds: Record<string, number>) => huntSpec({ ...huntSpecFor(), thresholds });
+
+  it("ends the hunt on the turn count rather than the call count", async () => {
+    const { ledger } = await newLedger({
+      budgets: { max_iterations: 1, max_calls: 999, max_cost_usd: 999, max_wall_ms: 1_800_000, max_park_ms: 604_800_000 },
+    });
+
+    const result = await controllerFor(ledger, [INVESTIGATE]).advanceIteration();
+    expect(result.hunt_status).toBe("parked");
+  });
+
+  // Off this spec's own fan-out, not the shipped arch's: the fixture dispatches
+  // one worker where threathunt.yaml dispatches four, and a ceiling read off the
+  // shipped shape would be wrong for both.
+  it("raises the call ceiling with the turns asked for, so calls stay a backstop", () => {
+    const spec = specWith({ max_iterations: 20 });
+    const perTurn = callsPerIteration(spec.dispatch.max_workers, spec.runtime.max_turns);
+    expect(spec.budgets.max_calls).toBe(20 * perTurn);
+    expect(perTurn).toBeGreaterThan(1);
+  });
+
+  it("leaves a call ceiling already above the derived one alone", () => {
+    const spec = huntSpec({
+      ...huntSpecFor({
+        budgets: { max_iterations: 8, max_calls: 5_000, max_cost_usd: 3, max_wall_ms: 1, max_park_ms: 1 },
+      }),
+      thresholds: { max_iterations: 2 },
+    });
+    expect(spec.budgets.max_calls).toBe(5_000);
+  });
+
+  // The ceiling shipped equal to the default, so min(24 + 5, 24) granted nothing
+  // and an operator buying headroom was told it was clamped every time.
+  it("keeps the hard ceiling above the budget it caps", () => {
+    expect(DEFAULT_TERMINATION.hard_max_iterations).toBeGreaterThan(DEFAULT_BUDGETS.max_iterations);
+    expect(specWith({ max_iterations: 30 }).termination.hard_max_iterations).toBe(60);
+  });
+
+  // huntSpec runs again over the journaled spec on every resume, so a count read
+  // only from the config would quietly restore the default mid-run.
+  it("keeps the turn count a resumed run opened with", () => {
+    const opened = huntSpec({
+      ...huntSpecFor({
+        budgets: { max_iterations: 3, max_calls: 36, max_cost_usd: 3, max_wall_ms: 1, max_park_ms: 1 },
+      }),
+      thresholds: {},
+    });
+    expect(opened.budgets.max_iterations).toBe(3);
+    expect(huntSpec(opened).budgets.max_iterations).toBe(3);
+  });
+
+  it("honours a hard ceiling the config states for itself", () => {
+    expect(specWith({ max_iterations: 30, hard_max_iterations: 31 }).termination.hard_max_iterations).toBe(31);
   });
 });

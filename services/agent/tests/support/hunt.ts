@@ -1,6 +1,6 @@
 import { InProcessState } from "../../core/state.js";
 import type { BudgetLimits } from "../../contracts/budget.js";
-import { DEFAULT_BUDGETS, DEFAULT_DISPATCH, DEFAULT_RUNTIME, type RunSpec } from "../../core/spec.js";
+import { DEFAULT_DISPATCH, DEFAULT_RUNTIME, type RunSpec } from "../../core/spec.js";
 import { DEFAULT_CHECKPOINTS, type Checkpoints } from "../../workflows/hunt/checkpoints.js";
 import {
   DEFAULT_ENRICHMENT,
@@ -23,7 +23,7 @@ import {
   type ScriptedDecision,
 } from "../../workflows/hunt/scripted.js";
 import { NULL_CHECK_PROVENANCE, unclassified } from "../../workflows/hunt/strength.js";
-import type { Decision, Entity, EvidenceRecord, LinkRelation } from "../../workflows/hunt/types.js";
+import { DEFAULT_BUDGETS, type Budgets, type Decision, type Entity, type EvidenceRecord, type LinkRelation } from "../../workflows/hunt/types.js";
 
 export const INVESTIGATE: Decision = { action: "INVESTIGATE", rationale: "look", query_intent: "baseline" };
 export const CONCLUDE: Decision = { action: "CONCLUDE", rationale: "nothing further to run" };
@@ -33,12 +33,20 @@ const LEAD = { prompt: "lead", description: "the hunt lead", output_schema: {}, 
 
 export interface SpecOverrides {
   hypotheses?: string[];
-  budgets?: BudgetLimits;
+  operatorHypotheses?: string[];
+  budgets?: Budgets;
   termination?: Partial<Termination>;
   checkpoints?: Partial<Checkpoints>;
   scope?: Record<string, unknown>;
   dispatch?: RunSpec["dispatch"];
   hypothesisLoop?: boolean;
+  // What the roles ask for and what the deployment answers with, so a test can
+  // put a capability out of reach without standing up a registry.
+  needs?: string[];
+  tools?: RunSpec["tools"];
+  // The playbook's standing brief and the job's own, which startHunt joins.
+  narrative?: string;
+  prompt?: string;
 }
 
 // Built as an object rather than parsed from three files: the loader has its own
@@ -50,7 +58,7 @@ export function huntSpecFor(overrides: SpecOverrides = {}): HuntSpec {
     model: "scripted",
     budgets: overrides.budgets ?? DEFAULT_BUDGETS,
     runtime: DEFAULT_RUNTIME,
-    tools: [],
+    tools: overrides.tools ?? [],
     approvals: [],
     thresholds: {},
     arch: "threathunt",
@@ -60,14 +68,15 @@ export function huntSpecFor(overrides: SpecOverrides = {}): HuntSpec {
     use_case: "",
     trigger_examples: [],
     phases: [],
-    prompt: "",
+    prompt: overrides.prompt ?? "",
     objectives: [],
     scope: overrides.scope ?? {},
-    narrative: "",
-    roles: { lead: LEAD, workers: {} },
+    narrative: overrides.narrative ?? "",
+    roles: { lead: { ...LEAD, needs: overrides.needs ?? [] }, workers: {} },
     dispatch: overrides.dispatch ?? DEFAULT_DISPATCH,
     digest: {},
     hypotheses,
+    operator_hypotheses: overrides.operatorHypotheses ?? [],
     attack_techniques: [],
     data_domains: [],
     enrichment: DEFAULT_ENRICHMENT,

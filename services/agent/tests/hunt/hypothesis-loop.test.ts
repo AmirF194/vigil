@@ -13,6 +13,7 @@ import type { Decision } from "../../workflows/hunt/types.js";
 import {
   bareEvidence,
   CONCLUDE,
+  evidenceOn,
   controllerFor,
   finalized,
   gapLock,
@@ -22,6 +23,7 @@ import {
   relate,
   resolve,
   ruled,
+  SEED_IP,
   type Started,
 } from "../support/hunt.js";
 
@@ -220,5 +222,28 @@ describe("stop when one dominates, or when none can", () => {
     expect(finalized(starved.ledger)[0]!.outcome).toBe("data_starved");
     expect(finalized(done.ledger)[0]!.outcome).toBe("completed");
     expect(finalized(starved.ledger)[0]!.outcome).not.toBe(finalized(done.ledger)[0]!.outcome);
+  });
+});
+
+// The refusal a live run died on. The lead put a hypothesis id in target_entity;
+// the refusal was right but said only that the graph was empty, so all three
+// attempts repeated it and the run failed on the attempt bound.
+describe("refusing an entity the graph does not know", () => {
+  it("says what target_entity holds and that an empty graph admits none", async () => {
+    const started = await loop({ hypotheses: ["h one"] });
+    const stray: Decision = { ...INVESTIGATE, target_entity: "hypothesis:h-cf7fbf91" };
+
+    expect(() => validateDecision(stray, started.ledger.projection)).toThrow(/target_entity names a thing/);
+    expect(() => validateDecision(stray, started.ledger.projection)).toThrow(/leave it unset/);
+  });
+
+  it("names what the graph does know once evidence has arrived", async () => {
+    const started = await loop({ hypotheses: ["h one"] });
+    evidenceOn(started.ledger, [...started.ledger.projection.hypotheses.keys()][0]!, {
+      entities: [SEED_IP],
+    });
+    const stray: Decision = { ...INVESTIGATE, target_entity: "host:nowhere" };
+
+    expect(() => validateDecision(stray, started.ledger.projection)).toThrow(/the graph knows /);
   });
 });

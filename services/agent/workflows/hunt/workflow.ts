@@ -87,7 +87,7 @@ export async function runHunt(harness: Harness<HuntKinds>, options: HuntOptions)
       // crash between the two loses the iteration rather than half of it.
       await ledger.flush();
       if (iteration.hunt_status === "terminal") {
-        return await end(harness, options, ledger, outcomeOf(iteration.hunt_outcome), iteration.note);
+        return await end(harness, options, ledger, outcomeOf(iteration.hunt_outcome), iteration.note, true);
       }
     } catch (error) {
       // Parked is not failed: the hunt is waiting on a person, and the whole
@@ -101,7 +101,7 @@ export async function runHunt(harness: Harness<HuntKinds>, options: HuntOptions)
       // every sweep to refuse the same call again.
       if (error instanceof BudgetRefused) {
         await ledger.flush();
-        return await end(harness, options, ledger, "budget_exhausted", error.message);
+        return await end(harness, options, ledger, "budget_exhausted", error.message, false);
       }
       if (error instanceof HuntAlreadyTerminal) return report(ledger, "completed", error.message);
       throw error;
@@ -117,12 +117,20 @@ async function end(
   ledger: Awaited<ReturnType<typeof startHunt>>,
   outcome: RunOutcome,
   reason: string,
+  journaled: boolean,
 ): Promise<HuntReport> {
+  const built = buildReport(ledger.projection);
+  // A run the controller never got to terminate still has a report, and the
+  // ledger is where a reader looks for it. Without this the console shows the
+  // verdicts of a budget-exhausted hunt and none of what it could not see.
+  if (!journaled) {
+    ledger.append({ kind: "finalize", payload: built } as never);
+    await ledger.flush();
+  }
   if ((await harness.state.terminal(options.run_id)) === null) {
-    const summary = renderReport(buildReport(ledger.projection));
     const handoffs = await handoffsOf(harness, options.run_id, ledger.projection);
     await harness.state.append(options.run_id, [
-      { run_id: options.run_id, run_kind: "hunt", kind: "terminal", payload: { outcome, reason, summary, handoffs } } as never,
+      { run_id: options.run_id, run_kind: "hunt", kind: "terminal", payload: { outcome, reason, summary: renderReport(built), handoffs } } as never,
     ]);
   }
   return report(ledger, outcome, reason);
@@ -180,7 +188,11 @@ async function parked(
 // reported honestly, not a failure: saying nothing was shown is the point.
 function outcomeOf(outcome: string | null): RunOutcome {
   if (outcome === "aborted") return "aborted";
-  if (outcome === "budget_exhausted") return "budget_exhausted";
+  // budget_terminated is what the hunt calls it; budget_exhausted is what the
+  // shared vocabulary calls it. Matching on the shared name against a hunt's own
+  // outcome never fired, so a hunt that stopped at its ceiling reported the same
+  // terminal as one that finished its work.
+  if (outcome === "budget_terminated" || outcome === "budget_exhausted") return "budget_exhausted";
   return "completed";
 }
 

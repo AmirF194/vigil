@@ -146,3 +146,97 @@ async def test_a_queue_outage_fails_the_run_rather_than_leaving_it_running(monke
     assert result["success"] is False
     finalize.assert_called_once()
     assert finalize.call_args.kwargs["status"] == "failed"
+
+
+# The run modal collects a hypothesis and the board came only from the definition,
+# so what an operator typed was stringified into the prompt and tested by nobody.
+@pytest.mark.asyncio
+async def test_the_job_carries_the_hypothesis_the_operator_asked_about(monkeypatch):
+    monkeypatch.setattr(
+        WorkflowsService, "get_workflow", lambda self, wid: _make_workflow(wid)
+    )
+    captured = {}
+
+    async def _enqueue(job, job_id=None):
+        captured["job"] = job
+        return "job-1"
+
+    with patch(
+        "core.workflows.workflow_run_service.WorkflowRunService.begin_run",
+        return_value="run-1",
+    ), patch("core.agents.queue.enqueue_run", new=AsyncMock(side_effect=_enqueue)):
+        await WorkflowsService().execute_workflow(
+            "threat-hunt", {"hypothesis": "lateral movement over SMB"}
+        )
+
+    assert captured["job"]["request"]["hypotheses"] == ["lateral movement over SMB"]
+
+
+@pytest.mark.asyncio
+async def test_one_hypothesis_per_line_so_a_run_can_put_up_several(monkeypatch):
+    monkeypatch.setattr(
+        WorkflowsService, "get_workflow", lambda self, wid: _make_workflow(wid)
+    )
+    captured = {}
+
+    async def _enqueue(job, job_id=None):
+        captured["job"] = job
+        return "job-1"
+
+    with patch(
+        "core.workflows.workflow_run_service.WorkflowRunService.begin_run",
+        return_value="run-1",
+    ), patch("core.agents.queue.enqueue_run", new=AsyncMock(side_effect=_enqueue)):
+        await WorkflowsService().execute_workflow(
+            "threat-hunt", {"hypothesis": "one\n\n  two  \n"}
+        )
+
+    assert captured["job"]["request"]["hypotheses"] == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_asked_nothing_puts_up_nothing(monkeypatch):
+    monkeypatch.setattr(
+        WorkflowsService, "get_workflow", lambda self, wid: _make_workflow(wid)
+    )
+    captured = {}
+
+    async def _enqueue(job, job_id=None):
+        captured["job"] = job
+        return "job-1"
+
+    with patch(
+        "core.workflows.workflow_run_service.WorkflowRunService.begin_run",
+        return_value="run-1",
+    ), patch("core.agents.queue.enqueue_run", new=AsyncMock(side_effect=_enqueue)):
+        await WorkflowsService().execute_workflow("threat-hunt", {"finding_id": "f-1"})
+
+    assert captured["job"]["request"]["hypotheses"] == []
+
+
+# What an operator is willing to spend on one question rides the job. The count
+# was a constant in the resolver before, so the only way to change it was an edit.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "asked,expected",
+    [({"iterations": 3}, 3), ({"iterations": "5"}, 5), ({}, None), ({"iterations": "ten"}, None)],
+)
+async def test_the_turn_count_rides_the_job(monkeypatch, asked, expected):
+    monkeypatch.setattr(
+        WorkflowsService, "get_workflow", lambda self, wid: _make_workflow(wid)
+    )
+    captured = {}
+
+    async def _enqueue(job, job_id=None):
+        captured["job"] = job
+        return "job-1"
+
+    with patch(
+        "core.workflows.workflow_run_service.WorkflowRunService.begin_run",
+        return_value="run-1",
+    ), patch("core.agents.queue.enqueue_run", new=AsyncMock(side_effect=_enqueue)):
+        await WorkflowsService().execute_workflow(
+            "threat-hunt", {"finding_id": "f-1", **asked}
+        )
+
+    assert captured["job"]["request"]["iterations"] == expected

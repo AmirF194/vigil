@@ -41,7 +41,21 @@ type StartJob = Extract<RunJob, { reason: "start" }>;
 export async function resolveSpec(job: StartJob, resolve: PlaybookResolver = defaultResolver()): Promise<RunSpec> {
   const entry = archFor(job.run_kind);
   const arch = job.request.arch === "" ? entry.arch : job.request.arch;
-  const tighten = (spec: RunSpec): RunSpec => withOverrides(spec, job.request.overrides);
+  // Carried on the job rather than the reference: what a caller wants tested is
+  // this run's, and the reference names a definition many runs share.
+  const asked = job.request.hypotheses ?? [];
+  const turns = job.request.iterations;
+  const tighten = (spec: RunSpec): RunSpec =>
+    withOverrides(
+      {
+        ...spec,
+        ...(asked.length === 0 ? {} : { sections: { ...spec.sections, operator_hypotheses: asked } }),
+        // Under thresholds because the harness refuses an unknown budgets key,
+        // and turns are the workflow's unit rather than the harness's.
+        ...(turns === undefined ? {} : { thresholds: { ...spec.thresholds, max_iterations: turns } }),
+      },
+      job.request.overrides,
+    );
   if (!isReference(job.request.playbook)) {
     return tighten(buildSpec({ arch, playbook: job.request.playbook, config: job.request.config }, entry.actions, entry.owned, job.request.prompt));
   }

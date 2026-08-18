@@ -21,6 +21,23 @@ HUNT_RUN_KIND = "hunt"
 WORKFLOW_SCHEME = "workflow:"
 
 
+# One statement per line, so an operator can put up more than one belief without
+# a second field. Blank lines are spacing rather than an empty hypothesis.
+# None rather than a number, so a caller that says nothing leaves the definition's
+# count rather than pinning every run to whatever this file happens to think.
+def _asked_iterations(parameters: Optional[Dict[str, Any]]) -> Optional[int]:
+    stated = (parameters or {}).get("iterations")
+    try:
+        return int(stated) if stated is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _asked_hypotheses(parameters: Optional[Dict[str, Any]]) -> List[str]:
+    stated = (parameters or {}).get("hypothesis") or ""
+    return [line.strip() for line in str(stated).splitlines() if line.strip()]
+
+
 def _nothing_to_run(workflow: "WorkflowDefinition") -> str:
     if workflow.run_kind == HUNT_RUN_KIND:
         return "" if workflow.metadata.get("hypotheses") else "hypotheses"
@@ -131,6 +148,9 @@ class WorkflowDefinition:
             "use_case": self.use_case,
             "trigger_examples": self.trigger_examples,
             "source": self.source,
+            # The console reads this to know a run takes a turn count rather than
+            # walking phases; without it the field would key off the workflow id.
+            "run_kind": self.run_kind,
         }
         if include_body:
             result["body"] = self.body
@@ -384,6 +404,11 @@ class WorkflowsService:
                 "playbook": f"{WORKFLOW_SCHEME}{workflow.id}",
                 "config": "",
                 "prompt": self._build_target_context(parameters),
+                # On the job rather than in the playbook: what this caller wants
+                # tested belongs to this run, and the reference names a definition
+                # every run of it shares.
+                "hypotheses": _asked_hypotheses(parameters),
+                "iterations": _asked_iterations(parameters),
             },
             enqueued_by=triggered_by or "api",
         )

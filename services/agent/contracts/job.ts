@@ -26,6 +26,14 @@ export interface StartRequest {
   config: string;
   prompt: string;
   overrides?: Record<string, unknown>;
+  // What the caller wants tested, beside whatever the playbook already states.
+  // Per-run and so not resolvable from the reference, which names a definition
+  // many runs share.
+  hypotheses?: string[];
+  // How many turns this run may take. Per-run for the same reason: what an
+  // operator is willing to spend on one question is not a property of the
+  // definition. Absent leaves the config's.
+  iterations?: number;
 }
 
 // A resume carries no request, so a resume path that read one would not compile.

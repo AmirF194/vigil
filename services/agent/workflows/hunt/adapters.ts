@@ -32,7 +32,15 @@ function role(spec: RunSpec, name: "lead" | "critic"): RoleSpec {
   return held;
 }
 
-function turnFor(options: AdapterOptions, id: string, spec: RoleSpec, task: string) {
+// The lease signal and the operator's abort both end the call, and either alone
+// leaves the other unheard.
+function either(held?: AbortSignal, asked?: AbortSignal): AbortSignal | undefined {
+  if (held === undefined) return asked;
+  if (asked === undefined) return held;
+  return AbortSignal.any([held, asked]);
+}
+
+function turnFor(options: AdapterOptions, id: string, spec: RoleSpec, task: string, signal?: AbortSignal) {
   const { runtime } = options.spec;
   return {
     run_id: options.run_id,
@@ -46,7 +54,7 @@ function turnFor(options: AdapterOptions, id: string, spec: RoleSpec, task: stri
     verbs: options.actions,
     result_cap: runtime.result_cap,
     recall_limit: runtime.recall_limit,
-    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(either(options.signal, signal) === undefined ? {} : { signal: either(options.signal, signal) }),
   };
 }
 
@@ -62,10 +70,10 @@ export function decisionProvider(options: AdapterOptions): DecisionProvider {
   const lead = role(options.spec, "lead");
 
   return {
-    decide: async (digest: Digest): Promise<DecisionResult> => {
+    decide: async (digest: Digest, signal?: AbortSignal): Promise<DecisionResult> => {
       const before = options.harness.budget.spent.cost_usd;
       const outcome = await drain(
-        streamTurn<Decision, HuntKinds>(turnFor(options, "lead", lead, renderDigest(digest)), options.harness),
+        streamTurn<Decision, HuntKinds>(turnFor(options, "lead", lead, renderDigest(digest), signal), options.harness),
       );
       if (outcome.value === null) {
         if (outcome.refusal !== null) throw new BudgetRefused(outcome.reason);

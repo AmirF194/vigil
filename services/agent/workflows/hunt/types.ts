@@ -88,12 +88,32 @@ export type Salience = "routine" | "notable" | "anomalous";
 // and never-considered are the difference the cross-hypothesis update exists for.
 export type LinkRelation = "supports" | "weakens" | "neither";
 
-// The harness's limits under the hunt's name, so a spec reads as one thing.
-export type Budgets = BudgetLimits;
+// The harness counts model calls; a hunt counts turns, and one turn costs several
+// calls. Aliasing the harness type outright lost that distinction, so max_calls
+// bound the run at a third of the turns its budget said it had.
+export type Budgets = BudgetLimits & { max_iterations: number };
+
+// A turn is not one call. It dispatches up to max_workers workers, each running
+// its own tool loop of up to runtime.max_turns calls, and the lead and the pass
+// that argues against them each run one too. The two spare turns per agent are
+// the emission retries a schema-invalid answer costs.
+//
+// Derived rather than guessed: a flat constant sat four times under what a
+// fan-out turn actually spends, so the call meter ended the hunt two turns into
+// an eight-turn budget -- the same "one number, two meters" failure this split
+// exists to end, moved one level down. Cost is the governor; calls are a
+// backstop against a single turn running away.
+export function callsPerIteration(maxWorkers: number, maxTurns: number): number {
+  return (maxWorkers + 2) * (maxTurns + 2);
+}
+
+// The shape the shipped arch and runtime describe: 4 workers, 8 turns each.
+export const CALLS_PER_ITERATION = callsPerIteration(4, 8);
 
 export const DEFAULT_BUDGETS: Budgets = {
-  max_calls: 20,
-  max_cost_usd: 25.0,
+  max_iterations: 8,
+  max_calls: 8 * CALLS_PER_ITERATION,
+  max_cost_usd: 3.0,
   max_wall_ms: 1_800_000,
   max_park_ms: DEFAULT_PARK_MS,
 };

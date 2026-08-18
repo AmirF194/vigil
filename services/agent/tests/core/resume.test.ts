@@ -69,6 +69,19 @@ describe("resolving a run", () => {
     job.request.arch = join(import.meta.dirname, "..", "..", "arch", "threathunt.yaml");
     expect((await resolveSpec(job)).dispatch.max_workers).toBe(4);
   });
+
+  // Per-run, so it rides the job rather than the playbook the reference names --
+  // which is a definition every run of it shares.
+  it("carries what this run asked about into the sections the workflow reads", async () => {
+    const job = startJob();
+    job.request.hypotheses = ["lateral movement over SMB"];
+
+    expect((await resolveSpec(job)).sections["operator_hypotheses"]).toEqual(["lateral movement over SMB"]);
+  });
+
+  it("leaves the sections alone when the run asked about nothing", async () => {
+    expect((await resolveSpec(startJob())).sections["operator_hypotheses"]).toBeUndefined();
+  });
 });
 
 describe("the arch a run started under is journaled", () => {
@@ -78,7 +91,15 @@ describe("the arch a run started under is journaled", () => {
 
     const opened = await specOf(state, RUN);
     expect(opened?.arch).toBe("threathunt");
-    expect(opened?.budgets).toEqual({ max_calls: 12, max_cost_usd: 5, max_wall_ms: 1_800_000, max_park_ms: 604_800_000 });
+    // The turn count is the one that binds; max_calls is a backstop the hunt
+    // raises off it, so this asserts the relationship rather than the arithmetic
+    // -- the multiplier is a property of this arch's fan-out, not of the budget.
+    // Cast because the harness's budget type has no turn count -- that is the
+    // whole point of the split, and the journaled spec carries the hunt's.
+    const budgets = opened?.budgets as unknown as { max_iterations: number; max_calls: number; max_cost_usd: number };
+    expect(budgets.max_iterations).toBe(8);
+    expect(budgets.max_calls).toBeGreaterThan(budgets.max_iterations);
+    expect(budgets.max_cost_usd).toBe(5);
   });
 
   // The whole point of journaling it: the file moved, the run did not.
@@ -86,11 +107,14 @@ describe("the arch a run started under is journaled", () => {
     const state = new InProcessState();
     await advance(state, leases, startJob(), scriptedHarness(CONCLUDE));
 
+    const opened = (await specOf(state, RUN))?.budgets.max_calls;
+
     rewriteBudget(99);
     expect((await resolveSpec(startJob())).budgets.max_calls).toBe(99);
 
+    // Not 99: the run keeps the ceiling it opened with, whatever the file says now.
     await advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE));
-    expect((await specOf(state, RUN))?.budgets.max_calls).toBe(12);
+    expect((await specOf(state, RUN))?.budgets.max_calls).toBe(opened);
   });
 
   it("refuses to resume a run that has no ledger", async () => {
