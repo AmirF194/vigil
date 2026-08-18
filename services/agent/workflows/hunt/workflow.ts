@@ -130,7 +130,7 @@ async function end(
   if ((await harness.state.terminal(options.run_id)) === null) {
     const handoffs = await handoffsOf(harness, options.run_id, ledger.projection);
     await harness.state.append(options.run_id, [
-      { run_id: options.run_id, run_kind: "hunt", kind: "terminal", payload: { outcome, reason, summary: renderReport(built), handoffs } } as never,
+      { run_id: options.run_id, run_kind: "hunt", kind: "terminal", payload: { outcome, reason, summary: renderReport(built, ledger.projection), handoffs } } as never,
     ]);
   }
   return report(ledger, outcome, reason);

@@ -288,6 +288,12 @@ export interface EvidenceRecord {
   salience: Salience;
   why_notable: string;
   provenance: string;
+  // The worker's own claim about what this specific record is evidence for --
+  // distinct from a hypothesis's declared technique, which is the playbook
+  // author's. Absent rather than null: omission is "not classified", not a
+  // classification of nothing. Schema-gated to the playbook's attack_techniques,
+  // so a worker can name one but not invent one.
+  attack_technique?: string;
   // Set when an adversary could have written the value; an ABANDON must not rest on it alone.
   attacker_influenceable: boolean;
   instruction_like: boolean;

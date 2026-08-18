@@ -113,6 +113,9 @@ function evidenceFrom(answer: WorkerAnswer): WorkerEvidence[] {
       ...(typeof record["attacker_influenceable"] === "boolean"
         ? { attacker_influenceable: record["attacker_influenceable"] }
         : {}),
+      ...(typeof record["attack_technique"] === "string" && record["attack_technique"] !== ""
+        ? { attack_technique: record["attack_technique"] }
+        : {}),
     } as WorkerEvidence;
   });
 }

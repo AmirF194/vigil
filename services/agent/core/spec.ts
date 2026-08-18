@@ -491,14 +491,17 @@ function constrainWorkerId(
   return { ...schema, properties: { ...properties, worker_agent_id: { ...field, enum: ids } } };
 }
 
-// The same idea one layer down, over a field inside a worker's result rows. A
-// reader that counts distinct values of an unconstrained string counts a typo as
-// a second source, so the playbook's stated vocabulary is imposed on the schema.
-function constrainSourceSystem(
+// A field inside a worker's result rows, narrowed to a vocabulary the playbook
+// declared. A reader that counts distinct values of an unconstrained string
+// counts a typo as a second source, or a model's own guess as a classification
+// nothing checked -- source_system and attack_technique are two instances of
+// the same problem, so this is the one mechanism for both.
+function constrainResultField(
   schema: Record<string, unknown> | null,
-  domains: readonly string[],
+  field: string,
+  values: readonly string[],
 ): Record<string, unknown> | null {
-  if (schema === null || domains.length === 0) return schema;
+  if (schema === null || values.length === 0) return schema;
   const properties = asRecord(schema["properties"], "roles.workers.output_schema.properties");
   const results = properties["results"];
   if (typeof results !== "object" || results === null) return schema;
@@ -509,8 +512,8 @@ function constrainSourceSystem(
   const itemProperties = (items as Record<string, unknown>)["properties"];
   if (typeof itemProperties !== "object" || itemProperties === null) return schema;
 
-  const field = (itemProperties as Record<string, unknown>)["source_system"];
-  if (typeof field !== "object" || field === null) return schema;
+  const target = (itemProperties as Record<string, unknown>)[field];
+  if (typeof target !== "object" || target === null) return schema;
 
   return {
     ...schema,
@@ -520,17 +523,17 @@ function constrainSourceSystem(
         ...(results as Record<string, unknown>),
         items: {
           ...(items as Record<string, unknown>),
-          properties: { ...(itemProperties as Record<string, unknown>), source_system: { ...field, enum: [...domains] } },
+          properties: { ...(itemProperties as Record<string, unknown>), [field]: { ...target, enum: [...values] } },
         },
       },
     },
   };
 }
 
-// The vocabulary a playbook declared for that field, if it declared one. Absent
+// The vocabulary a playbook declared for a section, if it declared one. Absent
 // on a playbook that owns no such section, which then constrains nothing.
-function dataDomainsOf(playbook: Playbook): readonly string[] {
-  const declared = playbook.sections["data_domains"];
+function declaredStrings(playbook: Playbook, section: string): readonly string[] {
+  const declared = playbook.sections[section];
   return Array.isArray(declared) ? declared.filter((one): one is string => typeof one === "string") : [];
 }
 
@@ -590,13 +593,21 @@ export function assembleSpec(sources: SpecSources): RunSpec {
   const bound = bindCapabilities(arch.roles, config.tools);
   const declared = new Set(config.tools.map((tool) => tool.id));
   const applied = applyDirectives(bound, playbook.directives, declared);
-  const domains = dataDomainsOf(playbook);
+  const domains = declaredStrings(playbook, "data_domains");
+  const techniques = declaredStrings(playbook, "attack_techniques");
   const roles: Roles = {
     ...applied,
     workers: Object.fromEntries(
       Object.entries(applied.workers).map(([id, role]) => [
         id,
-        { ...role, output_schema: constrainSourceSystem(role.output_schema, domains) },
+        {
+          ...role,
+          output_schema: constrainResultField(
+            constrainResultField(role.output_schema, "source_system", domains),
+            "attack_technique",
+            techniques,
+          ),
+        },
       ]),
     ),
   };

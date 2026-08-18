@@ -34,6 +34,8 @@ const LEAD = { prompt: "lead", description: "the hunt lead", output_schema: {}, 
 export interface SpecOverrides {
   hypotheses?: string[];
   operatorHypotheses?: string[];
+  // Positional against hypotheses, the same way the resolver builds it.
+  attackTechniques?: string[];
   budgets?: Budgets;
   termination?: Partial<Termination>;
   checkpoints?: Partial<Checkpoints>;
@@ -77,7 +79,7 @@ export function huntSpecFor(overrides: SpecOverrides = {}): HuntSpec {
     digest: {},
     hypotheses,
     operator_hypotheses: overrides.operatorHypotheses ?? [],
-    attack_techniques: [],
+    attack_techniques: overrides.attackTechniques ?? [],
     data_domains: [],
     enrichment: DEFAULT_ENRICHMENT,
     checkpoints: { ...DEFAULT_CHECKPOINTS, ...overrides.checkpoints },
@@ -146,6 +148,7 @@ export interface EvidenceOptions {
   relation?: LinkRelation;
   attackerInfluenceable?: boolean;
   entities?: Entity[];
+  attackTechnique?: string;
 }
 
 export function evidenceOn(ledger: Journal, hypothesisId: string, options: EvidenceOptions = {}): string {
@@ -167,6 +170,7 @@ export function evidenceOn(ledger: Journal, hypothesisId: string, options: Evide
       instruction_like: false,
       entities: options.entities ?? [],
       captured_at: new Date().toISOString(),
+      ...(options.attackTechnique !== undefined ? { attack_technique: options.attackTechnique } : {}),
     },
   });
   ledger.append({

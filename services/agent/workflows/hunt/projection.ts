@@ -53,7 +53,7 @@ export function huntProjection(runId: string, events: readonly HuntEvent[]): Hun
     evidence_count: view.evidence.size,
     open_checkpoint: open === undefined ? null : openCheckpoint(open),
     report,
-    report_markdown: report === null ? null : renderReport(report),
+    report_markdown: report === null ? null : renderReport(report, view),
     handoffs: events.filter((event) => event.kind === "handoff").map((event) => event.payload as Handoff),
   };
 }

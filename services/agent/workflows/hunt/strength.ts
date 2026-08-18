@@ -77,6 +77,19 @@ function survivedDisconfirmation(projection: Projection, hypothesisId: string, l
   return linked.every((evidenceId) => argued.has(evidenceId));
 }
 
+// Distinct techniques evidence bearing on this hypothesis actually cited, not
+// what the hypothesis was declared to test -- a hunt can find something its
+// playbook did not name. Presentation only: nothing here is part of the
+// journaled report, so a run's frozen record cannot disagree with a rendering
+// of it.
+export function citedTechniques(projection: Projection, hypothesisId: string): string[] {
+  const cited = projection.links
+    .filter((link) => link.hypothesis_id === hypothesisId)
+    .map((link) => projection.evidence.get(link.evidence_id)?.attack_technique)
+    .filter((technique): technique is string => typeof technique === "string" && technique !== "");
+  return [...new Set(cited)].sort();
+}
+
 export function evidenceStrength(projection: Projection, hypothesisId: string): EvidenceStrength {
   const linked = (relation: LinkRelation): EvidenceRecord[] =>
     projection.links

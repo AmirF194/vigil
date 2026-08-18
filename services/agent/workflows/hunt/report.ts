@@ -1,7 +1,7 @@
 import { resolutionOf, type Checkpoint, type Resolution } from "./checkpoints.js";
 import { suppressedEntities } from "./digest.js";
 import type { Projection } from "./ledger.js";
-import { isGap, unruledObservations } from "./strength.js";
+import { citedTechniques, isGap, unruledObservations } from "./strength.js";
 import type {
   Budgets,
   EvidenceRecord,
@@ -233,7 +233,12 @@ function headline(report: HuntReport): string {
   return `Nothing was proven; the hunt ended ${report.outcome ?? "without an outcome"} with its hypotheses unresolved.`;
 }
 
-export function renderReport(report: HuntReport): string {
+// projection is optional and never touches HuntReport's own shape: the report is
+// what buildReport froze -- the ADR 0012 goldens compare that object exactly --
+// and a technique citation is derived fresh from the live ledger each time this
+// renders, the same way groupedGaps derives a rendering without changing what
+// buildReport recorded.
+export function renderReport(report: HuntReport, projection?: Projection): string {
   const lines: string[] = [
     `# Hunt report — ${report.name}`,
     "",
@@ -253,6 +258,13 @@ export function renderReport(report: HuntReport): string {
   for (const hypothesis of ordered) {
     lines.push(`### ${hypothesis.hypothesis_id} — ${hypothesis.status}`, "", hypothesis.statement, "");
     if (hypothesis.resolution_reason) lines.push(`_${hypothesis.resolution_reason}_`, "");
+    // The playbook's own label for what this hypothesis tests, distinct from
+    // what evidence actually cited below -- a hunt can find something its
+    // definition never named.
+    const declared = projection?.hypotheses.get(hypothesis.hypothesis_id)?.attack_technique ?? null;
+    if (declared !== null) lines.push(`**Declared technique:** ${declared}`, "");
+    const observed = projection === undefined ? [] : citedTechniques(projection, hypothesis.hypothesis_id);
+    if (observed.length > 0) lines.push(`**Techniques cited by evidence:** ${observed.join(", ")}`, "");
     if (hypothesis.evidence_strength !== null) {
       lines.push(`Evidence strength at verdict: ${strengthLine(hypothesis.evidence_strength)}.`, "");
     }

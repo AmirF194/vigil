@@ -219,6 +219,11 @@ roles:
                 supports: { type: array, items: { type: string } }
                 weakens: { type: array, items: { type: string } }
                 attacker_influenceable: { type: boolean }
+                # Narrowed to the playbook's attack_techniques at spec build, the
+                # same way source_system is narrowed to data_domains. Optional:
+                # a record with nothing to classify should say nothing rather
+                # than invent a technique to fill the field.
+                attack_technique: { type: string }
           ips_to_check: { type: array, items: { type: string } }
 
     network_analyst:
