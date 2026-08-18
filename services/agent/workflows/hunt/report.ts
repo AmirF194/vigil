@@ -80,6 +80,39 @@ export interface HuntReport {
   unruled?: number;
 }
 
+// One entry per question, not per worker. A fan-out hands every worker the same
+// query_intent, so a turn where four of them failed printed the whole intent four
+// times over and buried the reasons that actually differed. Presentation only:
+// buildReport's gaps array is what the ADR 0012 goldens freeze, and it is untouched.
+export interface AskedGap {
+  iteration: number;
+  hypothesis_id: string | null;
+  query_intent: string;
+  reasons: string[];
+  workers: number;
+}
+
+export function groupedGaps(gaps: readonly VisibilityGap[]): AskedGap[] {
+  const byQuestion = new Map<string, AskedGap>();
+  for (const gap of gaps) {
+    const key = `${gap.iteration}|${gap.hypothesis_id ?? ""}|${gap.query_intent}`;
+    const held = byQuestion.get(key);
+    if (held === undefined) {
+      byQuestion.set(key, {
+        iteration: gap.iteration,
+        hypothesis_id: gap.hypothesis_id,
+        query_intent: gap.query_intent,
+        reasons: [gap.summary],
+        workers: 1,
+      });
+      continue;
+    }
+    held.workers += 1;
+    if (!held.reasons.includes(gap.summary)) held.reasons.push(gap.summary);
+  }
+  return [...byQuestion.values()];
+}
+
 export function reportPath(ledgerPath: string): string {
   return `${ledgerPath.replace(/\.jsonl$/, "")}.report.md`;
 }
@@ -206,7 +239,7 @@ export function renderReport(report: HuntReport): string {
     "",
     `- **Outcome:** ${report.outcome ?? "not terminated"}`,
     `- **Hunt:** ${report.hunt_id}`,
-    `- **Iterations:** ${report.iterations} of ${report.budgets.max_calls}`,
+    `- **Iterations:** ${report.iterations} of ${report.budgets.max_iterations}`,
     `- **Cost:** $${report.cost_usd.toFixed(4)} of $${report.budgets.max_cost_usd.toFixed(2)}`,
     `- **Started:** ${report.created_at}`,
     `- **Ended:** ${report.terminated_at ?? "still running"}`,
@@ -230,9 +263,11 @@ export function renderReport(report: HuntReport): string {
     lines.push("None: every query the hunt wanted to run came back.", "");
   } else {
     lines.push("Questions the hunt could not answer. Each is a blind spot, not a finding.", "");
-    for (const gap of report.gaps) {
-      const bearing = gap.hypothesis_id === null ? "unattributed" : gap.hypothesis_id;
-      lines.push(`- iteration ${gap.iteration} (${bearing}): ${gap.query_intent || gap.summary} — ${gap.summary}`);
+    for (const asked of groupedGaps(report.gaps)) {
+      const bearing = asked.hypothesis_id === null ? "unattributed" : asked.hypothesis_id;
+      const workers = asked.workers > 1 ? ` (${asked.workers} workers)` : "";
+      lines.push(`- iteration ${asked.iteration} (${bearing})${workers}: ${asked.query_intent || asked.reasons[0]}`);
+      if (asked.query_intent !== "") for (const reason of asked.reasons) lines.push(`  - ${reason}`);
     }
     lines.push("");
   }

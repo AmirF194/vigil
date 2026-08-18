@@ -337,16 +337,78 @@ function DetailsModal({ wf, onClose }: { wf: Workflow; onClose: () => void }) {
   )
 }
 
+/** The run this modal just started, watched with the hook History uses. Closing
+ *  the modal does not stop the run — it only stops looking at it. */
+function StartedRun({ runId, onClose }: { runId: string; onClose: () => void }) {
+  const { detail, load } = useRunDetail(runId, true, 'running')
+  useEffect(() => { void load() }, [load])
+
+  return (
+    <div className="flex flex-col gap-3.5">
+      <p className="text-[12.5px] text-tx-3 leading-[1.5]">
+        Started. It runs on the server whether this stays open or not — History has it under{' '}
+        <span className="mono">{runId.slice(0, 8)}</span>.
+      </p>
+      {detail === null
+        ? <div className="muted text-[12.5px]">Waiting for the run to open its ledger…</div>
+        : <RunDetail d={detail} onSteered={() => { void load() }} />}
+      <div className="flex justify-end gap-2.5 pt-1">
+        <button className="btn ghost" onClick={onClose}>Close</button>
+      </div>
+    </div>
+  )
+}
+
+/** What a hunt costs at most and what this deployment cannot answer. Both are
+ *  knowable before the run, and both used to be knowable only after it. */
+interface WfLimits {
+  capabilities?: { bound: string[]; unbound: string[] }
+  budgets?: { max_iterations: number; max_cost_usd: number }
+}
+
+/** The ceiling, not an estimate. Observed cost per model call varies several-fold
+ *  across runs because the transcript grows, so a per-turn figure would be
+ *  invented precision; what is actually true is where the run stops. */
+function turnsHint(asked: string, limits: WfLimits | null): string {
+  const turns = asked.trim() === '' ? limits?.budgets?.max_iterations : Number(asked)
+  const cap = limits?.budgets?.max_cost_usd
+  const where = cap === undefined ? '' : ` It stops at $${cap.toFixed(2)} whatever happens.`
+  if (turns === undefined) return 'Turns the hunt may take before it stops and reports.'
+  return `${turns} turn(s): each is a lead decision, the workers it dispatches and the pass that argues against them.${where}`
+}
+
+/** What the hunt will not be able to look at, said before it costs anything. The
+ *  hunt journals the same fact as a visibility gap, but only once the run is over
+ *  — and "nothing was proven" then reads as a fact about the estate rather than
+ *  about this deployment. */
+function Blindness({ unbound }: { unbound: string[] }) {
+  if (unbound.length === 0) return null
+  const blind = unbound.includes('telemetry_search')
+  return (
+    <div className="text-[12.5px] leading-[1.5]" style={{ color: 'var(--warn, var(--crit))' }}>
+      No tool here answers {unbound.join(', ')}.{' '}
+      {blind
+        ? 'Without telemetry_search the hunt cannot query a SIEM, so it can corroborate nothing and will report that nothing was proven — a fact about this deployment, not about your estate.'
+        : 'The roles that need it will run without it, and the hunt will record the gap.'}
+    </div>
+  )
+}
+
 /** Run a workflow — collects a target, then starts it on the agent layer. The
     run is enqueued and answers with an id, so this hands off to History, which
     already reports phases, beliefs and whatever the run is waiting on. */
-function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: () => void; onClose: () => void }) {
+export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: () => void; onClose: () => void }) {
   const [findingId, setFindingId] = useState('')
   const [caseId, setCaseId] = useState('')
   const [context, setContext] = useState('')
   const [hypothesis, setHypothesis] = useState('')
+  const [iterations, setIterations] = useState('')
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // The run this modal started. Held so the modal can stay open and watch it
+  // rather than closing and leaving the operator to find it in History.
+  const [startedId, setStartedId] = useState<string | null>(null)
+  const [limits, setLimits] = useState<WfLimits | null>(null)
   // Suggestions for the ID fields, fetched from the live findings/cases lists.
   const [findingOpts, setFindingOpts] = useState<{ id: string; label: string }[]>([])
   const [caseOpts, setCaseOpts] = useState<{ id: string; label: string }[]>([])
@@ -363,8 +425,17 @@ function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: () => v
       const list = (r.data?.cases || []) as { case_id: string; title?: string }[]
       setCaseOpts(list.map((c) => ({ id: c.case_id, label: c.title || '' })))
     }).catch(() => {})
+    // What this deployment can answer and what a run costs at most. Both are
+    // facts before the run rather than after it, which is the whole point.
+    workflowApi.get(wf.id).then((r) => {
+      if (!cancelled) setLimits(r.data as WfLimits)
+    }).catch(() => {})
     return () => { cancelled = true }
-  }, [])
+  }, [wf.id])
+
+  const isHunt = wf.runKind === 'hunt'
+  const turns = Number(iterations)
+  const turnsBad = iterations.trim() !== '' && (!Number.isInteger(turns) || turns < 1 || turns > 40)
 
   const params = {
     ...(findingId.trim() && { finding_id: findingId.trim() }),
@@ -372,13 +443,18 @@ function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: () => v
     ...(context.trim() && { context: context.trim() }),
     ...(hypothesis.trim() && { hypothesis: hypothesis.trim() }),
   }
-  const canRun = Object.keys(params).length > 0 && !starting
+  // A turn count is not a target: on its own it says how long to run and never
+  // what to run on, so it is kept out of the check that a run has something to do.
+  const withTurns = { ...params, ...(isHunt && !turnsBad && iterations.trim() && { iterations: turns }) }
+  const canRun = Object.keys(params).length > 0 && !turnsBad && !starting
 
   const run = async () => {
     setStarting(true)
     setError(null)
     try {
-      await workflowApi.execute(wf.id, params)
+      const res = await workflowApi.execute(wf.id, withTurns)
+      setStartedId((res.data as { run_id?: string })?.run_id ?? null)
+      setStarting(false)
       onStarted()
     } catch (e) {
       setError(errMsg(e))
@@ -386,15 +462,36 @@ function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: () => v
     }
   }
 
+  // Started: the modal becomes the run's own view rather than closing on it. The
+  // first checkpoint and the first dispatch both land within seconds, and they
+  // are the two moments worth watching.
+  if (startedId !== null) {
+    return (
+      <Popup open onClose={onClose} title={`Run · ${wf.name}`}>
+        <StartedRun runId={startedId} onClose={onClose} />
+      </Popup>
+    )
+  }
+
   return (
     <Popup open onClose={onClose} title={`Run · ${wf.name}`}>
       <div className="flex flex-col gap-3.5">
-        <p className="text-[12.5px] text-tx-3 leading-[1.5]">Provide at least one target, then start the run — the agents work it on the server and History reports where it got to. Findings and cases drive the investigation; context and hypothesis steer hunts.</p>
+        <p className="text-[12.5px] text-tx-3 leading-[1.5]">Provide at least one target, then start the run — the agents work it on the server and History reports where it got to. A finding or case gives the run something to work from, and the report comes back onto the case you pick. On a hunt, each line of Hypothesis goes on the board as its own belief to test, beside the ones the workflow already states.</p>
         {error && <div className="text-[12.5px] leading-[1.5]" style={{ color: 'var(--crit)' }}>{error}</div>}
+        {isHunt && <Blindness unbound={limits?.capabilities?.unbound ?? []} />}
         <ComboField label="Finding ID" value={findingId} onChange={setFindingId} placeholder="f-20260614-3b5c585e" options={findingOpts} hint={findingOpts.length ? `${findingOpts.length} recent findings — start typing to filter.` : undefined} />
         <ComboField label="Case ID" value={caseId} onChange={setCaseId} placeholder="case-2026-0142" options={caseOpts} />
         <Field label="Context" value={context} onChange={setContext} placeholder="Active ransomware on HOST-42…" textarea />
         <Field label="Hypothesis" value={hypothesis} onChange={setHypothesis} placeholder="Lateral movement in the finance subnet…" textarea />
+        {isHunt && (
+          <Field
+            label="Iterations"
+            value={iterations}
+            onChange={setIterations}
+            placeholder={String(limits?.budgets?.max_iterations ?? 8)}
+            hint={turnsBad ? 'A whole number of turns between 1 and 40.' : turnsHint(iterations, limits)}
+          />
+        )}
         <div className="flex justify-end gap-2.5 pt-1">
           <button className="btn ghost" onClick={onClose}>Cancel</button>
           <button className="btn primary" disabled={!canRun} style={{ opacity: canRun ? 1 : 0.5 }} onClick={run}>
@@ -491,13 +588,66 @@ interface HuntStanding {
   status: string
   attack_technique?: string | null
   resolution_reason?: string | null
+  /** hunt_spec, operator or base_rate — which belief the operator put up themselves. */
+  provenance?: string
+}
+/** What the hunt could not answer. A blind spot, not a finding. */
+interface HuntGap {
+  evidence_id: string
+  iteration: number
+  summary: string
+  query_intent?: string
+  hypothesis_id?: string | null
+}
+interface HuntCheckpoint {
+  checkpoint_id: string
+  class: string
+  raised_iteration?: number
+  question: string
+  resolution?: { answer: string; actor: string; text?: string } | null
+}
+interface HuntHandoff {
+  case_id: string
+  hypothesis_id: string
+  iteration: number
+  rationale: string
+}
+interface HuntStrength {
+  corroborating_sources: number
+  contradicting_records: number
+  open_gaps: number
+  attacker_influenceable_only: boolean
+  survived_disconfirmation: boolean
+}
+/** The derived deliverable. Null until the hunt writes one, so the panel reads
+ *  the live fields until it exists and the report itself afterwards. */
+interface HuntReport {
+  gaps: HuntGap[]
+  checkpoints: HuntCheckpoint[]
+  hypotheses: { hypothesis_id: string; evidence_strength?: HuntStrength | null }[]
+  unruled?: number
 }
 interface HuntView {
+  // The projection has always carried it; the type never said so.
+  run_id?: string
   status: string
   iteration: number
   evidence_count: number
+  cost_usd?: number
   hypotheses: HuntStanding[]
-  open_checkpoint?: { question: string } | null
+  // The whole record, not just its question. The wire has carried these fields
+  // since the projection did; the type stopped at the question, so a console that
+  // could see a run was waiting could not say what on, or answer it.
+  open_checkpoint?: {
+    checkpoint_id: string
+    checkpoint_class?: string
+    question: string
+    raised_at?: string
+    context?: Record<string, unknown>
+  } | null
+  report?: HuntReport | null
+  report_markdown?: string | null
+  handoffs?: HuntHandoff[]
 }
 interface WfRunDetail extends WfRun {
   result_summary?: string | null
@@ -510,29 +660,38 @@ interface WfRunDetail extends WfRun {
 const RUN_POLL_MS = 5_000
 const IN_FLIGHT = ['running', 'paused', 'pending']
 
-/** A run row that lazily fetches its full detail (getRun) when expanded. */
-function RunRow({ run }: { run: WfRun }) {
-  const [open, setOpen] = useState(false)
+/** One run's detail, refreshed while it is in flight. Extracted so the modal that
+ *  started a run watches it with the same code the history row does — the run is
+ *  the same run, and two pollers would be two answers to one question. */
+export function useRunDetail(runId: string, watching: boolean, seed?: string) {
   const [detail, setDetail] = useState<WfRunDetail | null>(null)
   const [dphase, setDphase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
 
   const load = useCallback(
     () =>
       workflowApi
-        .getRun(run.run_id)
+        .getRun(runId)
         .then((res) => { setDetail(res.data as WfRunDetail); setDphase('ready') })
         .catch(() => setDphase((p) => (p === 'ready' ? p : 'error'))),
-    [run.run_id],
+    [runId],
   )
 
   // Stops on its own when the run reaches a terminal status: a finished run has
   // nothing further to report, and the row would otherwise poll for the session.
-  const live = open && IN_FLIGHT.includes(detail?.status ?? run.status)
+  const live = watching && IN_FLIGHT.includes(detail?.status ?? seed ?? 'running')
   useEffect(() => {
     if (!live) return
     const timer = setInterval(() => { void load() }, RUN_POLL_MS)
     return () => clearInterval(timer)
   }, [live, load])
+
+  return { detail, dphase, setDphase, load }
+}
+
+/** A run row that lazily fetches its full detail (getRun) when expanded. */
+function RunRow({ run }: { run: WfRun }) {
+  const [open, setOpen] = useState(false)
+  const { detail, dphase, setDphase, load } = useRunDetail(run.run_id, open, run.status)
 
   const toggle = () => {
     const next = !open
@@ -569,7 +728,9 @@ function RunRow({ run }: { run: WfRun }) {
   )
 }
 
-function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => void }) {
+/** Exported for test: the run detail panel is the whole of what a hunt shows an
+ *  operator, and driving the screen down to it would test the History modal instead. */
+export function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => void }) {
   const agentMeta = useAgentMeta()
   return (
     <div className="run-detail">
@@ -580,10 +741,14 @@ function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => void }) 
           <pre className="font-mono text-[11.5px] leading-[1.5] whitespace-pre-wrap m-0" style={{ color: 'var(--crit)' }}>{d.error}</pre>
         </div>
       )}
-      {d.result_summary && (
+      {/* The hunt renders its own report as soon as one exists; result_summary
+          only lands at terminal, so a finished-but-unfiled run would show nothing. */}
+      {(d.hunt?.report_markdown || d.result_summary) && (
         <div className="modal-section" style={{ marginTop: 4 }}>
-          <h4>Result summary</h4>
-          <div className="text-[12.5px] text-tx-2 leading-[1.55]"><Markdown>{d.result_summary}</Markdown></div>
+          <h4>{d.hunt ? 'Hunt report' : 'Result summary'}</h4>
+          <div className="text-[12.5px] text-tx-2 leading-[1.55] [&_h1]:text-[15px] [&_h1]:font-semibold [&_h2]:text-[13.5px] [&_h2]:font-semibold [&_h3]:text-[12.5px] [&_h3]:font-semibold [&_h1]:mt-1 [&_h2]:mt-2.5 [&_h3]:mt-2">
+            <Markdown>{d.hunt?.report_markdown || d.result_summary || ''}</Markdown>
+          </div>
         </div>
       )}
       {!!d.phases?.length && (
@@ -618,27 +783,44 @@ function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => void }) 
  *  instant, and the panel re-reads rather than claiming the run obeyed. */
 function Steer({ runId, hunt, onSteered }: { runId: string; hunt: boolean; onSteered: () => void }) {
   const [note, setNote] = useState('')
+  const [entity, setEntity] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [said, setSaid] = useState<string | null>(null)
 
-  const send = (kind: string, text: string) => {
+  const send = (kind: string, text: string, fields?: Record<string, string>) => {
     setBusy(kind)
     setSaid(null)
     workflowApi
-      .steer(runId, kind, text)
-      .then(() => { setSaid(`${kind} queued`); setNote(''); onSteered() })
+      .steer(runId, kind, text, fields)
+      .then(() => { setSaid(`${kind} queued`); setNote(''); setEntity(''); onSteered() })
       .catch((e) => setSaid(errMsg(e)))
       .finally(() => setBusy(null))
   }
 
-  // abort and note apply to any run; a hunt is the only kind with beliefs to
-  // extend or a verdict to be told to reach.
-  const kinds = hunt ? ['abort', 'conclude', 'extend'] : ['abort']
+  // Stop goes through cancel rather than steer: a queued abort needs a live
+  // worker to read it, and cancel queues the same directive with an escalation
+  // behind it for the run that cannot answer.
+  const stop = () => {
+    setBusy('stop')
+    setSaid(null)
+    workflowApi
+      .cancelRun(runId, note.trim() || 'stopped from the console')
+      .then(() => { setSaid('stopping — it settles itself if it can'); setNote(''); onSteered() })
+      .catch((e) => setSaid(errMsg(e)))
+      .finally(() => setBusy(null))
+  }
+
+  // A hunt is the only kind with beliefs to extend or a verdict to be told to
+  // reach. Stop is separate below, and is the one that always works.
+  const kinds = hunt ? ['conclude', 'extend'] : []
 
   return (
     <div className="modal-section" style={{ marginTop: 4 }}>
       <h4>Steer</h4>
       <div className="flex gap-2 items-center flex-wrap">
+        <button className="btn ghost" disabled={busy !== null} onClick={stop} style={{ color: 'var(--crit)' }}>
+          stop
+        </button>
         {kinds.map((kind) => (
           <button key={kind} className="btn ghost" disabled={busy !== null} onClick={() => send(kind, note.trim())}>
             {kind}
@@ -654,35 +836,255 @@ function Steer({ runId, hunt, onSteered }: { runId: string; hunt: boolean; onSte
           note
         </button>
       </div>
+      {hunt && <SteerEntity busy={busy !== null} entity={entity} setEntity={setEntity} note={note} send={send} />}
       {said && <div className="muted text-[11.5px] mt-2">{said}</div>}
     </div>
   )
 }
 
+/** The two directives that name something rather than just saying something: a
+ *  known-benign entity the hunt should stop opening work on, and a blind spot no
+ *  query would ever report. Both need a typed field the note cannot carry. */
+function SteerEntity({
+  busy, entity, setEntity, note, send,
+}: {
+  busy: boolean
+  entity: string
+  setEntity: (value: string) => void
+  note: string
+  send: (kind: string, text: string, fields?: Record<string, string>) => void
+}) {
+  return (
+    <div className="flex gap-2 items-center flex-wrap mt-2">
+      <TextInput
+        className="grow"
+        placeholder="type:value — e.g. ip:45.77.53.176"
+        value={entity}
+        onChange={(e) => setEntity(e.target.value)}
+      />
+      <button
+        className="btn ghost"
+        disabled={busy || !entity.trim()}
+        title="Mark known-benign: its evidence stands, the hunt opens no new work on it."
+        onClick={() => send('benign', note.trim(), { entity_key: entity.trim() })}
+      >
+        known-benign
+      </button>
+      <button
+        className="btn ghost"
+        disabled={busy || !note.trim()}
+        title="Declare a blind spot no query will report — 'we have no EDR on that subnet'."
+        onClick={() => send('gap', note.trim())}
+      >
+        declare gap
+      </button>
+    </div>
+  )
+}
+
+/** The corroboration a verdict rested on, in the report's own words. */
+function strengthLine(s: HuntStrength): string {
+  return [
+    `${s.corroborating_sources} corroborating source system(s)`,
+    `${s.contradicting_records} contradicting record(s)`,
+    `${s.open_gaps} open gap(s)`,
+    s.attacker_influenceable_only ? 'support is attacker-influenceable only' : 'support is not attacker-authored alone',
+    s.survived_disconfirmation ? 'survived disconfirmation' : 'did not survive disconfirmation',
+  ].join(', ')
+}
+
 /** What a hunt has tested and how each belief stands — its equivalent of phase rows. */
 function HuntStandings({ hunt }: { hunt: HuntView }) {
+  const strengthOf = (id: string) =>
+    hunt.report?.hypotheses.find((h) => h.hypothesis_id === id)?.evidence_strength ?? null
   return (
     <div className="modal-section" style={{ marginTop: 12 }}>
       <h4>Hypotheses</h4>
       <div className="muted text-[11.5px] mb-2">
         Iteration {hunt.iteration} · {hunt.evidence_count} piece{hunt.evidence_count === 1 ? '' : 's'} of evidence
-        {hunt.open_checkpoint && ` · waiting: ${hunt.open_checkpoint.question}`}
+        {typeof hunt.cost_usd === 'number' && ` · $${hunt.cost_usd.toFixed(3)}`}
+        {hunt.open_checkpoint && ' · waiting on you'}
       </div>
       {hunt.hypotheses.length === 0 && <div className="muted" style={{ padding: '4px 0' }}>No hypotheses on the board yet.</div>}
       {hunt.hypotheses.length > 0 && (
         <table className="tbl">
           <thead><tr><th>Statement</th><th>Technique</th><th>Standing</th></tr></thead>
           <tbody>
-            {hunt.hypotheses.map((h) => (
-              <tr key={h.hypothesis_id}>
-                <td>{h.statement}{h.resolution_reason && <div className="muted text-[11px]">{h.resolution_reason}</div>}</td>
-                <td className="muted">{h.attack_technique || '—'}</td>
-                <td><span style={{ color: hypothesisColor(h.status) }}>{h.status}</span></td>
-              </tr>
-            ))}
+            {hunt.hypotheses.map((h) => {
+              const strength = strengthOf(h.hypothesis_id)
+              return (
+                <tr key={h.hypothesis_id}>
+                  <td>
+                    {h.statement}
+                    {h.provenance === 'operator' && <span className="chip ml-2" style={{ fontSize: 10 }}>yours</span>}
+                    {h.resolution_reason && <div className="muted text-[11px]">{h.resolution_reason}</div>}
+                    {strength && <div className="muted text-[11px]">{strengthLine(strength)}</div>}
+                  </td>
+                  <td className="muted">{h.attack_technique || '—'}</td>
+                  <td><span style={{ color: hypothesisColor(h.status) }}>{h.status}</span></td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       )}
+      <OpenCheckpoint hunt={hunt} />
+      <HuntGaps hunt={hunt} />
+      <HuntEscalations hunt={hunt} />
+      <HuntCheckpoints hunt={hunt} />
+    </div>
+  )
+}
+
+/** The one thing on this panel that is waiting on a person. approve and reject
+ *  have always been valid directives and the projection has always carried the
+ *  open checkpoint; nothing rendered it, so a parked hunt could be watched and
+ *  not answered, and the only way out of one was to abort it. */
+function OpenCheckpoint({ hunt }: { hunt: HuntView }) {
+  const open = hunt.open_checkpoint
+  const [busy, setBusy] = useState<string | null>(null)
+  const [said, setSaid] = useState<string | null>(null)
+  const [why, setWhy] = useState('')
+  if (!open) return null
+
+  const answer = (kind: 'approve' | 'reject') => {
+    setBusy(kind)
+    setSaid(null)
+    workflowApi
+      .steer(hunt.run_id ?? '', kind, why.trim(), { checkpoint_id: open.checkpoint_id })
+      .then(() => setSaid(`${kind} sent — the run picks it up at its next turn`))
+      .catch((e) => setSaid(errMsg(e)))
+      .finally(() => setBusy(null))
+  }
+
+  const unbound = (open.context?.['unbound_capabilities'] as string[] | undefined) ?? []
+
+  return (
+    <div className="modal-section" style={{ marginTop: 14, borderLeft: '2px solid var(--accent-line)', paddingLeft: 10 }}>
+      <h4>Waiting on you{open.checkpoint_class ? ` · ${open.checkpoint_class}` : ''}</h4>
+      <div className="text-[12.5px] leading-[1.55] mb-2" style={{ whiteSpace: 'pre-wrap' }}>{open.question}</div>
+      {unbound.length > 0 && (
+        <div className="muted text-[11.5px] mb-2">No tool here answers {unbound.join(', ')}.</div>
+      )}
+      <div className="flex gap-2 items-center flex-wrap">
+        <button className="btn primary" disabled={busy !== null} onClick={() => answer('approve')}>approve</button>
+        <button className="btn ghost" disabled={busy !== null} onClick={() => answer('reject')} style={{ color: 'var(--crit)' }}>
+          reject
+        </button>
+        <TextInput
+          className="grow"
+          placeholder="Why — recorded with your answer, and read by the run."
+          value={why}
+          onChange={(e) => setWhy(e.target.value)}
+        />
+      </div>
+      {said && <div className="muted text-[11.5px] mt-2">{said}</div>}
+    </div>
+  )
+}
+
+/** Questions the hunt could not answer. The reason this is a section of its own:
+ *  "we looked and it was not there" and "we could not look" read identically in a
+ *  report that does not separate them, and only one of them clears a hypothesis. */
+function HuntGaps({ hunt }: { hunt: HuntView }) {
+  const gaps = hunt.report?.gaps ?? []
+  if (gaps.length === 0) return null
+  const asked = groupedGaps(gaps)
+  return (
+    <div style={{ marginTop: 14 }}>
+      <h4>Visibility gaps ({gaps.length})</h4>
+      <div className="muted text-[11.5px] mb-2">Each is a blind spot, not a finding.</div>
+      <table className="tbl">
+        <thead><tr><th>Iteration</th><th>Bears on</th><th>What went unanswered</th></tr></thead>
+        <tbody>
+          {asked.map((g) => (
+            <tr key={g.key}>
+              <td className="muted">{g.iteration}</td>
+              <td className="muted">{g.hypothesis_id || 'unattributed'}</td>
+              <td>
+                {g.query_intent || g.reasons[0]}
+                {g.query_intent && g.reasons.map((reason) => (
+                  <div key={reason} className="muted text-[11px]">{reason}</div>
+                ))}
+                {g.workers > 1 && <div className="muted text-[11px]">{g.workers} workers, same question.</div>}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+/** One row per question, not per worker. A fan-out dispatches the same
+ *  query_intent to every worker, so a failed one repeated the whole intent once
+ *  per worker and buried the reasons that actually differed. */
+export function groupedGaps(gaps: HuntGap[]) {
+  const byQuestion = new Map<string, { key: string; iteration: number; hypothesis_id: string | null; query_intent: string; reasons: string[]; workers: number }>()
+  for (const gap of gaps) {
+    const intent = gap.query_intent ?? ''
+    const key = `${gap.iteration}|${gap.hypothesis_id ?? ''}|${intent}`
+    const held = byQuestion.get(key)
+    if (held === undefined) {
+      byQuestion.set(key, {
+        key,
+        iteration: gap.iteration,
+        hypothesis_id: gap.hypothesis_id ?? null,
+        query_intent: intent,
+        reasons: [gap.summary],
+        workers: 1,
+      })
+      continue
+    }
+    held.workers += 1
+    if (!held.reasons.includes(gap.summary)) held.reasons.push(gap.summary)
+  }
+  return [...byQuestion.values()]
+}
+
+function HuntEscalations({ hunt }: { hunt: HuntView }) {
+  const handoffs = hunt.handoffs ?? []
+  if (handoffs.length === 0) return null
+  return (
+    <div style={{ marginTop: 14 }}>
+      <h4>Escalated to incident response ({handoffs.length})</h4>
+      <table className="tbl">
+        <thead><tr><th>Case</th><th>Hypothesis</th><th>Why</th></tr></thead>
+        <tbody>
+          {handoffs.map((h) => (
+            <tr key={h.case_id}>
+              <td className="mono" style={{ fontSize: 11 }}>{h.case_id}</td>
+              <td className="muted">{h.hypothesis_id}</td>
+              <td>{h.rationale}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+/** Where a human was in the loop, and where policy stood in for one. */
+function HuntCheckpoints({ hunt }: { hunt: HuntView }) {
+  const checkpoints = hunt.report?.checkpoints ?? []
+  if (checkpoints.length === 0) return null
+  return (
+    <div style={{ marginTop: 14 }}>
+      <h4>Checkpoints ({checkpoints.length})</h4>
+      <table className="tbl">
+        <thead><tr><th>Class</th><th>Question</th><th>Answer</th></tr></thead>
+        <tbody>
+          {checkpoints.map((c) => (
+            <tr key={c.checkpoint_id}>
+              <td className="muted">{c.class}</td>
+              <td>{c.question}</td>
+              <td className="muted">
+                {c.resolution ? `${c.resolution.answer} by ${c.resolution.actor}${c.resolution.text ? ` — ${c.resolution.text}` : ''}` : 'still pending'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }

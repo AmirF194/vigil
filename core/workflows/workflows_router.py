@@ -1,6 +1,6 @@
 """Workflows API endpoints for SOC workflow management and execution."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import logging
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,6 +9,7 @@ from core.agents.projections import read_projection
 from core.deps import (
     provide_approvals,
     provide_custom_workflows,
+    provide_mcp_registry,
     provide_workflow_ai,
     provide_workflow_runs,
     provide_workflows,
@@ -42,6 +43,9 @@ class WorkflowExecuteRequest(BaseModel):
     case_id: Optional[str] = None
     context: Optional[str] = None
     hypothesis: Optional[str] = None
+    # Turns, not model calls. Bounded here so a typo cannot enqueue a run that
+    # spends for an hour before anything reads the number.
+    iterations: Optional[int] = Field(default=None, ge=1, le=40)
 
 
 class WorkflowPhaseSchema(BaseModel):
@@ -278,10 +282,31 @@ async def generate_workflow(
 # -----------------------------------------------------------------------------
 
 
+# Read from the resolver, not restated: a second copy of the shipped turn count
+# would drift from the one every run is actually built with.
+def _hunt_defaults() -> Tuple[int, float]:
+    from core.workflows.playbook_resolver import HUNT_BUDGETS, HUNT_THRESHOLDS
+
+    return HUNT_THRESHOLDS["max_iterations"], HUNT_BUDGETS["max_cost_usd"]
+
+
+# Best effort: a registry that cannot be read reports nothing missing rather than
+# blocking the modal, because a wrong warning is worse than a late one.
+def _capabilities(registry: Any) -> Dict[str, Any]:
+    from core.workflows.playbook_resolver import capability_report
+
+    try:
+        return capability_report(registry)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not read bound capabilities: %s", exc)
+        return {"bound": [], "unbound": []}
+
+
 @router.get("/workflows/{workflow_id}")
 async def get_workflow(
     workflow_id: str,
     service: WorkflowsService = Depends(provide_workflows),
+    registry=Depends(provide_mcp_registry),
 ):
     """
     Get full details for a specific workflow (custom or file-based).
@@ -293,6 +318,15 @@ async def get_workflow(
                 status_code=404,
                 detail=f"Workflow not found: {workflow_id}",
             )
+        # Only a hunt has turns to budget or capabilities to be missing. Answered
+        # here so the console can say what the run will cost and what it will not
+        # be able to see, before the operator spends anything on finding out.
+        if _is_hunt(service, workflow_id):
+            workflow["capabilities"] = _capabilities(registry)
+            workflow["budgets"] = {
+                "max_iterations": _hunt_defaults()[0],
+                "max_cost_usd": _hunt_defaults()[1],
+            }
         return workflow
     except HTTPException:
         raise
@@ -445,6 +479,7 @@ async def cancel_workflow_run(
     as ``cancelled`` with the supplied reason.
     """
     from core.response.approval_service import ActionStatus
+    from core.workflows.run_cancel import stop_run
     from core.workflows.run_resume import resume_run
 
     run = run_service.get_run(run_id)
@@ -465,10 +500,12 @@ async def cancel_workflow_run(
     if run.get("status") == "paused" and pending:
         return await resume_run(run_id, pending[0].action_id, rejected_by)
 
-    # Running-but-not-paused runs: we can't interrupt the in-flight
-    # Claude call here, but we can mark the row cancelled so history
-    # reflects the user's intent. (Background-worker support would
-    # let us actually stop execution; that's out of scope for #128.)
+    # Ask the run to stop, then make sure it does. Marking the row alone left the
+    # worker spending and overwriting the row with its own terminal later; the
+    # abort lets a hunt settle itself and write a report, and the escalation
+    # behind it covers a worker that is dead, wedged, or failing every attempt.
+    stopped = stop_run(run_id, request.reason, rejected_by)
+
     run_service.finalize_run(
         run_id,
         status="cancelled",
@@ -479,6 +516,7 @@ async def cancel_workflow_run(
         "status": "cancelled",
         "run_id": run_id,
         "rejection_reason": request.reason,
+        **stopped,
     }
 
 

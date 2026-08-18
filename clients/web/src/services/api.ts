@@ -1145,6 +1145,7 @@ export const workflowApi = {
     case_id?: string
     context?: string
     hypothesis?: string
+    iterations?: number
   }) => api.post(`/workflows/${id}/execute`, params, { timeout: LLM_TIMEOUT }),
   reloadFiles: () => api.post('/workflows/reload'),
 
@@ -1157,8 +1158,15 @@ export const workflowApi = {
 
   // Steer a run that is already going. Queued rather than journalled: the worker
   // holding the ledger is what turns a directive into an event on it.
-  steer: (runId: string, kind: string, text = '') =>
-    api.post(`/agent-runs/${runId}/directives`, { kind, text }),
+  // fields carries the typed half of a directive — the entity a benign suppresses,
+  // the hypothesis a gap bears on — which prose in `text` cannot say unambiguously.
+  // Stop, as opposed to steer. Queues the abort so the run can settle itself and
+  // write a report, and escalates behind that if it does not -- steer('abort')
+  // alone leaves a dead or wedged worker running.
+  cancelRun: (runId: string, reason: string, rejectedBy?: string) =>
+    api.post(`/workflows/runs/${runId}/cancel`, { reason, ...(rejectedBy && { rejected_by: rejectedBy }) }),
+  steer: (runId: string, kind: string, text = '', fields?: Record<string, string>) =>
+    api.post(`/agent-runs/${runId}/directives`, { kind, text, ...(fields && { fields }) }),
 
   // Custom (database-backed) CRUD
   listCustom: (activeOnly: boolean = true) =>
