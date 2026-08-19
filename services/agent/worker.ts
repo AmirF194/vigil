@@ -210,6 +210,7 @@ export async function advance(
     await journalAnswers(state, job.run_id, job.run_kind, answersFor());
 
     if (await abandonIfParkedOut(state, leases, job, spec)) return;
+    if (await abandonIfStalled(state, leases, job)) return;
     if (latest !== null) await markResumed(state, job, owner, latest);
     await drive(state, job, spec, build, halt.signal, directives);
     await settle(state, leases, job, spec, owner);
@@ -345,6 +346,38 @@ async function abandonIfParkedOut(state: State, leases: Leases, job: RunJob, spe
   ]);
   // This path returns before settle, so nobody reported it: the console showed the
   // run paused forever and its question stayed in the approvals queue for good.
+  await mirrorFor().terminal(job.run_id, { outcome: "abandoned", reason, summary: "" });
+  await reap(leases, job.run_id);
+  return true;
+}
+
+// Nothing but the record of being picked up again. A run whose model calls fail
+// without throwing came back here on every sweep, journaled a resume and two
+// zero-token spends, and advanced nothing -- nineteen times, for as long as anybody
+// left it. The SpecError path cannot see this one: nothing threw.
+//
+// Counted off the ledger rather than a counter, because the ledger is what survives
+// a worker restart, and the sweeper hands the run to whichever worker is free.
+export const MAX_STALLED_RESUMES = 6;
+
+// Neither is progress. A spend says a call was paid for, which a failing call also
+// writes at zero, and a resume says only that somebody looked again.
+const NOT_PROGRESS: ReadonlySet<string> = new Set(["resumed", "spend"]);
+
+async function abandonIfStalled(state: State, leases: Leases, job: RunJob): Promise<boolean> {
+  const events = await state.read(job.run_id);
+  let resumes = 0;
+  for (let at = events.length - 1; at >= 0; at -= 1) {
+    const kind = events[at]?.kind ?? "";
+    if (!NOT_PROGRESS.has(kind)) break;
+    if (kind === "resumed") resumes += 1;
+  }
+  if (resumes < MAX_STALLED_RESUMES) return false;
+
+  const reason = `picked up ${resumes} times without advancing; something upstream is failing without saying so`;
+  await state.append(job.run_id, [
+    { run_id: job.run_id, run_kind: job.run_kind, kind: "terminal", payload: { outcome: "abandoned", reason } },
+  ]);
   await mirrorFor().terminal(job.run_id, { outcome: "abandoned", reason, summary: "" });
   await reap(leases, job.run_id);
   return true;

@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { RunJob } from "../../contracts/job.js";
 import { InProcessLeases } from "../../core/leases.js";
 import { InProcessState } from "../../core/state.js";
-import { advance, resolveSpec, specOf } from "../../worker.js";
+import { advance, MAX_STALLED_RESUMES, resolveSpec, specOf } from "../../worker.js";
 import { scriptedHarness } from "../support/scripted-harness.js";
 import type { ScriptedTurn } from "../support/scripted-provider.js";
 
@@ -205,5 +205,63 @@ describe("what the caller enqueuing a run may tighten", () => {
   it("refuses to override anything but budgets and runtime", async () => {
     // The deployment's ceilings are the deployment's; the arch is not negotiable.
     await expect(resolveSpec(startJob("hunt", { roles: {} }))).rejects.toThrow(/may name budgets or runtime/);
+  });
+});
+
+// The other half of the same disease. A run whose model calls fail without throwing
+// never reaches the SpecError path: advance() returns, the sweeper hands it back, and
+// it journals a resume and two zero-token spends per attempt forever. One did that
+// nineteen times against a gateway holding no API key.
+describe("a run that keeps being picked up and going nowhere", () => {
+  async function stalledAfter(resumes: number): Promise<InProcessState> {
+    const state = new InProcessState();
+    await advance(state, leases, startJob(), scriptedHarness(CONCLUDE));
+    // Past its own terminal, so the guard rather than the terminal check is what
+    // this exercises: a real stall has no terminal, which is the whole problem.
+    const fresh = new InProcessState();
+    for (const event of (await state.read(RUN)).filter((one) => one.kind !== "terminal")) {
+      await fresh.append(RUN, [event]);
+    }
+    for (let n = 0; n < resumes; n += 1) {
+      await fresh.append(RUN, [
+        { run_id: RUN, run_kind: "hunt", kind: "resumed", payload: { worker: "w", enqueued_by: "watchdog" } },
+        { run_id: RUN, run_kind: "hunt", kind: "spend", payload: { role: "lead", tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0 }, cost_usd: 0, model_id: "m", provider_type: "bifrost", pricing_source: "exact" } },
+      ]);
+    }
+    return fresh;
+  }
+
+  it("stops once it has been resumed too many times without progressing", async () => {
+    const state = await stalledAfter(MAX_STALLED_RESUMES);
+
+    await advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE));
+
+    const terminal = await state.terminal(RUN);
+    expect(terminal?.outcome).toBe("abandoned");
+    expect(terminal?.reason).toMatch(/without advancing/);
+    expect(await leases.sweep(60_000, 10)).toEqual([]);
+  });
+
+  // A run that is merely slow is not a run that is stuck, and ending one early
+  // would be worse than the loop this guards.
+  it("leaves a run alone while it is still under the cap", async () => {
+    const state = await stalledAfter(MAX_STALLED_RESUMES - 1);
+
+    await advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE));
+
+    expect((await state.terminal(RUN))?.outcome).not.toBe("abandoned");
+  });
+
+  // Progress resets it: a long hunt writes hundreds of spends and resumes across a
+  // week of parking, and the count that matters is since it last did something.
+  it("counts only the resumes since the run last did something", async () => {
+    const state = await stalledAfter(MAX_STALLED_RESUMES);
+    await state.append(RUN, [
+      { run_id: RUN, run_kind: "hunt", kind: "dispatch", payload: { role: "threat_hunter" } as never },
+    ]);
+
+    await advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE));
+
+    expect((await state.terminal(RUN))?.outcome).not.toBe("abandoned");
   });
 });
