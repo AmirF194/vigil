@@ -49,7 +49,16 @@ def _mcp_catalogue(registry: Optional["MCPRegistry"]) -> List[Dict[str, Any]]:
     if registry is None:
         return []
     try:
-        return registry.get_all_tools()
+        tools = registry.get_all_tools()
+        # An empty registry is indistinguishable from a deployment carrying no
+        # integrations, and the two resolve differently: fill it from the tools
+        # cache before concluding a capability has nothing to bind to.
+        if not tools:
+            from core.integrations.mcp.registry import populate_from_cache
+
+            if populate_from_cache(registry):
+                tools = registry.get_all_tools()
+        return tools
     except Exception as exc:  # noqa: BLE001
         logger.debug("MCP registry unavailable while resolving tools: %s", exc)
         return []
