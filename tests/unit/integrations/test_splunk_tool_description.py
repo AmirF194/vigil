@@ -61,9 +61,27 @@ _ROWS = [
 def test_names_every_index_and_sourcetype_it_can_see(monkeypatch):
     described = _describe(_load(monkeypatch, _ROWS))["splunk_execute"]
 
-    assert "index=botsv3 sourcetype=stream:dns" in described
-    assert "count=218456" in described
+    assert "index=botsv3" in described
+    assert "stream:dns:~218k" in described
     assert "cisco:asa" in described
+
+
+# tstats reads the index rather than the events, so it is right about which
+# sourcetype is large and wrong about how large. A number stated exactly is a
+# number that gets believed.
+def test_marks_the_counts_approximate_rather_than_stating_them_exactly(monkeypatch):
+    described = _describe(_load(monkeypatch, _ROWS))["splunk_execute"]
+
+    assert "counts approximate" in described
+    assert "218456" not in described
+
+
+# One line per index rather than per sourcetype: the span was the same date repeated
+# once per row, and the description is charged on every call the tool is offered on.
+def test_states_the_span_once_per_index(monkeypatch):
+    described = _describe(_load(monkeypatch, _ROWS))["splunk_execute"]
+
+    assert described.count("2018-08-20") == 1
 
 
 # The date span is the part that was actually missing: everything else can be
@@ -94,7 +112,10 @@ def test_names_the_time_formats_that_work_and_the_one_that_does_not(monkeypatch)
 def test_warns_that_the_natural_language_tool_cannot_set_a_range(monkeypatch):
     described = _describe(_load(monkeypatch, _ROWS))["splunk_nl_search"]
 
-    assert "Cannot express a time range" in described
+    assert "Takes no time range" in described
+    # And carries no map: it has no way to act on one, and the description is
+    # charged on every call. Repeating it there doubled the cost to say nothing.
+    assert "index=botsv3" not in described
 
 
 @pytest.mark.parametrize("rows,service", [(None, object()), ([], object()), ([], None)])

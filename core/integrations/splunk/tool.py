@@ -93,9 +93,13 @@ def generate_spl(query: str, indexes=None):
 # no turn to spend on it and no way to skip it.
 _SUMMARY_SPL = (
     "| tstats count, min(_time) AS earliest, max(_time) AS latest WHERE index=* "
-    "BY index, sourcetype | sort - count | head 40"
+    "BY index, sourcetype | sort - count | head 200"
 )
-_SUMMARY_ROWS = 40
+_SUMMARY_ROWS = 200
+# Sourcetypes named per index before the rest are counted rather than listed. The
+# description is charged on every call the tool is offered on, so its size is a
+# per-call cost, not a one-off.
+_TYPES_NAMED = 12
 # Every accepted form here was tried against this path rather than taken from
 # Splunk's docs: the console's own MM/DD/YYYY:HH:MM:SS is silently empty through
 # the REST search, which is the same dead end this text exists to prevent.
@@ -112,15 +116,59 @@ _WHY_THE_SPAN_MATTERS = (
 _summary_cache: Optional[str] = None
 
 
-def _fmt_span(row: dict) -> str:
-    def when(key: str) -> str:
-        try:
-            stamp = datetime.fromtimestamp(float(row[key]), timezone.utc)
-        except (KeyError, TypeError, ValueError, OSError):
-            return "?"
-        return stamp.strftime("%Y-%m-%d")
+# tstats reads the index rather than the events, so its totals are right about
+# which sourcetype is large and wrong about how large: it reported 1,944,092 for a
+# deployment whose botsv3 index alone holds 2,083,056 by raw count. Rounded and
+# marked approximate, because a number stated exactly is a number that gets
+# believed, and relative magnitude is all a query needs.
+def _approx(count: int) -> str:
+    if count >= 1_000_000:
+        return f"~{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"~{count / 1_000:.0f}k"
+    return str(count)
 
-    return f"{when('earliest')}..{when('latest')}"
+
+def _day(value: object) -> Optional[str]:
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+# Grouped by index, with the span stated once per index. Per-sourcetype it was the
+# same date repeated forty times, which cost tokens on every call to say one fact.
+def _fold_by_index(rows: list) -> dict:
+    held: dict = {}
+    for row in rows:
+        index = row.get("index")
+        if not index:
+            continue
+        at = held.setdefault(index, {"count": 0, "types": [], "days": []})
+        try:
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        at["count"] += count
+        at["types"].append((count, str(row.get("sourcetype") or "?")))
+        edges = (_day(row.get("earliest")), _day(row.get("latest")))
+        at["days"] += [day for day in edges if day]
+    return held
+
+
+def _render_index(index: str, held: dict) -> str:
+    days = sorted(held["days"])
+    if not days:
+        span = ""
+    elif days[0] == days[-1]:
+        span = days[0]
+    else:
+        span = f"{days[0]}..{days[-1]}"
+    named = sorted(held["types"], reverse=True)[:_TYPES_NAMED]
+    rest = len(held["types"]) - len(named)
+    types = " ".join(f"{name}:{_approx(count)}" for count, name in named)
+    more = f" +{rest} more sourcetypes" if rest > 0 else ""
+    return f"  index={index} events={_approx(held['count'])} {span}\n    {types}{more}"
 
 
 # Best effort by design: a summary that cannot be read leaves the plain description
@@ -143,20 +191,16 @@ def _telemetry_summary() -> str:
         logger.debug("could not summarise Splunk telemetry: %s", exc)
         return _summary_cache
 
-    lines = [
-        f"  index={row.get('index')} sourcetype={row.get('sourcetype')} "
-        f"count={row.get('count')} {_fmt_span(row)}"
-        for row in (rows or [])
-        if row.get("index")
-    ]
-    if not lines:
+    by_index = _fold_by_index(list(rows or []))
+    if not by_index:
         return _summary_cache
 
-    held = "\n".join(lines)
+    ordered = sorted(by_index.items(), key=lambda pair: -pair[1]["count"])
+    body = "\n".join(_render_index(index, held) for index, held in ordered)
     _summary_cache = (
-        "\n\nWhat this deployment holds "
-        "(index, sourcetype, event count, UTC date span):\n"
-        f"{held}\n\n{_WHY_THE_SPAN_MATTERS}"
+        "\n\nWhat this deployment holds (UTC date span, then sourcetype:events, "
+        "counts approximate):\n"
+        f"{body}\n\n{_WHY_THE_SPAN_MATTERS}"
     )
     return _summary_cache
 
@@ -185,9 +229,11 @@ async def handle_list_tools():
                 "hostname": {"type": "string"}, "hours": {"type": "integer", "default": 24}
             }, "required": ["hostname"]}),
         types.Tool(name="splunk_nl_search",
-            description="Natural language search (generate + execute). Cannot "
-                        "express a time range, so it reaches only data inside the "
-                        "default window." + telemetry,
+            description="Natural language search (generate + execute). Takes no "
+                        "time range, so it reaches only the last 24 hours and "
+                        "returns nothing on a historical dataset. Prefer "
+                        "splunk_execute, whose description lists what is held and "
+                        "which windows cover it.",
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "max_results": {"type": "integer", "default": 100}
             }, "required": ["query"]}),
