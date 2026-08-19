@@ -5823,6 +5823,29 @@
       white-space: normal;
       vertical-align: top;
       line-height: 1.45;
+      /* Wrapping at spaces is not enough: a hunt's text is full of tokens that
+         contain none — 172.18.0.3:47618->160.79.104.10:443, ev-efbee70bf7a6,
+         sourcetype=aws:cloudwatchlogs:vpcflow — and one of those sets the cell's
+         minimum width, which pushes the table past the modal however the prose
+         around it wraps. `anywhere` also lets the cell shrink below that token. */
+      overflow-wrap: anywhere;
+   }
+
+   /* The same tokens reach the panel outside tables: the report is markdown, and
+      the question a run parks on is a paragraph. */
+   .run-detail .md p,
+   .run-detail .md li,
+   .run-detail .md h1,
+   .run-detail .md h2,
+   .run-detail .md h3,
+   .run-ask {
+      overflow-wrap: anywhere;
+   }
+
+   /* Flex children default to min-width:auto, so the run id and the meta group
+      refuse to shrink and widen the bar instead of wrapping within it. */
+   .run-bar>* {
+      min-width: 0;
    }
 
    .run-detail .tbl tbody td.tight {
