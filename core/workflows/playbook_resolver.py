@@ -357,11 +357,10 @@ def resolve_hunt(
     if definition is None:
         raise UnknownPlaybook(f"no such workflow: {workflow_id}")
 
+    # Empty is the shipped case, not an error: threat-hunt declares no hypotheses
+    # because what a hunt tests belongs to the caller. A run with none from either
+    # source is refused in execute_workflow, which is where a person sees why.
     hypotheses = _strings(definition.metadata.get("hypotheses"))
-    # Refused rather than run: a hunt with nothing to test would open a ledger,
-    # spend a lead turn and conclude having tested nothing.
-    if not hypotheses:
-        raise UnknownPlaybook(f"{workflow_id} declares no hypotheses; there is nothing to test")
 
     playbook = {
         "name": definition.name,

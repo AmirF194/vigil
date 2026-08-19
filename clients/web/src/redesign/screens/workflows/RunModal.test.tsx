@@ -91,13 +91,14 @@ describe('what the run will cost', () => {
     await screen.findByText(/It stops at/)
 
     fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing' } })
+    fireEvent.change(screen.getByLabelText(/Hypothesis/), { target: { value: 'a host beacons' } })
     fireEvent.change(screen.getByLabelText(/Cost ceiling/), { target: { value: '25' } })
     expect(await screen.findByText(/It stops at \$25\.00 whatever happens/)).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /Run workflow/ }))
 
     await waitFor(() => expect(execute).toHaveBeenCalledWith('threat-hunt', {
-      context: 'beaconing', max_cost_usd: 25,
+      context: 'beaconing', hypothesis: 'a host beacons', max_cost_usd: 25,
     }))
   })
 
@@ -107,6 +108,7 @@ describe('what the run will cost', () => {
     await screen.findByText(/It stops at/)
 
     fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing' } })
+    fireEvent.change(screen.getByLabelText(/Hypothesis/), { target: { value: 'a host beacons' } })
     fireEvent.change(screen.getByLabelText(/Cost ceiling/), { target: { value: '-3' } })
 
     expect(await screen.findByText(/above 0 and no more than 100/)).toBeInTheDocument()
@@ -129,9 +131,44 @@ describe('after the run starts', () => {
     await screen.findByText(/It stops at/)
 
     fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing on the finance subnet' } })
+    fireEvent.change(screen.getByLabelText(/Hypothesis/), { target: { value: 'a host beacons' } })
     fireEvent.click(screen.getByRole('button', { name: /Run workflow/ }))
 
     expect(await screen.findByText(/It runs on the server whether this stays open or not/)).toBeInTheDocument()
     expect(await screen.findByText('run-abc1')).toBeInTheDocument()
+  })
+})
+
+describe('a hunt tests what the operator states', () => {
+  it('will not start on a target with no belief to test', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([]))
+    open()
+    await screen.findByText(/It stops at/)
+
+    fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing' } })
+
+    expect(screen.getByRole('button', { name: /Run workflow/ })).toBeDisabled()
+  })
+
+  it('starts once a belief is stated', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([]))
+    open()
+    await screen.findByText(/It stops at/)
+
+    fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing' } })
+    fireEvent.change(screen.getByLabelText(/Hypothesis/), { target: { value: 'a host beacons' } })
+
+    expect(screen.getByRole('button', { name: /Run workflow/ })).not.toBeDisabled()
+  })
+
+  // A phase-walking workflow states its own phases and needs no belief.
+  it('asks a phase workflow for no hypothesis', async () => {
+    getWorkflow.mockResolvedValueOnce({ data: {} })
+    open('compose')
+    await waitFor(() => expect(getWorkflow).toHaveBeenCalled())
+
+    fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'ransomware on HOST-42' } })
+
+    expect(screen.getByRole('button', { name: /Run workflow/ })).not.toBeDisabled()
   })
 })

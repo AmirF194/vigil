@@ -488,7 +488,11 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
     ...(isHunt && !turnsBad && iterations.trim() && { iterations: turns }),
     ...(isHunt && !costBad && maxCost.trim() && { max_cost_usd: cost }),
   }
-  const canRun = Object.keys(params).length > 0 && !turnsBad && !costBad && !starting
+  // A hunt ships no hypotheses, so the caller's is the whole board beside the base
+  // rate. Gated here as well as in the service: an operator should not spend a
+  // round trip to be told the run had nothing to test.
+  const needsHypothesis = isHunt && hypothesis.trim() === ''
+  const canRun = Object.keys(params).length > 0 && !turnsBad && !costBad && !needsHypothesis && !starting
 
   const run = async () => {
     setStarting(true)
@@ -520,13 +524,22 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
   return (
     <Popup open onClose={onClose} title={`Run · ${wf.name}`}>
       <div className="flex flex-col gap-3.5">
-        <p className="text-[12.5px] text-tx-3 leading-[1.5]">Provide at least one target, then start the run — the agents work it on the server and History reports where it got to. A finding or case gives the run something to work from, and the report comes back onto the case you pick. On a hunt, each line of Hypothesis goes on the board as its own belief to test, beside the ones the workflow already states.</p>
+        <p className="text-[12.5px] text-tx-3 leading-[1.5]">Provide at least one target, then start the run — the agents work it on the server and History reports where it got to. A finding or case gives the run something to work from, and the report comes back onto the case you pick. A hunt tests what you state: each line of Hypothesis goes on the board as its own belief, and the benign explanation goes up beside them as the claim to beat.</p>
         {error && <div className="text-[12.5px] leading-[1.5]" style={{ color: 'var(--crit)' }}>{error}</div>}
         {isHunt && <Blindness unbound={limits?.capabilities?.unbound ?? []} />}
         <ComboField label="Finding ID" value={findingId} onChange={setFindingId} placeholder="f-20260614-3b5c585e" options={findingOpts} hint={findingOpts.length ? `${findingOpts.length} recent findings — start typing to filter.` : undefined} />
         <ComboField label="Case ID" value={caseId} onChange={setCaseId} placeholder="case-2026-0142" options={caseOpts} />
         <Field label="Context" value={context} onChange={setContext} placeholder="Active ransomware on HOST-42…" textarea />
-        <Field label="Hypothesis" value={hypothesis} onChange={setHypothesis} placeholder="Lateral movement in the finance subnet…" textarea />
+        <Field
+          label="Hypothesis"
+          value={hypothesis}
+          onChange={setHypothesis}
+          placeholder="Lateral movement in the finance subnet…"
+          textarea
+          hint={isHunt
+            ? 'Required, one belief per line. Each goes on the board as its own claim to test. The benign account is added for you as the claim to beat.'
+            : undefined}
+        />
         {isHunt && (
           <Field
             label="Iterations"
@@ -642,6 +655,10 @@ interface HuntStanding {
   statement: string
   status: string
   attack_technique?: string | null
+  /** What evidence bearing on this belief cited. Earned rather than declared: the
+   *  playbook's technique list is the vocabulary a citation is gated against, and
+   *  nothing labels a hypothesis with one. */
+  techniques_cited?: string[]
   resolution_reason?: string | null
   /** hunt_spec, operator or base_rate — which belief the operator put up themselves. */
   provenance?: string
@@ -1067,6 +1084,13 @@ function SteerEntity({
   )
 }
 
+/** What evidence actually cited, falling back to a declared technique so a run
+ *  from before the two were separated still reads correctly. */
+function techniquesOf(h: HuntStanding): string {
+  const cited = h.techniques_cited ?? []
+  return cited.length > 0 ? cited.join(', ') : h.attack_technique || ''
+}
+
 /** The corroboration a verdict rested on, in the report's own words. */
 function strengthLine(s: HuntStrength): string {
   return [
@@ -1091,7 +1115,7 @@ function HuntStandings({ hunt }: { hunt: HuntView }) {
       {hunt.hypotheses.length > 0 && (
         <div className="table-wrap">
           <table className="tbl">
-            <thead><tr><th>Statement</th><th>Technique</th><th>Standing</th></tr></thead>
+            <thead><tr><th>Statement</th><th>Techniques cited</th><th>Standing</th></tr></thead>
             <tbody>
               {hunt.hypotheses.map((h) => {
                 const strength = strengthOf(h.hypothesis_id)
@@ -1103,7 +1127,7 @@ function HuntStandings({ hunt }: { hunt: HuntView }) {
                       {h.resolution_reason && <div className="muted text-[11px]">{h.resolution_reason}</div>}
                       {strength && <div className="muted text-[11px]">{strengthLine(strength)}</div>}
                     </td>
-                    <td className="muted tight">{h.attack_technique || '—'}</td>
+                    <td className="muted tight">{techniquesOf(h) || '—'}</td>
                     <td className="tight"><span style={{ color: hypothesisColor(h.status) }}>{h.status}</span></td>
                   </tr>
                 )

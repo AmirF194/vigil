@@ -59,9 +59,15 @@ def _asked_hypotheses(parameters: Optional[Dict[str, Any]]) -> List[str]:
     return [line.strip() for line in str(stated).splitlines() if line.strip()]
 
 
-def _nothing_to_run(workflow: "WorkflowDefinition") -> str:
+# A hunt tests what it was given, from the definition or from this caller. Neither
+# is required to carry one on its own; between them one is, or the run would open a
+# ledger, spend a lead turn and conclude having tested nothing.
+def _nothing_to_run(
+    workflow: "WorkflowDefinition", parameters: Optional[Dict[str, Any]] = None
+) -> str:
     if workflow.run_kind == HUNT_RUN_KIND:
-        return "" if workflow.metadata.get("hypotheses") else "hypotheses"
+        stated = workflow.metadata.get("hypotheses") or _asked_hypotheses(parameters)
+        return "" if stated else "hypotheses"
     return "" if workflow.phases else "phases"
 
 
@@ -390,7 +396,16 @@ class WorkflowsService:
         # Caught here as well as in the resolver, so a definition with nothing to
         # run is refused before it leaves a run record behind. The two loops read
         # different sections, so they are empty in different ways.
-        missing = _nothing_to_run(workflow)
+        missing = _nothing_to_run(workflow, parameters)
+        if missing == "hypotheses":
+            return {
+                "success": False,
+                "error": (
+                    "A hunt needs a hypothesis to test. State one per line in "
+                    "Hypothesis -- what a hunt is out to test is a claim about "
+                    f"your estate, and {workflow_id} ships none."
+                ),
+            }
         if missing:
             return {
                 "success": False,

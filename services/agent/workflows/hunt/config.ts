@@ -144,10 +144,12 @@ export interface HuntSpec extends RunSpec {
   budgets: Budgets;
   hypothesis_loop: boolean;
   hypotheses: string[];
-  // The caller's own, kept apart from the definition's. attack_techniques is
-  // positional against hypotheses, so an appended one would inherit a technique
-  // the playbook author wrote for somebody else's belief.
+  // The caller's own, kept apart from the definition's so the console can show an
+  // operator that the thing they asked about is a thing being tested.
   operator_hypotheses: string[];
+  // The technique vocabulary a worker's citation is gated against, and nothing
+  // else -- not a label per hypothesis. Empty declares no vocabulary, which gates
+  // nothing rather than refusing everything.
   attack_techniques: string[];
   data_domains: string[];
   enrichment: EnrichmentPolicy;

@@ -29,7 +29,8 @@ const hunt = (over = {}) => ({
       hypothesis_id: 'h-3431',
       statement: 'An internal host is beaconing on a regular interval',
       status: 'handed_off',
-      attack_technique: 'T1071.001',
+      attack_technique: null,
+      techniques_cited: ['T1071.001'],
       resolution_reason: 'survived the argue-the-null pass',
       provenance: 'hunt_spec',
     },
@@ -48,12 +49,32 @@ const renderPanel = (over = {}) =>
 const tabTo = (name: RegExp) => fireEvent.click(screen.getByRole('tab', { name }))
 
 describe('what a finished hunt shows an operator', () => {
-  it('names each belief, its technique and where it stands', () => {
+  it('names each belief, the techniques its evidence cited and where it stands', () => {
     renderPanel({ hunt: hunt() })
 
     expect(screen.getByText(/An internal host is beaconing/)).toBeInTheDocument()
     expect(screen.getByText('T1071.001')).toBeInTheDocument()
     expect(screen.getByText('handed_off')).toBeInTheDocument()
+  })
+
+  it('lists every technique the evidence cited, not just the first', () => {
+    renderPanel({ hunt: hunt({ hypotheses: [{ hypothesis_id: 'h-1', statement: 'beaconing', status: 'active', techniques_cited: ['T1071.001', 'T1496'] }] }) })
+
+    expect(screen.getByText('T1071.001, T1496')).toBeInTheDocument()
+  })
+
+  // A run journaled before the vocabulary and the label were separated carries a
+  // declared technique and no citations, and still has to read correctly.
+  it('falls back to a technique an older run declared', () => {
+    renderPanel({ hunt: hunt({ hypotheses: [{ hypothesis_id: 'h-1', statement: 'beaconing', status: 'active', attack_technique: 'T1078' }] }) })
+
+    expect(screen.getByText('T1078')).toBeInTheDocument()
+  })
+
+  it('says nothing rather than inventing a technique for an uncited belief', () => {
+    renderPanel({ hunt: hunt({ hypotheses: [{ hypothesis_id: 'h-1', statement: 'beaconing', status: 'active', techniques_cited: [] }] }) })
+
+    expect(screen.getByText('—')).toBeInTheDocument()
   })
 
   it('marks the belief the operator put up themselves', () => {

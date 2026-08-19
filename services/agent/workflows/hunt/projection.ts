@@ -1,5 +1,6 @@
 import { openCheckpoint, type OpenCheckpoint } from "../../contracts/events.js";
-import { fold, type HuntEvent } from "./ledger.js";
+import { fold, type HuntEvent, type Projection } from "./ledger.js";
+import { citedTechniques } from "./strength.js";
 import { renderReport, type HuntReport } from "./report.js";
 import type { Budgets, Handoff, HuntOutcome, HuntState, HuntStatus, Hypothesis, HypothesisStatus } from "./types.js";
 
@@ -31,7 +32,13 @@ export interface HypothesisStanding {
   hypothesis_id: string;
   statement: string;
   status: HypothesisStatus;
+  // What a belief was declared to test, which nothing declares any more: the
+  // vocabulary gates a citation, it does not label a hypothesis. Kept because the
+  // ledger's own record carries it, and a historical run has one.
   attack_technique: string | null;
+  // What evidence bearing on this belief actually cited -- earned rather than
+  // asserted, and the only technique claim on a hypothesis that anything checked.
+  techniques_cited: string[];
   resolution_reason: string | null;
   // Where the belief came from: the definition, the caller, or the base rate.
   // A console that cannot say which is which cannot show an operator that the
@@ -53,7 +60,7 @@ export function huntProjection(runId: string, events: readonly HuntEvent[]): Hun
     iteration: view.hunt.iteration,
     cost_usd: view.hunt.cost_usd,
     budgets: view.hunt.budgets,
-    hypotheses: [...view.hypotheses.values()].map(standing),
+    hypotheses: [...view.hypotheses.values()].map((hypothesis) => standing(hypothesis, view)),
     evidence_count: view.evidence.size,
     open_checkpoint: open === undefined ? null : openCheckpoint(open),
     report,
@@ -76,7 +83,15 @@ function why(hunt: HuntState): string {
   return (hunt.status === "terminal" ? hunt.termination_reason : hunt.parked_reason) ?? "";
 }
 
-function standing(hypothesis: Hypothesis): HypothesisStanding {
+function standing(hypothesis: Hypothesis, view: Projection): HypothesisStanding {
   const { hypothesis_id, statement, status, attack_technique, resolution_reason, provenance } = hypothesis;
-  return { hypothesis_id, statement, status, attack_technique, resolution_reason, provenance };
+  return {
+    hypothesis_id,
+    statement,
+    status,
+    attack_technique,
+    techniques_cited: citedTechniques(view, hypothesis_id),
+    resolution_reason,
+    provenance,
+  };
 }

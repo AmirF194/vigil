@@ -261,8 +261,6 @@ export function renderReport(report: HuntReport, projection?: Projection): strin
     // The playbook's own label for what this hypothesis tests, distinct from
     // what evidence actually cited below -- a hunt can find something its
     // definition never named.
-    const declared = projection?.hypotheses.get(hypothesis.hypothesis_id)?.attack_technique ?? null;
-    if (declared !== null) lines.push(`**Declared technique:** ${declared}`, "");
     const observed = projection === undefined ? [] : citedTechniques(projection, hypothesis.hypothesis_id);
     if (observed.length > 0) lines.push(`**Techniques cited by evidence:** ${observed.join(", ")}`, "");
     if (hypothesis.evidence_strength !== null) {

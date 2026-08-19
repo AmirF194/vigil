@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { citedTechniques } from "../../workflows/hunt/strength.js";
 import { buildReport, groupedGaps, renderReport, type HuntReport, type VisibilityGap } from "../../workflows/hunt/report.js";
 import { DEFAULT_BUDGETS } from "../../workflows/hunt/types.js";
-import { evidenceOn, newLedger, relate } from "../support/hunt.js";
+import { evidenceOn, newLedger } from "../support/hunt.js";
 
 // A fan-out hands every worker the same query_intent, so four failed workers
 // printed one 300-character intent four times over and buried the reasons that
@@ -131,18 +131,23 @@ describe("citing a technique beside a claim", () => {
     expect(citedTechniques(started.ledger.projection, started.hypothesisIds[0]!)).toEqual([]);
   });
 
-  it("renders both lines when the report is given the live projection", async () => {
+  // The split: attack_techniques is the vocabulary a citation is gated against and
+  // never a label on a belief. It used to be paired against `hypotheses` by list
+  // position, which asserted a technique nobody had checked and made hypothesis
+  // order load-bearing. What a belief is about is what its evidence cited.
+  it("reports the technique evidence cited, not one the vocabulary happened to list first", async () => {
     const started = await newLedger({
       hypotheses: ["a host is beaconing to C2"],
-      attackTechniques: ["T1071.001"],
+      attackTechniques: ["T1071.001", "T1496"],
     });
     const hypothesisId = started.hypothesisIds[0]!;
-    evidenceOn(started.ledger, hypothesisId, { attackTechnique: "T1496" });
+    expect(started.ledger.projection.hypotheses.get(hypothesisId)?.attack_technique).toBeNull();
 
+    evidenceOn(started.ledger, hypothesisId, { attackTechnique: "T1496" });
     const rendered = renderReport(buildReport(started.ledger.projection), started.ledger.projection);
 
-    expect(rendered).toMatch(/\*\*Declared technique:\*\* T1071\.001/);
     expect(rendered).toMatch(/\*\*Techniques cited by evidence:\*\* T1496/);
+    expect(rendered).not.toMatch(/Declared technique/);
   });
 
   it("renders neither line without a projection, and buildReport's own shape is untouched", async () => {

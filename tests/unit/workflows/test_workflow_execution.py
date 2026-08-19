@@ -279,3 +279,38 @@ async def test_the_cost_ceiling_rides_the_job(monkeypatch, asked, expected):
     # would fail the run at spec assembly rather than be ignored.
     if expected is not None:
         assert set(captured["job"]["request"]["overrides"]) == {"budgets"}
+
+
+# The run is where the belief has to exist, because the run is where a person is
+# there to be told. The definition ships none on purpose.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "asked,refused",
+    [
+        ({"context": "beaconing"}, True),
+        ({"finding_id": "f-1"}, True),
+        ({"context": "beaconing", "hypothesis": "  \n "}, True),
+        ({"context": "beaconing", "hypothesis": "a host beacons"}, False),
+        ({"hypothesis": "a host beacons"}, False),
+    ],
+)
+async def test_a_hunt_needs_a_belief_from_someone(monkeypatch, asked, refused):
+    hunt = WorkflowDefinition(
+        workflow_id="threat-hunt",
+        file_path=None,
+        metadata={"name": "Threat Hunt", "run_kind": "hunt", "hypotheses": []},
+        body="",
+    )
+    monkeypatch.setattr(WorkflowsService, "get_workflow", lambda self, wid: hunt)
+
+    with patch(
+        "core.workflows.workflow_run_service.WorkflowRunService.begin_run",
+        return_value="run-1",
+    ), patch("core.agents.queue.enqueue_run", new=AsyncMock(return_value="job-1")):
+        result = await WorkflowsService().execute_workflow("threat-hunt", asked)
+
+    if refused:
+        assert result["success"] is False
+        assert "needs a hypothesis" in result["error"]
+    else:
+        assert result.get("success") is True

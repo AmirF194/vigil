@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import yaml
 
@@ -28,8 +30,21 @@ class TestThePlaybookLayer:
     def test_carries_the_hypotheses_the_definition_states(self, resolved):
         playbook, _ = resolved
         stated = playbook["hypotheses"]
-        assert stated
         assert all(isinstance(one, str) and one.strip() for one in stated)
+
+    # Shipping none is the point: a default belief is a claim about somebody else's
+    # estate, and the two that used to sit here described one intrusion pattern.
+    def test_ships_no_belief_of_its_own(self, resolved):
+        playbook, _ = resolved
+        assert playbook["hypotheses"] == []
+
+    # The vocabulary a citation is gated against, so it has to span what a hunt
+    # over the declared domains could find rather than what one scenario expects.
+    def test_declares_a_technique_vocabulary_wider_than_one_scenario(self, resolved):
+        playbook, _ = resolved
+        techniques = playbook["attack_techniques"]
+        assert len(techniques) > 10
+        assert all(re.fullmatch(r"T\d{4}(\.\d{3})?", one) for one in techniques)
 
     def test_carries_the_sections_the_hunt_owns(self, resolved):
         playbook, _ = resolved
@@ -126,10 +141,15 @@ class TestRefusals:
 
         assert _nothing_to_run(_hunt(hypotheses=["something to test"])) == ""
         assert _nothing_to_run(_hunt()) == "hypotheses"
+        # The caller's belief counts: the shipped definition states none.
+        assert _nothing_to_run(_hunt(), {"hypothesis": "a host beacons"}) == ""
+        assert _nothing_to_run(_hunt(), {"hypothesis": "   \n  "}) == "hypotheses"
+        assert _nothing_to_run(_hunt(), {"context": "no belief here"}) == "hypotheses"
 
-    # Refused rather than run: a hunt with nothing to test opens a ledger, spends
-    # a lead turn and concludes having tested nothing.
-    def test_refuses_a_definition_with_nothing_to_test(self):
+    # The refusal moved to the run, where a person sees it. A definition declaring
+    # none resolves fine -- that is the shipped case -- and execute_workflow is what
+    # stops a run that has no belief from either source.
+    def test_resolves_a_definition_that_ships_no_belief(self):
         class _Empty:
             metadata: dict = {}
             name = "x"
@@ -142,8 +162,8 @@ class TestRefusals:
             def get_workflow(self, _id):
                 return _Empty()
 
-        with pytest.raises(UnknownPlaybook, match="no hypotheses"):
-            resolve_hunt("threat-hunt", workflows=_Workflows())
+        playbook, _ = resolve_hunt("threat-hunt", workflows=_Workflows())
+        assert yaml.safe_load(playbook)["hypotheses"] == []
 
     def test_refuses_a_workflow_that_does_not_exist(self):
         with pytest.raises(UnknownPlaybook):

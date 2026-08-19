@@ -343,14 +343,18 @@ export async function startHunt(
     started_by: startedBy,
   });
 
-  for (const [index, statement] of spec.hypotheses.entries()) {
+  for (const statement of spec.hypotheses) {
     ledger.append({
       kind: "hypothesis",
       payload: {
         hypothesis_id: newId("h", 4),
         statement,
         status: "active",
-        attack_technique: spec.attack_techniques[index] ?? null,
+        // A belief declares no technique. attack_techniques is the vocabulary a
+        // worker's citation is gated against, not a per-hypothesis label, and
+        // pairing the two by list position made hypothesis order load-bearing.
+        // What a hypothesis is about is what its evidence cited.
+        attack_technique: null,
         provenance: "hunt_spec",
         resolution_reason: null,
         evidence_strength: null,
