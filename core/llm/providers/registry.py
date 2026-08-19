@@ -253,9 +253,22 @@ _OPENAI_TIERS: Tuple[_TierPattern, ...] = (
     (r"o1", 15.0, 60.0),
 )
 
+# Vertex serves both families, so the model id picks the rate card: Gemini at
+# Google's rates, Claude at Anthropic's. Without an entry a Vertex model is
+# unpriced, and the run budget refuses to start a run it cannot cost.
+_VERTEX_TIERS: Tuple[_TierPattern, ...] = (
+    (r"flash-lite", 0.10, 0.40),
+    (r"flash", 0.30, 2.50),
+    (r"gemini.*pro", 1.25, 10.0),
+    (r"opus", 15.0, 75.0),
+    (r"sonnet", 3.0, 15.0),
+    (r"haiku", 0.80, 4.0),
+)
+
 _TIER_HEURISTIC: Dict[str, Tuple[_TierPattern, ...]] = {
     "anthropic": _ANTHROPIC_TIERS,
     "openai": _OPENAI_TIERS,
+    "vertex": _VERTEX_TIERS,
     "ollama": (),  # always $0 — handled as a separate branch
 }
 
