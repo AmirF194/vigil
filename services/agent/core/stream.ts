@@ -65,6 +65,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
   // could possibly send is the one that goes unfolded. Retrying that identically is
   // three times the cost for the same answer, so the retry sends less instead.
   private tightened: FoldPolicy | null = null;
+  private folds = 0;
   private turns = 0;
   private capped = false;
   private prose = "";
@@ -234,8 +235,10 @@ class Run<T, Kinds extends Record<string, unknown>> {
       try {
         turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema });
       } catch (error) {
-        if (this.tightened !== null || this.cfg.signal?.aborted === true) throw error;
-        this.tightened = TIGHT_FOLD;
+        const tighter = FOLD_LADDER[this.folds];
+        if (tighter === undefined || this.cfg.signal?.aborted === true) throw error;
+        this.tightened = tighter;
+        this.folds += 1;
         this.rejected.push(`the emission call failed (${(error as Error).message}); asked again over a folded transcript`);
         attempt -= 1;
         continue;
@@ -433,9 +436,15 @@ class Folder<Kinds extends Record<string, unknown>> {
   }
 }
 
-// Half the tail and a quarter of the ceiling: enough recent turns to write over, and
-// small enough that the retry is a different request rather than the same one.
-const TIGHT_FOLD: FoldPolicy = { head: 2, tail: 4, max_messages: 10 };
+// Tried in order, one step per failed write-up. A gateway holds a ceiling on how long
+// one call may take, and a write-up composed over eight groups of results is the call
+// most likely to cross it: measured, one over a single group streams without pausing
+// where the unfolded request went quiet for half a minute. Raising the ceiling is the
+// real fix and belongs to the deployment; this is what the run can do unaided.
+const FOLD_LADDER: readonly FoldPolicy[] = [
+  { head: 2, tail: 4, max_messages: 10 },
+  { head: 1, tail: 1, max_messages: 4 },
+];
 
 // Names what was dropped rather than reproducing it: a summary that quotes the
 // middle back is the middle, and folds nothing.
@@ -463,10 +472,17 @@ function parseArgs(raw: string): Record<string, unknown> | null {
 
 function tryParse(content: string): unknown {
   try {
-    return JSON.parse(content);
+    return JSON.parse(fenceless(content));
   } catch {
     return undefined;
   }
+}
+
+// Some models return the object inside a markdown code fence, which is a correct
+// answer this layer would otherwise reject as unparseable and pay to ask again.
+function fenceless(content: string): string {
+  const fenced = /^\s*```(?:json)?\s*([\s\S]*?)\s*```\s*$/.exec(content);
+  return fenced === null ? content : fenced[1]!;
 }
 
 const ajv = new Ajv({ allErrors: true, strict: false });

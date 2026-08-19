@@ -380,14 +380,15 @@ describe("what the stream reports", () => {
     const harness = harnessOf([
       { calls: [], tokens: { input: 40 } },
       { fail: "the gateway hung up", tokens: { input: 7 } },
-      // The write-up is asked again over a folded transcript; this one dies too, so
-      // the run still fails -- and every one of the three is billed.
+      // The write-up is asked again over each step of the fold ladder; all of them die,
+      // so the run still fails -- and every one of the four calls is billed.
       { fail: "the gateway hung up", tokens: { input: 3 } },
+      { fail: "the gateway hung up", tokens: { input: 2 } },
     ]);
     const { seen, outcome } = await watch(config(), harness);
 
-    expect(seen.flatMap((event) => (event.type === "usage" ? [event.payload.tokens.input] : []))).toEqual([40, 7, 3]);
-    expect(harness.budget.spent.tokens.input).toBe(50);
+    expect(seen.flatMap((event) => (event.type === "usage" ? [event.payload.tokens.input] : []))).toEqual([40, 7, 3, 2]);
+    expect(harness.budget.spent.tokens.input).toBe(52);
     // Ends on the stream rather than off the side of it: a caller reading only
     // events must see the run end, not have the loop throw past it.
     expect(seen.at(-1)?.type).toBe("failed");
