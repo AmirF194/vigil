@@ -104,15 +104,27 @@ _TYPES_NAMED = 12
 # Splunk's docs: the console's own MM/DD/YYYY:HH:MM:SS is silently empty through
 # the REST search, which is the same dead end this text exists to prevent.
 _WHY_THE_SPAN_MATTERS = (
-    "The date span is the point: `earliest` defaults to -24h, so a historical "
-    "dataset returns nothing at all unless you widen it to cover the span above. "
-    "Empty results against a span you did not cover are a gap in what you looked "
-    "at, not an absence of evidence.\n"
+    "`earliest` defaults to 0, which is all time, so a query reaches the whole span "
+    "above unless you narrow it deliberately. Empty results against a span you did "
+    "narrow are a gap in what you looked at, not an absence of evidence. This used to "
+    "default to -24h, and every telemetry query in a hunt over a 2018 dataset came "
+    "back empty while reading as though nothing was there.\n"
     "`earliest` takes a relative offset (-15y), an ISO 8601 timestamp "
     "(2018-08-19T00:00:00) or an epoch second. It does NOT take Splunk's console "
     "form (08/19/2018:00:00:00), which returns nothing here. There is no `latest` "
     "parameter; the window always ends now, which covers any past span."
 )
+# Splunk's own all-time earliest. A tool that answers over the span the index holds
+# needs no operator to guess the span first, and a narrower default is a silent zero
+# on any data older than it.
+_ALL_TIME = "0"
+
+# search_by_ip and search_by_hostname build their window as -{hours}h, and the client
+# they call is also the daemon's, so widening it here rather than there leaves the
+# daemon's polling window alone. A century covers any index.
+# ponytail: hours arithmetic, not an epoch -- the helpers take no earliest to pass.
+_ALL_TIME_HOURS = 876_000
+
 _summary_cache: Optional[str] = None
 
 
@@ -217,23 +229,22 @@ async def handle_list_tools():
             description="Execute SPL query" + telemetry,
             inputSchema={"type": "object", "properties": {
                 "spl_query": {"type": "string"},
-                "earliest": {"type": "string", "default": "-24h"},
+                "earliest": {"type": "string", "default": "0"},
                 "max_results": {"type": "integer", "default": 100}
             }, "required": ["spl_query"]}),
         types.Tool(name="splunk_search_ip", description="Search events for IP",
             inputSchema={"type": "object", "properties": {
-                "ip_address": {"type": "string"}, "hours": {"type": "integer", "default": 24}
+                "ip_address": {"type": "string"}, "hours": {"type": "integer"}
             }, "required": ["ip_address"]}),
         types.Tool(name="splunk_search_host", description="Search events for hostname",
             inputSchema={"type": "object", "properties": {
-                "hostname": {"type": "string"}, "hours": {"type": "integer", "default": 24}
+                "hostname": {"type": "string"}, "hours": {"type": "integer"}
             }, "required": ["hostname"]}),
         types.Tool(name="splunk_nl_search",
             description="Natural language search (generate + execute). Takes no "
-                        "time range, so it reaches only the last 24 hours and "
-                        "returns nothing on a historical dataset. Prefer "
-                        "splunk_execute, whose description lists what is held and "
-                        "which windows cover it.",
+                        "time range and reaches all time. Prefer splunk_execute, "
+                        "whose description lists what is held and which windows "
+                        "cover it, and which lets you narrow the span yourself.",
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "max_results": {"type": "integer", "default": 100}
             }, "required": ["query"]}),
@@ -258,7 +269,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
         if not splunk:
             return result({"error": "Splunk not configured", "spl": spl})
         try:
-            results = splunk.search(spl, args.get("earliest", "-24h"), "now", args.get("max_results", 100))
+            results = splunk.search(spl, args.get("earliest", _ALL_TIME), "now", args.get("max_results", 100))
             return result({"success": True, "query": spl, "count": len(results or []), "results": results or []})
         except Exception as e:
             return result({"error": str(e), "query": spl})
@@ -271,7 +282,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
         if not splunk:
             return result({"error": "Splunk not configured"})
         try:
-            results = splunk.search_by_ip(ip, args.get("hours", 24))
+            results = splunk.search_by_ip(ip, args.get("hours") or _ALL_TIME_HOURS)
             return result({"success": True, "ip": ip, "count": len(results or []), "results": results or []})
         except Exception as e:
             return result({"error": str(e)})
@@ -284,7 +295,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
         if not splunk:
             return result({"error": "Splunk not configured"})
         try:
-            results = splunk.search_by_hostname(host, args.get("hours", 24))
+            results = splunk.search_by_hostname(host, args.get("hours") or _ALL_TIME_HOURS)
             return result({"success": True, "hostname": host, "count": len(results or []), "results": results or []})
         except Exception as e:
             return result({"error": str(e)})
@@ -298,7 +309,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
         if not splunk:
             return result({"error": "Splunk not configured", "generated_spl": spl_result})
         try:
-            results = splunk.search(spl_result["spl_query"], "-24h", "now", args.get("max_results", 100))
+            results = splunk.search(spl_result["spl_query"], _ALL_TIME, "now", args.get("max_results", 100))
             return result({
                 "success": True, "query": query, "spl": spl_result["spl_query"],
                 "pattern": spl_result["pattern"], "count": len(results or []), "results": results or []

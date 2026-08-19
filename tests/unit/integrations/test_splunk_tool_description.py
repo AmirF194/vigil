@@ -90,7 +90,9 @@ def test_carries_the_date_span_and_says_why_it_matters(monkeypatch):
     described = _describe(_load(monkeypatch, _ROWS))["splunk_execute"]
 
     assert "2018-08-20" in described
-    assert "-24h" in described
+    # All time, and said so: a narrower default returns a silent zero on any data
+    # older than it, which is what sent three hunts looking at nothing.
+    assert "defaults to 0" in described
     assert "not an absence of evidence" in described
 
 
