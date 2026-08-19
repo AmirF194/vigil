@@ -6,7 +6,10 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { RunDetail } from './WorkflowsScreen'
 
 vi.mock('../../../services/api', () => ({
-  workflowApi: { steer: vi.fn(() => Promise.resolve({ data: {} })) },
+  workflowApi: {
+    steer: vi.fn(() => Promise.resolve({ data: {} })),
+    cancelRun: vi.fn(() => Promise.resolve({ data: {} })),
+  },
   agentsApi: { listAgents: vi.fn(() => Promise.resolve({ data: { agents: [] } })) },
   findingsApi: { getAll: vi.fn(() => Promise.resolve({ data: { findings: [] } })) },
   casesApi: { getAll: vi.fn(() => Promise.resolve({ data: { cases: [] } })) },
@@ -38,6 +41,11 @@ const detail = (over = {}) => ({ run_id: 'run-1', status: 'completed', ...over }
 
 const renderPanel = (over = {}) =>
   render(<RunDetail d={detail(over)} onSteered={() => {}} />)
+
+/** The panel is four views of one run rather than five stacked tables, so a test
+ *  about one of them says which. A tab that is not offered at all is a claim in
+ *  itself and getByRole fails loudly rather than silently finding nothing. */
+const tabTo = (name: RegExp) => fireEvent.click(screen.getByRole('tab', { name }))
 
 describe('what a finished hunt shows an operator', () => {
   it('names each belief, its technique and where it stands', () => {
@@ -110,6 +118,7 @@ describe('what the hunt could not see', () => {
 
   it('lists an unbound capability as a visibility gap', () => {
     renderPanel({ hunt: hunt({ report: blind }) })
+    tabTo(/^Gaps/)
 
     expect(screen.getByText('Visibility gaps (1)')).toBeInTheDocument()
     expect(screen.getByText(/answers telemetry_search/)).toBeInTheDocument()
@@ -117,13 +126,17 @@ describe('what the hunt could not see', () => {
 
   it('says a gap that names no hypothesis is unattributed rather than blank', () => {
     renderPanel({ hunt: hunt({ report: blind }) })
+    tabTo(/^Gaps/)
 
     expect(screen.getByText('unattributed')).toBeInTheDocument()
   })
 
-  it('shows no gap section at all when every query came back', () => {
+  // Not offered rather than offered empty: a tab that opens onto nothing reads as
+  // a section that failed to load.
+  it('offers no gap view at all when every query came back', () => {
     renderPanel({ hunt: hunt({ report: { gaps: [], checkpoints: [], hypotheses: [] } }) })
 
+    expect(screen.queryByRole('tab', { name: /^Gaps/ })).toBeNull()
     expect(screen.queryByText(/Visibility gaps/)).toBeNull()
   })
 })
@@ -137,6 +150,7 @@ describe('escalations and supervision', () => {
         ],
       }),
     })
+    tabTo(/^Escalations/)
 
     expect(screen.getByText('Escalated to incident response (1)')).toBeInTheDocument()
     expect(screen.getByText('case-25aac39c')).toBeInTheDocument()
@@ -161,6 +175,7 @@ describe('escalations and supervision', () => {
         },
       }),
     })
+    tabTo(/^Escalations/)
 
     expect(screen.getByText('Mark h-3431 proven?')).toBeInTheDocument()
     expect(screen.getByText(/approve by matthewmorris/)).toBeInTheDocument()
@@ -178,6 +193,7 @@ describe('escalations and supervision', () => {
         },
       }),
     })
+    tabTo(/^Escalations/)
 
     expect(screen.getByText('still pending')).toBeInTheDocument()
   })
@@ -189,7 +205,7 @@ describe('the report', () => {
   it('renders the hunt report as soon as the projection carries one', () => {
     renderPanel({ hunt: hunt({ report_markdown: '## Verdicts\n\nNothing was proven.' }) })
 
-    expect(screen.getByRole('heading', { name: 'Hunt report' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Report', selected: true })).toBeInTheDocument()
     expect(screen.getByText('Nothing was proven.')).toBeInTheDocument()
   })
 
@@ -232,6 +248,7 @@ describe('gaps read as questions, not as workers', () => {
         },
       }),
     })
+    tabTo(/^Gaps/)
 
     expect(screen.getAllByText(/Determine reputation and ASN/)).toHaveLength(1)
     expect(screen.getByText('3 workers, same question.')).toBeInTheDocument()
@@ -247,6 +264,7 @@ describe('gaps read as questions, not as workers', () => {
         },
       }),
     })
+    tabTo(/^Gaps/)
 
     expect(screen.getByText('worker failed: calls_exhausted')).toBeInTheDocument()
     expect(screen.getByText('worker failed: timeout')).toBeInTheDocument()
@@ -258,6 +276,7 @@ describe('gaps read as questions, not as workers', () => {
     renderPanel({
       hunt: hunt({ report: { gaps: [same('ev-1'), same('ev-2')], checkpoints: [], hypotheses: [] } }),
     })
+    tabTo(/^Gaps/)
 
     expect(screen.getByText('Visibility gaps (2)')).toBeInTheDocument()
   })
@@ -320,5 +339,37 @@ describe('answering a checkpoint the hunt is parked on', () => {
     renderPanel({ hunt: hunt() })
 
     expect(screen.queryByText(/Waiting on you/)).toBeNull()
+  })
+})
+
+// Stop ended the run and its spend on one click, styled as a peer of the notes
+// the lead reads at its next turn. It now sits with the run's own status and asks.
+describe('ending a run', () => {
+  const live = () => renderPanel({ status: 'running', hunt: hunt({ status: 'running' }) })
+
+  it('asks before it fires, and does not fire on the ask', async () => {
+    const { workflowApi } = await import('../../../services/api')
+    live()
+
+    fireEvent.click(screen.getByRole('button', { name: /Stop/ }))
+
+    expect(screen.getByText(/It cannot be resumed/)).toBeInTheDocument()
+    expect(workflowApi.cancelRun).not.toHaveBeenCalled()
+  })
+
+  it('cancels the run once confirmed', async () => {
+    const { workflowApi } = await import('../../../services/api')
+    live()
+
+    fireEvent.click(screen.getByRole('button', { name: /Stop/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+
+    expect(workflowApi.cancelRun).toHaveBeenCalledWith('run-1', 'stopped from the console')
+  })
+
+  it('offers nothing to stop on a run that already ended', () => {
+    renderPanel({ hunt: hunt() })
+
+    expect(screen.queryByRole('button', { name: /Stop/ })).toBeNull()
   })
 })

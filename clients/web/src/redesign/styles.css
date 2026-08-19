@@ -4033,6 +4033,18 @@
       background: var(--crit-dim);
    }
 
+   /* The confirmed half of a destructive pair: filled, so it reads as the commit
+      rather than as a second way to ask. */
+   .btn.danger.solid {
+      background: var(--crit);
+      color: #fff;
+   }
+
+   .btn.danger.solid:hover {
+      background: var(--crit);
+      filter: brightness(1.08);
+   }
+
    .feedback-box {
       width: 100%;
       min-height: 70px;
@@ -5802,6 +5814,92 @@
 
    .run-detail .tbl {
       margin-top: 4px;
+   }
+
+   /* A hunt's cells hold prose — statements, questions, the reason a query came
+      back empty. Under the table's default nowrap a 300-character intent pushed
+      the table wider than the modal and the panel scrolled sideways. */
+   .run-detail .tbl tbody td {
+      white-space: normal;
+      vertical-align: top;
+      line-height: 1.45;
+   }
+
+   .run-detail .tbl tbody td.tight {
+      white-space: nowrap;
+      width: 1%;
+   }
+
+   /* What the run is doing, and the one control that ends it. Stop lives with the
+      run's own state rather than among the steering directives. */
+   .run-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 9px 0 11px;
+      border-bottom: 1px solid var(--line-soft);
+   }
+
+   .run-bar .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 600;
+   }
+
+   .run-bar .pill .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+   }
+
+   .run-bar .meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--tx-2);
+   }
+
+   .run-bar .meta b {
+      color: var(--tx);
+      font-weight: 600;
+   }
+
+   .run-bar .sep {
+      width: 1px;
+      height: 18px;
+      background: var(--line);
+   }
+
+   .budget-track {
+      width: 70px;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--bg-3);
+      overflow: hidden;
+   }
+
+   .budget-fill {
+      height: 100%;
+      background: var(--accent);
+   }
+
+   /* The one thing on the panel waiting on a person, so it sits above the tabs
+      rather than inside one of them. */
+   .run-ask {
+      margin-top: 14px;
+      padding: 13px 15px;
+      border-left: 3px solid var(--high);
+      border-radius: var(--r);
+      background: var(--high-dim);
+   }
+
+   .run-detail .detail-tabs {
+      padding: 10px 0;
    }
 
    .tech-expand>td {

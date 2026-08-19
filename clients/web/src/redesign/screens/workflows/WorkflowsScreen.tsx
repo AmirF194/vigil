@@ -337,24 +337,59 @@ function DetailsModal({ wf, onClose }: { wf: Workflow; onClose: () => void }) {
   )
 }
 
-/** The run this modal just started, watched with the hook History uses. Closing
- *  the modal does not stop the run — it only stops looking at it. */
-function StartedRun({ runId, onClose }: { runId: string; onClose: () => void }) {
+/** The run this modal just started. It confirms the run reached the server and
+ *  hands off to History rather than becoming a second live view of it — the same
+ *  panel in two places is the same panel kept in sync by hand. */
+function StartedRun({ runId, onView, onClose }: { runId: string; onView: () => void; onClose: () => void }) {
   const { detail, load } = useRunDetail(runId, true, 'running')
   useEffect(() => { void load() }, [load])
 
   return (
-    <div className="flex flex-col gap-3.5">
-      <p className="text-[12.5px] text-tx-3 leading-[1.5]">
-        Started. It runs on the server whether this stays open or not — History has it under{' '}
-        <span className="mono">{runId.slice(0, 8)}</span>.
-      </p>
-      {detail === null
-        ? <div className="muted text-[12.5px]">Waiting for the run to open its ledger…</div>
-        : <RunDetail d={detail} onSteered={() => { void load() }} />}
-      <div className="flex justify-end gap-2.5 pt-1">
-        <button className="btn ghost" onClick={onClose}>Close</button>
+    <div className="flex flex-col items-center gap-3.5 text-center">
+      <div className="w-11 h-11 rounded-full grid place-items-center bg-ok-dim" style={{ color: 'var(--ok)' }}>
+        <Icon name="check" size={22} />
       </div>
+      <p className="text-[14.5px] font-semibold">Started</p>
+      <p className="text-[12.5px] text-tx-3 leading-[1.5] max-w-[340px]">
+        It runs on the server whether this stays open or not. Everything from here — beliefs, evidence, cost and
+        any checkpoint it raises — lives in History.
+      </p>
+      <span className="mono text-[11.5px] text-tx-3 bg-bg-2 border border-line rounded-md px-2.5 py-1">{runId.slice(0, 8)}</span>
+      <StartedPreview detail={detail} />
+      <div className="flex gap-2.5 w-full pt-1">
+        <button className="btn ghost flex-1 justify-center" onClick={onClose}>Close</button>
+        <button className="btn primary flex-1 justify-center" onClick={onView}>View in History <Icon name="chevR" size={14} /></button>
+      </div>
+    </div>
+  )
+}
+
+/** The first seconds of the run, so that Started is a fact about the ledger and
+ *  not just about the POST. A hunt raises its approval checkpoint immediately, and
+ *  whether policy answered it or the operator has to is the one thing worth
+ *  knowing before this closes. */
+function StartedPreview({ detail }: { detail: WfRunDetail | null }) {
+  if (detail === null) {
+    return <div className="muted text-[12px] w-full text-left px-3 py-2.5 rounded-[9px] border border-line-soft bg-bg">Waiting for the run to open its ledger…</div>
+  }
+  const hunt = detail.hunt ?? null
+  const open = hunt?.open_checkpoint ?? null
+  return (
+    <div className="w-full text-left rounded-[9px] border border-line-soft bg-bg px-3 py-2.5">
+      <div className="text-[11.5px] font-semibold flex items-center gap-1.5" style={{ color: runStatusColor(detail.status) }}>
+        <span className="w-1.5 h-1.5 rounded-full bg-current" />{detail.status}
+      </div>
+      {open === null && (
+        <div className="text-[12px] text-tx-3 leading-[1.5] mt-1.5">
+          {hunt ? `Iteration ${hunt.iteration} · ${hunt.evidence_count} piece(s) of evidence` : 'No checkpoint raised.'}
+        </div>
+      )}
+      {open !== null && (
+        <>
+          <div className="text-[10.5px] uppercase tracking-[0.05em] text-tx-faint mt-2 mb-1">Waiting on you</div>
+          <div className="text-[12px] text-tx-2 leading-[1.5]">{open.question}</div>
+        </>
+      )}
     </div>
   )
 }
@@ -385,7 +420,7 @@ function Blindness({ unbound }: { unbound: string[] }) {
   if (unbound.length === 0) return null
   const blind = unbound.includes('telemetry_search')
   return (
-    <div className="text-[12.5px] leading-[1.5]" style={{ color: 'var(--warn, var(--crit))' }}>
+    <div className="text-[12.5px] leading-[1.5]" style={{ color: 'var(--high)' }}>
       No tool here answers {unbound.join(', ')}.{' '}
       {blind
         ? 'Without telemetry_search the hunt cannot query a SIEM, so it can corroborate nothing and will report that nothing was proven — a fact about this deployment, not about your estate.'
@@ -453,22 +488,24 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
     setError(null)
     try {
       const res = await workflowApi.execute(wf.id, withTurns)
-      setStartedId((res.data as { run_id?: string })?.run_id ?? null)
+      const started = (res.data as { run_id?: string })?.run_id ?? null
       setStarting(false)
-      onStarted()
+      // Without an id there is nothing to confirm or link to, so go straight to
+      // History rather than sitting on a form that looks like it did nothing.
+      if (started === null) onStarted()
+      else setStartedId(started)
     } catch (e) {
       setError(errMsg(e))
       setStarting(false)
     }
   }
 
-  // Started: the modal becomes the run's own view rather than closing on it. The
-  // first checkpoint and the first dispatch both land within seconds, and they
-  // are the two moments worth watching.
+  // Started: confirm it, show the first thing the ledger says, and let the
+  // operator decide whether to follow it into History.
   if (startedId !== null) {
     return (
       <Popup open onClose={onClose} title={`Run · ${wf.name}`}>
-        <StartedRun runId={startedId} onClose={onClose} />
+        <StartedRun runId={startedId} onView={onStarted} onClose={onClose} />
       </Popup>
     )
   }
@@ -554,7 +591,7 @@ function HistoryModal({ wf, onClose }: { wf: Workflow; onClose: () => void }) {
   useEffect(() => load(), [load])
 
   return (
-    <Popup open onClose={onClose} title={`History · ${wf.name}`} width={720}>
+    <Popup open onClose={onClose} title={`History · ${wf.name}`} width={840}>
       {phase === 'loading' && <EmptyState loading compact icon="clock" title="Loading run history…" />}
       {phase === 'error' && <EmptyState error compact icon="alert" title="Couldn’t load history" body={error} primary={{ label: 'Retry', onClick: load, icon: 'refresh' }} />}
       {phase === 'ready' && runs.length === 0 && <EmptyState compact icon="clock" title="No runs yet" body="Run this workflow to capture execution history, duration, trigger, and cost." />}
@@ -627,13 +664,23 @@ interface HuntReport {
   hypotheses: { hypothesis_id: string; evidence_strength?: HuntStrength | null }[]
   unruled?: number
 }
+interface HuntBudgets {
+  max_iterations: number
+  max_cost_usd: number
+}
 interface HuntView {
   // The projection has always carried it; the type never said so.
   run_id?: string
   status: string
+  // Why it ended, which is not the same as whether it succeeded: a hunt stopped at
+  // its ceiling finalises as completed, and saying only that hides the ceiling.
+  outcome?: string | null
   iteration: number
   evidence_count: number
   cost_usd?: number
+  // What this run was granted, extensions included — so progress is against the
+  // budget the operator asked for rather than against the shipped default.
+  budgets?: HuntBudgets
   hypotheses: HuntStanding[]
   // The whole record, not just its question. The wire has carried these fields
   // since the projection did; the type stopped at the question, so a console that
@@ -731,28 +778,156 @@ function RunRow({ run }: { run: WfRun }) {
 /** Exported for test: the run detail panel is the whole of what a hunt shows an
  *  operator, and driving the screen down to it would test the History modal instead. */
 export function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => void }) {
-  const agentMeta = useAgentMeta()
+  const hunt = d.hunt ?? null
   return (
     <div className="run-detail">
-      {IN_FLIGHT.includes(d.status) && <Steer runId={d.run_id} hunt={!!d.hunt} onSteered={onSteered} />}
+      <RunBar d={d} hunt={hunt} onSteered={onSteered} />
+      {hunt && <OpenCheckpoint hunt={hunt} />}
       {d.error && (
-        <div className="modal-section" style={{ marginTop: 4 }}>
+        <div className="modal-section">
           <h4 style={{ color: 'var(--crit)' }}>Error</h4>
           <pre className="font-mono text-[11.5px] leading-[1.5] whitespace-pre-wrap m-0" style={{ color: 'var(--crit)' }}>{d.error}</pre>
         </div>
       )}
-      {/* The hunt renders its own report as soon as one exists; result_summary
-          only lands at terminal, so a finished-but-unfiled run would show nothing. */}
-      {(d.hunt?.report_markdown || d.result_summary) && (
-        <div className="modal-section" style={{ marginTop: 4 }}>
-          <h4>{d.hunt ? 'Hunt report' : 'Result summary'}</h4>
-          <div className="text-[12.5px] text-tx-2 leading-[1.55] [&_h1]:text-[15px] [&_h1]:font-semibold [&_h2]:text-[13.5px] [&_h2]:font-semibold [&_h3]:text-[12.5px] [&_h3]:font-semibold [&_h1]:mt-1 [&_h2]:mt-2.5 [&_h3]:mt-2">
-            <Markdown>{d.hunt?.report_markdown || d.result_summary || ''}</Markdown>
+      {hunt ? <HuntTabs d={d} hunt={hunt} /> : <ComposeDetail d={d} />}
+      {IN_FLIGHT.includes(d.status) && <Steer runId={d.run_id} hunt={hunt !== null} onSteered={onSteered} />}
+    </div>
+  )
+}
+
+/** What the run is doing and the one control that ends it. Stop belongs with the
+ *  run's own status rather than among the steering directives: those are notes the
+ *  lead reads at its next turn, this ends the run and its spend. */
+function RunBar({ d, hunt, onSteered }: { d: WfRunDetail; hunt: HuntView | null; onSteered: () => void }) {
+  const cost = hunt?.cost_usd ?? d.total_cost_usd
+  const budgets = hunt?.budgets
+  const ceiling = budgets?.max_cost_usd
+  const spent = typeof cost === 'number' && ceiling !== undefined && ceiling > 0
+    ? Math.min(100, (cost / ceiling) * 100)
+    : null
+  return (
+    <div className="run-bar">
+      <span className="pill" style={{ color: runStatusColor(d.status) }}><span className="dot" />{d.status}</span>
+      {hunt?.outcome && !IN_FLIGHT.includes(d.status) && <span className="muted text-[11.5px]">{hunt.outcome}</span>}
+      <span className="mono text-[11.5px] text-tx-3">{d.run_id.slice(0, 13)}</span>
+      <span className="flex-1" />
+      <div className="meta">
+        {hunt && <span>Iteration <b>{hunt.iteration}</b>{budgets && ` of ${budgets.max_iterations}`}</span>}
+        {typeof cost === 'number' && <span>$<b>{cost.toFixed(2)}</b>{ceiling !== undefined && ` of $${ceiling.toFixed(2)}`}</span>}
+        {spent !== null && (
+          <div className="budget-track" title={`${spent.toFixed(0)}% of the cost ceiling`}>
+            <div className="budget-fill" style={{ width: `${spent}%` }} />
           </div>
+        )}
+      </div>
+      {IN_FLIGHT.includes(d.status) && (
+        <>
+          <span className="sep" />
+          <StopRun runId={d.run_id} onStopped={onSteered} />
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Ending a run cannot be undone and stops real spend, so it asks first and says
+ *  what it means. It goes through cancel rather than steer because a queued abort
+ *  needs a live worker to read it, and cancel escalates behind one that cannot. */
+function StopRun({ runId, onStopped }: { runId: string; onStopped: () => void }) {
+  const [asking, setAsking] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [said, setSaid] = useState<string | null>(null)
+
+  const stop = () => {
+    setBusy(true)
+    workflowApi
+      .cancelRun(runId, 'stopped from the console')
+      .then(() => { setSaid('stopping — it settles itself if it can'); onStopped() })
+      .catch((e) => setSaid(errMsg(e)))
+      .finally(() => setBusy(false))
+  }
+
+  if (said !== null) return <span className="muted text-[11.5px]">{said}</span>
+  if (!asking) {
+    return (
+      <button className="btn danger" onClick={() => setAsking(true)}>
+        <Icon name="stop" size={13} /> Stop
+      </button>
+    )
+  }
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <span className="text-[11.5px] text-tx-2">Stop this run? It cannot be resumed.</span>
+      <button className="btn danger solid" disabled={busy} onClick={stop}>
+        {busy ? 'Stopping…' : 'Confirm'}
+      </button>
+      <button className="btn ghost" disabled={busy} onClick={() => setAsking(false)}>Cancel</button>
+    </div>
+  )
+}
+
+type HuntTab = 'hyp' | 'gaps' | 'esc' | 'report'
+
+/** Five stacked tables ran the panel past the bottom of the modal and squeezed
+ *  prose into a sideways scroll. They are four views of one run, so they are tabs;
+ *  a view with nothing in it is not offered rather than offered empty. */
+function HuntTabs({ d, hunt }: { d: WfRunDetail; hunt: HuntView }) {
+  const gaps = hunt.report?.gaps ?? []
+  const checkpoints = hunt.report?.checkpoints ?? []
+  const handoffs = hunt.handoffs ?? []
+  const report = hunt.report_markdown ?? d.result_summary ?? ''
+  const supervision = handoffs.length + checkpoints.length
+  const tabs: [HuntTab, string, number | null][] = [
+    ['hyp', 'Hypotheses', hunt.hypotheses.length],
+    ...(gaps.length > 0 ? ([['gaps', 'Gaps', gaps.length]] as [HuntTab, string, number][]) : []),
+    ...(supervision > 0 ? ([['esc', 'Escalations & checkpoints', supervision]] as [HuntTab, string, number][]) : []),
+    ['report', 'Report', null],
+  ]
+  // Decided at mount, so a report landing mid-poll does not move the tab the
+  // operator is reading out from under them.
+  const [tab, setTab] = useState<HuntTab>(report === '' ? 'hyp' : 'report')
+  const shown = tabs.some(([k]) => k === tab) ? tab : 'hyp'
+
+  return (
+    <>
+      <div className="detail-tabs" role="tablist" aria-label="Hunt views">
+        {tabs.map(([k, label, count]) => (
+          <button key={k} role="tab" aria-selected={shown === k} className={`tab${shown === k ? ' active' : ''}`} onClick={() => setTab(k)}>
+            {label}{count !== null && <span className="mono text-[10.5px] text-tx-3 ml-1.5">{count}</span>}
+          </button>
+        ))}
+      </div>
+      {shown === 'hyp' && <HuntStandings hunt={hunt} />}
+      {shown === 'gaps' && <HuntGaps gaps={gaps} />}
+      {shown === 'esc' && (
+        <>
+          <HuntEscalations handoffs={handoffs} />
+          <HuntCheckpoints checkpoints={checkpoints} />
+        </>
+      )}
+      {shown === 'report' && (report === ''
+        ? <div className="muted text-[12.5px] py-3">The report is written when the hunt reaches a terminal state — completed, cancelled, or stopped at its budget.</div>
+        : <ReportBody md={report} />)}
+    </>
+  )
+}
+
+/** A run that walks phases has steps and a summary; there is nothing to tab between. */
+function ComposeDetail({ d }: { d: WfRunDetail }) {
+  const agentMeta = useAgentMeta()
+  if (!d.result_summary && !d.phases?.length) {
+    return d.error ? null : <div className="muted" style={{ padding: '10px 4px' }}>No additional detail recorded for this run.</div>
+  }
+  return (
+    <>
+      {d.result_summary && (
+        <div className="modal-section">
+          <h4>Result summary</h4>
+          <ReportBody md={d.result_summary} />
         </div>
       )}
       {!!d.phases?.length && (
-        <div className="modal-section" style={{ marginTop: 12 }}>
+        <div className="modal-section">
           <h4>Phases</h4>
           <div className="table-wrap">
             <table className="tbl">
@@ -760,11 +935,11 @@ export function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => v
               <tbody>
                 {d.phases.map((p) => (
                   <tr key={p.phase_id}>
-                    <td className="muted">{p.phase_order}</td>
+                    <td className="muted tight">{p.phase_order}</td>
                     <td>{agentMeta(p.agent_id).label}{p.error && <span className="ml-2" style={{ color: 'var(--crit)' }} title={p.error}>⚠</span>}</td>
-                    <td><span style={{ color: runStatusColor(p.status) }}>{p.status}</span></td>
-                    <td className="muted">{fmtDuration(p.duration_ms)}</td>
-                    <td className="muted">{p.cost_usd ? `$${p.cost_usd.toFixed(3)}` : '—'}</td>
+                    <td className="tight"><span style={{ color: runStatusColor(p.status) }}>{p.status}</span></td>
+                    <td className="muted tight">{fmtDuration(p.duration_ms)}</td>
+                    <td className="muted tight">{p.cost_usd ? `$${p.cost_usd.toFixed(3)}` : '—'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -772,10 +947,16 @@ export function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => v
           </div>
         </div>
       )}
-      {d.hunt && <HuntStandings hunt={d.hunt} />}
-      {!d.error && !d.result_summary && !d.phases?.length && !d.hunt && (
-        <div className="muted" style={{ padding: '10px 4px' }}>No additional detail recorded for this run.</div>
-      )}
+    </>
+  )
+}
+
+/** Markdown at the panel's own type scale rather than the document scale it is
+ *  written at. */
+function ReportBody({ md }: { md: string }) {
+  return (
+    <div className="text-[12.5px] text-tx-2 leading-[1.55] [&_h1]:text-[15px] [&_h1]:font-semibold [&_h2]:text-[13.5px] [&_h2]:font-semibold [&_h3]:text-[12.5px] [&_h3]:font-semibold [&_h1]:mt-1 [&_h2]:mt-2.5 [&_h3]:mt-2">
+      <Markdown>{md}</Markdown>
     </div>
   )
 }
@@ -799,30 +980,14 @@ function Steer({ runId, hunt, onSteered }: { runId: string; hunt: boolean; onSte
       .finally(() => setBusy(null))
   }
 
-  // Stop goes through cancel rather than steer: a queued abort needs a live
-  // worker to read it, and cancel queues the same directive with an escalation
-  // behind it for the run that cannot answer.
-  const stop = () => {
-    setBusy('stop')
-    setSaid(null)
-    workflowApi
-      .cancelRun(runId, note.trim() || 'stopped from the console')
-      .then(() => { setSaid('stopping — it settles itself if it can'); setNote(''); onSteered() })
-      .catch((e) => setSaid(errMsg(e)))
-      .finally(() => setBusy(null))
-  }
-
   // A hunt is the only kind with beliefs to extend or a verdict to be told to
-  // reach. Stop is separate below, and is the one that always works.
+  // reach. Ending the run is not one of these and lives in the status bar.
   const kinds = hunt ? ['conclude', 'extend'] : []
 
   return (
-    <div className="modal-section" style={{ marginTop: 4 }}>
+    <div className="modal-section">
       <h4>Steer</h4>
       <div className="flex gap-2 items-center flex-wrap">
-        <button className="btn ghost" disabled={busy !== null} onClick={stop} style={{ color: 'var(--crit)' }}>
-          stop
-        </button>
         {kinds.map((kind) => (
           <button key={kind} className="btn ghost" disabled={busy !== null} onClick={() => send(kind, note.trim())}>
             {kind}
@@ -900,12 +1065,9 @@ function HuntStandings({ hunt }: { hunt: HuntView }) {
   const strengthOf = (id: string) =>
     hunt.report?.hypotheses.find((h) => h.hypothesis_id === id)?.evidence_strength ?? null
   return (
-    <div className="modal-section" style={{ marginTop: 12 }}>
-      <h4>Hypotheses</h4>
+    <div style={{ marginTop: 12 }}>
       <div className="muted text-[11.5px] mb-2">
-        Iteration {hunt.iteration} · {hunt.evidence_count} piece{hunt.evidence_count === 1 ? '' : 's'} of evidence
-        {typeof hunt.cost_usd === 'number' && ` · $${hunt.cost_usd.toFixed(3)}`}
-        {hunt.open_checkpoint && ' · waiting on you'}
+        {hunt.evidence_count} piece{hunt.evidence_count === 1 ? '' : 's'} of evidence gathered so far.
       </div>
       {hunt.hypotheses.length === 0 && <div className="muted" style={{ padding: '4px 0' }}>No hypotheses on the board yet.</div>}
       {hunt.hypotheses.length > 0 && (
@@ -923,8 +1085,8 @@ function HuntStandings({ hunt }: { hunt: HuntView }) {
                       {h.resolution_reason && <div className="muted text-[11px]">{h.resolution_reason}</div>}
                       {strength && <div className="muted text-[11px]">{strengthLine(strength)}</div>}
                     </td>
-                    <td className="muted">{h.attack_technique || '—'}</td>
-                    <td><span style={{ color: hypothesisColor(h.status) }}>{h.status}</span></td>
+                    <td className="muted tight">{h.attack_technique || '—'}</td>
+                    <td className="tight"><span style={{ color: hypothesisColor(h.status) }}>{h.status}</span></td>
                   </tr>
                 )
               })}
@@ -932,10 +1094,6 @@ function HuntStandings({ hunt }: { hunt: HuntView }) {
           </table>
         </div>
       )}
-      <OpenCheckpoint hunt={hunt} />
-      <HuntGaps hunt={hunt} />
-      <HuntEscalations hunt={hunt} />
-      <HuntCheckpoints hunt={hunt} />
     </div>
   )
 }
@@ -964,8 +1122,12 @@ function OpenCheckpoint({ hunt }: { hunt: HuntView }) {
   const unbound = (open.context?.['unbound_capabilities'] as string[] | undefined) ?? []
 
   return (
-    <div className="modal-section" style={{ marginTop: 14, borderLeft: '2px solid var(--accent-line)', paddingLeft: 10 }}>
-      <h4>Waiting on you{open.checkpoint_class ? ` · ${open.checkpoint_class}` : ''}</h4>
+    <div className="modal-section run-ask">
+      <div className="flex items-center gap-2" style={{ color: 'var(--high)' }}>
+        <Icon name="alert" size={15} />
+        <h4 style={{ color: 'var(--tx)', margin: 0 }}>Waiting on you{open.checkpoint_class ? ` · ${open.checkpoint_class}` : ''}</h4>
+      </div>
+      <div style={{ height: 8 }} />
       <div className="text-[12.5px] leading-[1.55] mb-2" style={{ whiteSpace: 'pre-wrap' }}>{open.question}</div>
       {unbound.length > 0 && (
         <div className="muted text-[11.5px] mb-2">No tool here answers {unbound.join(', ')}.</div>
@@ -990,12 +1152,11 @@ function OpenCheckpoint({ hunt }: { hunt: HuntView }) {
 /** Questions the hunt could not answer. The reason this is a section of its own:
  *  "we looked and it was not there" and "we could not look" read identically in a
  *  report that does not separate them, and only one of them clears a hypothesis. */
-function HuntGaps({ hunt }: { hunt: HuntView }) {
-  const gaps = hunt.report?.gaps ?? []
+function HuntGaps({ gaps }: { gaps: HuntGap[] }) {
   if (gaps.length === 0) return null
   const asked = groupedGaps(gaps)
   return (
-    <div style={{ marginTop: 14 }}>
+    <div style={{ marginTop: 12 }}>
       <h4>Visibility gaps ({gaps.length})</h4>
       <div className="muted text-[11.5px] mb-2">Each is a blind spot, not a finding.</div>
       <div className="table-wrap">
@@ -1004,8 +1165,8 @@ function HuntGaps({ hunt }: { hunt: HuntView }) {
           <tbody>
             {asked.map((g) => (
               <tr key={g.key}>
-                <td className="muted">{g.iteration}</td>
-                <td className="muted">{g.hypothesis_id || 'unattributed'}</td>
+                <td className="muted tight">{g.iteration}</td>
+                <td className="muted tight">{g.hypothesis_id || 'unattributed'}</td>
                 <td>
                   {g.query_intent || g.reasons[0]}
                   {g.query_intent && g.reasons.map((reason) => (
@@ -1048,11 +1209,10 @@ export function groupedGaps(gaps: HuntGap[]) {
   return [...byQuestion.values()]
 }
 
-function HuntEscalations({ hunt }: { hunt: HuntView }) {
-  const handoffs = hunt.handoffs ?? []
+function HuntEscalations({ handoffs }: { handoffs: HuntHandoff[] }) {
   if (handoffs.length === 0) return null
   return (
-    <div style={{ marginTop: 14 }}>
+    <div style={{ marginTop: 12 }}>
       <h4>Escalated to incident response ({handoffs.length})</h4>
       <div className="table-wrap">
         <table className="tbl">
@@ -1060,8 +1220,8 @@ function HuntEscalations({ hunt }: { hunt: HuntView }) {
           <tbody>
             {handoffs.map((h) => (
               <tr key={h.case_id}>
-                <td className="mono" style={{ fontSize: 11 }}>{h.case_id}</td>
-                <td className="muted">{h.hypothesis_id}</td>
+                <td className="mono tight" style={{ fontSize: 11 }}>{h.case_id}</td>
+                <td className="muted tight">{h.hypothesis_id}</td>
                 <td>{h.rationale}</td>
               </tr>
             ))}
@@ -1073,11 +1233,10 @@ function HuntEscalations({ hunt }: { hunt: HuntView }) {
 }
 
 /** Where a human was in the loop, and where policy stood in for one. */
-function HuntCheckpoints({ hunt }: { hunt: HuntView }) {
-  const checkpoints = hunt.report?.checkpoints ?? []
+function HuntCheckpoints({ checkpoints }: { checkpoints: HuntCheckpoint[] }) {
   if (checkpoints.length === 0) return null
   return (
-    <div style={{ marginTop: 14 }}>
+    <div style={{ marginTop: 16 }}>
       <h4>Checkpoints ({checkpoints.length})</h4>
       <div className="table-wrap">
         <table className="tbl">
@@ -1085,7 +1244,7 @@ function HuntCheckpoints({ hunt }: { hunt: HuntView }) {
           <tbody>
             {checkpoints.map((c) => (
               <tr key={c.checkpoint_id}>
-                <td className="muted">{c.class}</td>
+                <td className="muted tight">{c.class}</td>
                 <td>{c.question}</td>
                 <td className="muted">
                   {c.resolution ? `${c.resolution.answer} by ${c.resolution.actor}${c.resolution.text ? ` — ${c.resolution.text}` : ''}` : 'still pending'}

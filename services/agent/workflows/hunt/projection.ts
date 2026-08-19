@@ -1,7 +1,7 @@
 import { openCheckpoint, type OpenCheckpoint } from "../../contracts/events.js";
 import { fold, type HuntEvent } from "./ledger.js";
 import { renderReport, type HuntReport } from "./report.js";
-import type { Handoff, HuntOutcome, HuntState, HuntStatus, Hypothesis, HypothesisStatus } from "./types.js";
+import type { Budgets, Handoff, HuntOutcome, HuntState, HuntStatus, Hypothesis, HypothesisStatus } from "./types.js";
 
 // What a reader outside this process is told about a hunt. A hunt has no steps to
 // report progress against, so what it has tested and how each belief stands is it.
@@ -12,6 +12,9 @@ export interface HuntProjection {
   reason: string;
   iteration: number;
   cost_usd: number;
+  // What this run was actually granted, extensions included -- so a reader can
+  // say how far through its budget the hunt is rather than only where it stands.
+  budgets: Budgets;
   hypotheses: HypothesisStanding[];
   evidence_count: number;
   open_checkpoint: OpenCheckpoint | null;
@@ -49,6 +52,7 @@ export function huntProjection(runId: string, events: readonly HuntEvent[]): Hun
     reason: why(view.hunt),
     iteration: view.hunt.iteration,
     cost_usd: view.hunt.cost_usd,
+    budgets: view.hunt.budgets,
     hypotheses: [...view.hypotheses.values()].map(standing),
     evidence_count: view.evidence.size,
     open_checkpoint: open === undefined ? null : openCheckpoint(open),
