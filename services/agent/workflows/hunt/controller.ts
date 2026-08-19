@@ -153,6 +153,10 @@ const NO_NULL_CHECK: NullCheckAttempt = { result: null, blocked: "", cost_usd: 0
 // "budget exhausted" beside "$0.11 of $14.00" reads as a contradiction, and an
 // operator seeing it reasonably concludes the ceiling is broken -- when what ran
 // out was the turn count they set, which the same sentence never named.
+// Named because two places have to agree: the record is written in one and its
+// entities are refused in the other.
+export const TOOL_FAILURE = "tool_failure";
+
 export function boundBy(hunt: HuntState): "iterations" | "cost" | null {
   if (hunt.cost_usd >= hunt.budgets.max_cost_usd) return "cost";
   if (hunt.iteration >= hunt.budgets.max_iterations) return "iterations";
@@ -1782,7 +1786,14 @@ export class HuntController {
         evidence_id: evidenceId,
         dispatch_id: dispatchId,
         iteration,
-        entities: entitiesOf(record),
+        // A failed dispatch says something about this deployment and nothing about
+        // the estate, and its text is ours: "read tcp 172.18.0.3:46528->
+        // 160.79.104.10:443" is a Docker bridge address and the model gateway.
+        // Extracted as observables, those reached the board as leads, and a worker
+        // spent a turn and real money deciding whether api.anthropic.com was
+        // attacker infrastructure -- then wrote that a Frothly host had been seen
+        // beaconing to it. A hunt must not investigate its own plumbing.
+        entities: record.provenance === TOOL_FAILURE ? [] : entitiesOf(record),
         captured_at: new Date().toISOString(),
       };
       this.ledger.append({ kind: "evidence", payload: stored });
@@ -1841,7 +1852,7 @@ export class HuntController {
             payload: {},
             salience: "routine" as const,
             why_notable: "a query the hunt wanted could not be run",
-            provenance: "tool_failure",
+            provenance: TOOL_FAILURE,
             attacker_influenceable: false,
             instruction_like: false,
           },

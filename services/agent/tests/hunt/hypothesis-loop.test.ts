@@ -247,3 +247,73 @@ describe("refusing an entity the graph does not know", () => {
     expect(() => validateDecision(stray, started.ledger.projection)).toThrow(/the graph knows /);
   });
 });
+
+// A failed dispatch is evidence about this deployment, and its text is ours. The
+// extractor read IPs out of "read tcp 172.18.0.3:46528->160.79.104.10:443" -- a
+// Docker bridge address and the model gateway -- and put them on the board as
+// observables. A worker then spent a turn deciding whether api.anthropic.com was
+// attacker infrastructure and wrote that a Frothly host had beaconed to it.
+describe("a hunt does not investigate its own plumbing", () => {
+  // Through the real dispatch path: a worker that fails is how this record is
+  // written, and the extraction runs where it is appended.
+  const failingDispatcher = (reason: string) => ({
+    dispatch: async (request: { dispatch_id: string }) => ({
+      dispatch_id: request.dispatch_id,
+      evidence: [],
+      failed: true,
+      failure_reason: reason,
+      cost_usd: 0,
+    }),
+  });
+
+  it("takes no entities from a tool failure, however many addresses it names", async () => {
+    const started = await newLedger({ hypotheses: ["a host is beaconing to C2"] });
+    const controller = controllerFor(started.ledger, [INVESTIGATE], {
+      dispatcher: failingDispatcher(
+        "Error reading stream: read tcp 172.18.0.3:46528->160.79.104.10:443: read: connection timed out",
+      ) as never,
+    });
+
+    await controller.advanceIteration();
+
+    const record = [...started.ledger.projection.evidence.values()].find(
+      (one) => one.provenance === "tool_failure",
+    );
+    expect(record?.summary).toMatch(/160\.79\.104\.10/);
+    expect(record?.entities).toEqual([]);
+  });
+
+  // The estate's own addresses still have to reach the board: this refuses a
+  // source, not a shape. Same path, same kind of text, opposite provenance.
+  it("still takes entities from a worker's real answer", async () => {
+    const started = await newLedger({ hypotheses: ["a host is beaconing to C2"] });
+    const controller = controllerFor(started.ledger, [INVESTIGATE], {
+      dispatcher: {
+        dispatch: async (request: { dispatch_id: string }) => ({
+          dispatch_id: request.dispatch_id,
+          evidence: [
+            {
+              source_system: "net_flow",
+              summary: "HOST-42 reached 45.77.53.176 every 30s",
+              payload: {},
+              salience: "notable" as const,
+              why_notable: "low jitter",
+              provenance: "worker",
+              attacker_influenceable: false,
+              instruction_like: false,
+            },
+          ],
+          failed: false,
+          cost_usd: 0,
+        }),
+      } as never,
+    });
+
+    await controller.advanceIteration();
+
+    const record = [...started.ledger.projection.evidence.values()].find(
+      (one) => one.provenance === "worker",
+    );
+    expect(record?.entities.map((one) => one.value)).toContain("45.77.53.176");
+  });
+});
