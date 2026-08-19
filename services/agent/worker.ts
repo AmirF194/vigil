@@ -215,7 +215,7 @@ export async function advance(
     await settle(state, leases, job, spec, owner);
   } catch (error) {
     await abandon(job, error);
-    await forget(state, leases, job.run_id, owner);
+    await forget(state, leases, job, owner, error);
     throw error;
   } finally {
     clearInterval(renewing);
@@ -232,12 +232,40 @@ export async function advance(
 // retry that lands seconds later, and a refused claim returns quietly, so BullMQ
 // would retire the job as a success with the run stalled. release() is scoped to
 // this owner, so a worker already reclaimed displaces nobody.
-async function forget(state: State, leases: Leases, runId: string, owner: string): Promise<void> {
-  if ((await state.latestSeq(runId)) === null) {
-    await leases.finish(runId);
+async function forget(state: State, leases: Leases, job: RunJob, owner: string, error: unknown): Promise<void> {
+  if ((await state.latestSeq(job.run_id)) === null) {
+    await leases.finish(job.run_id);
     return;
   }
-  await leases.release(runId, owner, 0);
+  if (await stopBecauseItCannotSucceed(state, leases, job, error)) return;
+  await leases.release(job.run_id, owner, 0);
+}
+
+// A spec error answers the same way on every attempt. On a resume the layers come
+// off the ledger, so no retry can change the spec, and releasing for one swept the
+// run again every interval for as long as anybody left it -- 5,860 failed jobs
+// across two runs over five days, not one of which could have succeeded. So say why
+// it stopped and stop: an operator reading a terminal can fix the cause and start a
+// run, which a queue quietly refilling itself never let them see.
+async function stopBecauseItCannotSucceed(
+  state: State,
+  leases: Leases,
+  job: RunJob,
+  error: unknown,
+): Promise<boolean> {
+  if (!(error instanceof SpecError)) return false;
+
+  const reason = `its spec cannot be built: ${error.message}`;
+  await state.append(job.run_id, [
+    { run_id: job.run_id, run_kind: job.run_kind, kind: "terminal", payload: { outcome: "failed", reason } },
+  ]);
+  // abandon() already told the mirror for compose; every other kind is told off the
+  // terminal in settle, which this path returns before reaching.
+  if (job.run_kind !== "compose") {
+    await mirrorFor().terminal(job.run_id, { outcome: "failed", reason, summary: "" });
+  }
+  await reap(leases, job.run_id);
+  return true;
 }
 
 // Where a run was picked back up, so a crash and its recovery are readable rather

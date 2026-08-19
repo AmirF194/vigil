@@ -122,6 +122,66 @@ describe("the arch a run started under is journaled", () => {
   });
 });
 
+// A journaled spec that no longer validates is the same answer every attempt, and
+// the retry path released the claim immediately so the sweeper took it again on
+// every interval. Two runs did that for five days and left 5,860 failed jobs, none
+// of which could ever have succeeded, with nothing anywhere saying why.
+describe("a run whose spec cannot be built", () => {
+  // Hand-built rather than started: the point is a ledger holding a spec that
+  // assembly refuses, which a run that opened successfully cannot have.
+  async function ledgerHoldingAnUnbuildableSpec(): Promise<InProcessState> {
+    const state = new InProcessState();
+    const spec = await resolveSpec(startJob());
+    await state.append(RUN, [
+      {
+        run_id: RUN,
+        run_kind: "hunt",
+        kind: "run",
+        // A ceiling under the budget it caps. The real one was implicit -- the
+        // ceiling was a constant while the budget was the caller's -- and stating
+        // it here is the same refusal from the same check.
+        payload: {
+          run_kind: "hunt",
+          spec: { ...spec, thresholds: { ...spec.thresholds, hard_max_cost_usd: 0.01 } },
+          budgets: spec.budgets,
+          seed: RUN,
+          tenant_id: null,
+          started_by: "test",
+        },
+      },
+    ]);
+    return state;
+  }
+
+  it("stops instead of handing the claim back for another sweep", async () => {
+    const state = await ledgerHoldingAnUnbuildableSpec();
+
+    await expect(advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE))).rejects.toThrow(/hard_max_cost_usd/);
+
+    // finish(), not release(): nothing is left for the sweeper to pick up.
+    expect(await leases.sweep(60_000, 10)).toEqual([]);
+  });
+
+  it("journals why it stopped, so the reason outlives the failed job", async () => {
+    const state = await ledgerHoldingAnUnbuildableSpec();
+
+    await expect(advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE))).rejects.toThrow();
+
+    const terminal = await state.terminal(RUN);
+    expect(terminal?.outcome).toBe("failed");
+    expect(terminal?.reason).toMatch(/its spec cannot be built/);
+  });
+
+  // The terminal is the off switch every other path already relies on, so a sweep
+  // that does land finds nothing to do rather than throwing again.
+  it("short-circuits a later attempt rather than rebuilding the spec", async () => {
+    const state = await ledgerHoldingAnUnbuildableSpec();
+    await expect(advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE))).rejects.toThrow();
+
+    await expect(advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE))).resolves.toBeUndefined();
+  });
+});
+
 describe("what the caller enqueuing a run may tighten", () => {
   it("lowers a ceiling the config set", async () => {
     const spec = await resolveSpec(startJob("hunt", { budgets: { max_cost_usd: 0.5 } }));
