@@ -18,7 +18,7 @@ const MAX_OUTPUT_TOKENS = 12_000;
 
 export const EMIT_TOOL = "emit";
 
-type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
+type Body = Omit<OpenAI.Chat.ChatCompletionCreateParams, "stream" | "stream_options">;
 
 // Not every provider honours response_format, so a 400 downgrades once to a tool
 // whose parameters are the schema. Remembered per model, never process-wide.
@@ -42,8 +42,10 @@ class OpenAiSurface implements Provider {
     readonly provider_type: string,
   ) {}
 
-  // The gateway's completion is one shot, so the events are emitted once it
-  // returns. Usage precedes the tool calls, which is the order the loop needs.
+  // Assembled before the events are emitted, so usage precedes the tool calls --
+  // the order the loop needs. The transport streams; this does not re-emit the
+  // deltas, because nothing downstream renders a partial turn and a half-written
+  // tool call is not a tool call.
   async *stream(request: TurnRequest): AsyncGenerator<ProviderEvent> {
     const turn = request.emit === undefined ? await this.ask(request) : await this.emit(request, request.emit);
     if (turn.content !== "") yield { type: "text_delta", text: turn.content };
@@ -86,16 +88,80 @@ class OpenAiSurface implements Provider {
     return { ...turn, content: emitted === undefined ? turn.content : emitted.args, tool_calls: [] };
   }
 
+  // Streamed, and not for the deltas: a buffered completion is subject to the
+  // gateway's non-streaming request ceiling -- 30 seconds in Bifrost, which no
+  // network_config setting moves and which it returns as a 504. Every call that ran
+  // longer died, so a role emitting a long answer failed where one emitting a short
+  // decision went through, and the caller could only record that its tool had
+  // failed. The method was already named stream() and the interface already said
+  // "assembled from its stream"; only the wire disagreed.
   private async call(body: Body, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> {
     // Before the limiter, not only inside the request: a call still queued behind
     // a rate limit is the cheapest one to give up on.
     signal?.throwIfAborted();
-    const response = await this.limiter.run(estimateTokens(JSON.stringify(body)), () =>
-      this.client.chat.completions.create({ max_tokens: MAX_OUTPUT_TOKENS, ...body }, signal ? { signal } : {}),
-    );
-    if (!("choices" in response)) throw new ProviderError("streaming responses are not supported");
-    return response;
+    // Assembled inside run() rather than after it, so the rate-limit slot is held
+    // for the whole call and a mid-stream failure is retried like any other.
+    return this.limiter.run(estimateTokens(JSON.stringify(body)), async () => {
+      const stream = await this.client.chat.completions.create(
+        { max_tokens: MAX_OUTPUT_TOKENS, ...body, stream: true, stream_options: { include_usage: true } },
+        signal ? { signal } : {},
+      );
+      if (!(Symbol.asyncIterator in stream)) {
+        throw new ProviderError("the gateway answered a stream request with a whole completion");
+      }
+      return assemble(stream);
+    });
   }
+}
+
+// One completion out of its chunks. A tool call arrives split across them: the
+// opening fragment carries id and name, every later one carries null for both and
+// another slice of the arguments, so held values are kept rather than overwritten.
+async function assemble(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>): Promise<OpenAI.Chat.ChatCompletion> {
+  const calls = new Map<number, OpenAI.Chat.ChatCompletionMessageToolCall>();
+  let content = "";
+  let usage: OpenAI.CompletionUsage | undefined;
+  let finish: OpenAI.Chat.ChatCompletion.Choice["finish_reason"] = "stop";
+  let head: OpenAI.Chat.ChatCompletionChunk | undefined;
+
+  for await (const chunk of stream) {
+    head ??= chunk;
+    // Sent once, in a final chunk of its own that carries no choice at all.
+    if (chunk.usage) usage = chunk.usage;
+    const choice = chunk.choices[0];
+    if (choice === undefined) continue;
+    if (choice.finish_reason) finish = choice.finish_reason;
+    content += textOf(choice.delta.content);
+    for (const delta of choice.delta.tool_calls ?? []) {
+      const held = calls.get(delta.index);
+      calls.set(delta.index, {
+        id: delta.id ?? held?.id ?? "",
+        type: "function",
+        function: {
+          name: delta.function?.name ?? held?.function.name ?? "",
+          arguments: (held?.function.arguments ?? "") + (delta.function?.arguments ?? ""),
+        },
+      });
+    }
+  }
+
+  if (head === undefined) throw new ProviderError("the gateway closed the stream without sending anything");
+  const tool_calls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
+  return {
+    id: head.id,
+    created: head.created,
+    model: head.model,
+    object: "chat.completion",
+    choices: [
+      {
+        index: 0,
+        finish_reason: finish,
+        logprobs: null,
+        message: { role: "assistant", content, refusal: null, ...(tool_calls.length === 0 ? {} : { tool_calls }) },
+      },
+    ],
+    ...(usage === undefined ? {} : { usage }),
+  };
 }
 
 function turnOf(response: OpenAI.Chat.ChatCompletion): Turn {

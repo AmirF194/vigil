@@ -5,7 +5,17 @@ import { EMIT_TOOL, openAiSurface, resetEmitMode } from "../../core/wire.js";
 import { ZERO_TOKENS, type TokenCounts } from "../../contracts/budget.js";
 import type { Message, Provider, ToolCall, Turn, TurnRequest } from "../../core/provider.js";
 
-type Body = OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
+type Body = OpenAI.Chat.ChatCompletionCreateParams;
+
+type Chunk = OpenAI.Chat.ChatCompletionChunk;
+
+// Split so a reassembly that drops a fragment or keeps only the last one fails
+// here rather than in a run.
+function halves(text: string): string[] {
+  if (text.length < 2) return [text];
+  const at = Math.floor(text.length / 2);
+  return [text.slice(0, at), text.slice(at)];
+}
 
 const SCHEMA = { type: "object", required: ["verb"], properties: { verb: { type: "string" } } };
 
@@ -13,14 +23,59 @@ function limiter(): Limiter {
   return new Limiter({ rpm: 10_000, tpm: 10_000_000 }, 4, 1);
 }
 
-function completion(message: Record<string, unknown>, usage?: Record<string, unknown>): OpenAI.Chat.ChatCompletion {
+// A whole message, delivered the way a gateway delivers one: content in pieces, a
+// tool call opened by a fragment carrying id and name and continued by fragments
+// carrying null for both, and usage alone in a final chunk with no choice at all.
+// Authored as the finished message because that is what each test is about.
+function completion(
+  message: Record<string, unknown>,
+  usage?: Record<string, unknown> | null,
+): AsyncIterable<Chunk> {
+  const chunks: Chunk[] = [];
+  const push = (delta: Record<string, unknown>) =>
+    chunks.push({
+      id: "chunk-1",
+      created: 1,
+      model: "m",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta, finish_reason: null }],
+    } as unknown as Chunk);
+
+  const content = message["content"];
+  if (typeof content === "string") {
+    for (const piece of halves(content)) push({ content: piece });
+  } else if (content !== undefined && content !== null) {
+    // A content-block list, which textOf flattens; handed over whole.
+    push({ content });
+  }
+
+  const calls = (message["tool_calls"] ?? []) as { id: string; function: { name: string; arguments: string } }[];
+  for (const [index, call] of calls.entries()) {
+    push({ tool_calls: [{ index, type: "function", id: call.id, function: { name: call.function.name, arguments: "" } }] });
+    for (const piece of halves(call.function.arguments ?? "")) {
+      push({ tool_calls: [{ index, type: "function", function: { name: null, arguments: piece } }] });
+    }
+  }
+
+  if (usage !== null) {
+    chunks.push({
+      id: "chunk-1",
+      created: 1,
+      model: "m",
+      object: "chat.completion.chunk",
+      choices: [],
+      usage: usage ?? { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    } as unknown as Chunk);
+  }
+
   return {
-    choices: [{ message, finish_reason: "stop", index: 0, logprobs: null }],
-    usage: usage ?? { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-  } as unknown as OpenAI.Chat.ChatCompletion;
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk;
+    },
+  };
 }
 
-function surfaceOf(create: (body: Body) => Promise<OpenAI.Chat.ChatCompletion>, model = "openai/gpt-4o") {
+function surfaceOf(create: (body: Body) => Promise<AsyncIterable<Chunk>>, model = "openai/gpt-4o") {
   const client = { chat: { completions: { create } } } as unknown as OpenAI;
   return openAiSurface(client, model, limiter(), "openai");
 }
@@ -205,10 +260,87 @@ describe("token accounting", () => {
   });
 
   it("reports zeroes rather than guessing when usage is absent", async () => {
-    const surface = surfaceOf(async () =>
-      ({ choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop", index: 0 }] }) as unknown as OpenAI.Chat.ChatCompletion,
-    );
+    // On a stream, absent usage is a stream that ended without ever sending it.
+    const surface = surfaceOf(async () => completion({ role: "assistant", content: "ok" }, null));
     expect((await turn(surface, { messages: [], tools: [] })).tokens).toEqual(ZERO_TOKENS);
+  });
+});
+
+// The wire was buffered while the method was called stream() and the interface
+// said "assembled from its stream". A buffered completion is subject to the
+// gateway's non-streaming ceiling -- 30 seconds in Bifrost, unmovable by any
+// network_config value and returned as a 504 -- so every call that ran longer
+// died, and a worker writing a long answer died while the lead's short decisions
+// went through.
+describe("the wire streams", () => {
+  it("asks the gateway for a stream, and for usage with it", async () => {
+    const bodies: Body[] = [];
+    const surface = surfaceOf(async (body) => {
+      bodies.push(body);
+      return completion({ role: "assistant", content: "ok" });
+    });
+
+    await turn(surface, { messages: [{ role: "user", content: "hi" }], tools: [] });
+
+    expect(bodies[0]?.stream).toBe(true);
+    // Without it the final chunk carries no usage and every call would be free.
+    expect(bodies[0]?.stream_options).toEqual({ include_usage: true });
+  });
+
+  it("keeps every fragment of a reply rather than the last one", async () => {
+    const surface = surfaceOf(async () =>
+      completion({ role: "assistant", content: "the whole answer, in pieces" }),
+    );
+
+    expect((await turn(surface, { messages: [], tools: [] })).content).toBe("the whole answer, in pieces");
+  });
+
+  // The fragments after the first carry null for id and name, so an accumulator
+  // that overwrites rather than keeps loses the name and the call is unroutable.
+  it("rebuilds a tool call split across fragments", async () => {
+    const surface = surfaceOf(async () =>
+      completion({
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "call-1", type: "function", function: { name: "splunk_execute", arguments: '{"spl_query":"index=botsv3"}' } }],
+      }),
+    );
+
+    const [call] = (await turn(surface, { messages: [], tools: [] })).tool_calls;
+    expect(call?.id).toBe("call-1");
+    expect(call?.tool).toBe("splunk_execute");
+    expect(JSON.parse(call?.args ?? "{}")).toEqual({ spl_query: "index=botsv3" });
+  });
+
+  it("keeps two tool calls apart and in the order the model asked for them", async () => {
+    const surface = surfaceOf(async () =>
+      completion({
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "call-1", type: "function", function: { name: "first", arguments: '{"a":1}' } },
+          { id: "call-2", type: "function", function: { name: "second", arguments: '{"b":2}' } },
+        ],
+      }),
+    );
+
+    const { tool_calls } = await turn(surface, { messages: [], tools: [] });
+    expect(tool_calls.map((one) => one.tool)).toEqual(["first", "second"]);
+    expect(tool_calls.map((one) => one.args)).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  it("refuses a gateway that answers a stream request with a whole completion", async () => {
+    const surface = surfaceOf(
+      async () => ({ choices: [{ message: { role: "assistant", content: "ok" } }] }) as unknown as AsyncIterable<Chunk>,
+    );
+
+    await expect(turn(surface, { messages: [], tools: [] })).rejects.toThrow(/whole completion/);
+  });
+
+  it("says so when the stream carries nothing at all", async () => {
+    const surface = surfaceOf(async () => ({ async *[Symbol.asyncIterator]() {} }));
+
+    await expect(turn(surface, { messages: [], tools: [] })).rejects.toThrow(/without sending anything/);
   });
 });
 
