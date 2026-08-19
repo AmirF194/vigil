@@ -21,7 +21,11 @@ export const EMIT_TOOL = "emit";
 type Body = Omit<OpenAI.Chat.ChatCompletionCreateParams, "stream" | "stream_options">;
 
 // Not every provider honours response_format, so a 400 downgrades once to a tool
-// whose parameters are the schema. Remembered per model, never process-wide.
+// whose parameters are the schema. Keyed by model and schema together: the refusal
+// is a property of the schema as much as the provider -- Anthropic requires
+// additionalProperties: false on every object, which a free-form payload cannot
+// carry -- and keyed by model alone one worker's 400 downgraded the lead, whose
+// own schema the same gateway accepts.
 const emitModes = new Map<string, "schema" | "tool">();
 
 export function resetEmitMode(): void {
@@ -60,13 +64,14 @@ class OpenAiSurface implements Provider {
 
   private async emit(request: TurnRequest, schema: Record<string, unknown>): Promise<Turn> {
     const messages = wire(request.messages);
-    if ((emitModes.get(this.model) ?? "schema") === "schema") {
+    const mode = `${this.model}\n${JSON.stringify(schema)}`;
+    if ((emitModes.get(mode) ?? "schema") === "schema") {
       try {
         const format = { type: "json_schema" as const, json_schema: { name: "emission", strict: false, schema } };
         return turnOf(await this.call({ model: this.model, messages, response_format: format }, request.signal));
       } catch (error) {
         if (statusOf(error) !== 400) throw error;
-        emitModes.set(this.model, "tool");
+        emitModes.set(mode, "tool");
       }
     }
 

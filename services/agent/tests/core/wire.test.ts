@@ -223,6 +223,29 @@ describe("the emission turn", () => {
     expect(bodies[0]!.response_format).toBeDefined();
   });
 
+  // Keyed by schema as well: Anthropic refuses a schema carrying a free-form
+  // object, which is the worker's, and accepts the lead's. Keyed by model alone
+  // the worker's 400 downgraded the lead, whose schema the gateway takes.
+  it("does not downgrade another schema on one schema's rejection", async () => {
+    const refused = { type: "object", properties: { payload: { type: "object" } } };
+    const bodies: Body[] = [];
+    const surface = surfaceOf(async (body) => {
+      bodies.push(body);
+      const schema = body.response_format?.type === "json_schema" ? body.response_format.json_schema.schema : undefined;
+      if (schema === refused) throw Object.assign(new Error("additionalProperties"), { status: 400 });
+      return completion({
+        role: "assistant",
+        content: "{}",
+        tool_calls: [{ id: "e1", type: "function", function: { name: EMIT_TOOL, arguments: "{}" } }],
+      });
+    });
+
+    await turn(surface, { messages: [], tools: [], emit: refused });
+    bodies.length = 0;
+    await turn(surface, { messages: [], tools: [], emit: SCHEMA });
+    expect(bodies[0]!.response_format).toBeDefined();
+  });
+
   it("does not read a non-400 failure as a reason to downgrade", async () => {
     const surface = surfaceOf(async () => {
       throw Object.assign(new Error("unauthorized"), { status: 401 });
