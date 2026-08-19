@@ -4,7 +4,19 @@
 import { describe, expect, it } from "vitest";
 import type { Attempt } from "../../core/loop.js";
 import { wrap, scannerFor } from "../../core/security.js";
-import { callsOf, charged } from "../../workflows/hunt/adapters.js";
+import { callsOf, charged, link, salvaged, workerDispatcher } from "../../workflows/hunt/adapters.js";
+import { getEventListeners } from "node:events";
+import { narrativeOf, renderDispatch, renderNullCheck } from "../../workflows/hunt/render.js";
+import { budgetOf, unmeteredQuota } from "../../core/budget.js";
+import { defineTool } from "../../contracts/tool.js";
+import { localDispatch } from "../../core/dispatch.js";
+import type { Harness } from "../../core/loop.js";
+import { nullMemory } from "../../core/memory.js";
+import { registryOf } from "../../core/registry.js";
+import type { RunSpec } from "../../core/spec.js";
+import { InProcessState } from "../../core/state.js";
+import type { HuntKinds } from "../../workflows/hunt/ledger.js";
+import { scriptedProvider } from "../support/scripted-provider.js";
 import { renderCaseFile } from "../../workflows/hunt/report.js";
 import { newLedger, relate } from "../support/hunt.js";
 import { newId } from "../../workflows/hunt/ids.js";
@@ -138,5 +150,260 @@ describe("what a failed call cost", () => {
 
   it("hands a successful call straight back", async () => {
     expect(await charged(harnessSpending(1), 0, Promise.resolve("answered"))).toBe("answered");
+  });
+});
+
+// One flaky call cost the whole iteration: eight successful searches discarded
+// because the write-up call after them died.
+describe("what a dispatch keeps when it dies at the write-up", () => {
+  it("keeps a successful call's rows, with the query beside them", () => {
+    const [record] = salvaged([attempt("splunk_execute", '{"spl_query":"index=botsv3"}', [{ dest_ip: "45.77.53.176" }])]);
+
+    expect(record!.provenance).toBe("unsummarised");
+    expect(record!.source_system).toBe("duckdb");
+    const gathered = record!.payload["gathered"] as { tool: string; query: string; rows: unknown[] }[];
+    expect(gathered).toHaveLength(1);
+    expect(gathered[0]!.rows).toEqual([{ dest_ip: "45.77.53.176" }]);
+    expect(gathered[0]!.query).toBe('{"spl_query":"index=botsv3"}');
+    // Routine, and not a claim anyone made: no role has said what these rows mean.
+    expect(record!.salience).toBe("routine");
+    expect(record!.attacker_influenceable).toBe(true);
+  });
+
+  // Twenty-nine of these reached one board, every one promoted to notable by the
+  // attacker_influenceable floor, in a digest that holds twenty-five.
+  it("folds a whole dispatch into one record rather than one per call", () => {
+    const many = Array.from({ length: 29 }, (_, index) =>
+      attempt("splunk_execute", `{"spl_query":"search ${index}"}`, [{ dest_ip: "45.77.53.176" }]),
+    );
+    const records = salvaged(many);
+
+    expect(records).toHaveLength(1);
+    expect(records[0]!.summary).toContain("29 queries");
+    expect((records[0]!.payload["gathered"] as unknown[])).toHaveLength(29);
+  });
+
+  // Corroboration is counted over source_system, so naming one of several tools
+  // would credit it with the others' independence.
+  it("refuses to name one source system when several answered", () => {
+    const mixed = [
+      attempt("splunk_execute", "{}", [{ a: 1 }]),
+      { ...attempt("lookup_indicators", "{}", [{ b: 2 }]), result: { ok: true as const, rows: [{ b: 2 }], rowCount: 1, capped: false, sourceSystem: "misp" } },
+    ];
+    expect(salvaged(mixed as never)[0]!.source_system).toBe("several");
+  });
+
+  // The queries are what an analyst re-runs, so they survive the budget even when
+  // the rows behind them do not -- and the record says the rows were dropped.
+  it("keeps every query but trims rows past the budget, saying so", () => {
+    const heavy = Array.from({ length: 12 }, (_, index) =>
+      attempt("splunk_execute", `{"spl_query":"search ${index}"}`, [{ blob: "x".repeat(900) }]),
+    );
+    const gathered = salvaged(heavy)[0]!.payload["gathered"] as { query: string; rows?: unknown[]; rows_dropped?: number }[];
+
+    expect(gathered).toHaveLength(12);
+    expect(gathered.every((one) => typeof one.query === "string" && one.query.includes("spl_query"))).toBe(true);
+    expect(gathered.some((one) => one.rows_dropped !== undefined)).toBe(true);
+  });
+
+  it("keeps nothing from a call that failed or returned nothing", () => {
+    const empty = attempt("splunk_execute", "{}", []);
+    const failed: Attempt = { ...empty, result: { ok: false, failure: { kind: "timeout", timeoutMs: 30_000 } } };
+    expect(salvaged([empty, failed])).toEqual([]);
+  });
+});
+
+// AbortSignal.any attaches to both sources and lets go only when the composite is
+// collected, so one per turn piled a listener per iteration onto the run-long lease
+// signal until Node warned about a leak.
+describe("the lease signal is not a place listeners accumulate", () => {
+  it("lets go of both signals when the turn ends", () => {
+    const lease = new AbortController();
+    const asked = new AbortController();
+    const on = (control: AbortController) => getEventListeners(control.signal, "abort").length;
+
+    for (let turn = 0; turn < 20; turn += 1) {
+      const linked = link(lease.signal, asked.signal);
+      expect(on(lease)).toBe(1);
+      linked.release();
+    }
+
+    expect(on(lease)).toBe(0);
+    expect(on(asked)).toBe(0);
+  });
+
+  it("attaches nothing when there is only one signal to honour", () => {
+    const lease = new AbortController();
+    const linked = link(lease.signal, undefined);
+    expect(linked.signal).toBe(lease.signal);
+    expect(getEventListeners(lease.signal, "abort")).toHaveLength(0);
+    linked.release();
+  });
+
+  it("still aborts from whichever signal fires", () => {
+    for (const firing of ["lease", "asked"] as const) {
+      const lease = new AbortController();
+      const asked = new AbortController();
+      const linked = link(lease.signal, asked.signal);
+      (firing === "lease" ? lease : asked).abort(new Error(firing));
+      expect(linked.signal!.aborted).toBe(true);
+      expect((linked.signal!.reason as Error).message).toBe(firing);
+    }
+  });
+
+  it("is already aborted when a signal fired before the turn began", () => {
+    const lease = new AbortController();
+    lease.abort(new Error("lease lost"));
+    expect(link(lease.signal, new AbortController().signal).signal!.aborted).toBe(true);
+  });
+});
+
+// The salvage has to happen on the dispatcher's own failure path, not just in the
+// function it calls: returning evidence: [] there is what discarded eight searches.
+describe("the dispatcher's failure path, end to end", () => {
+  const SEARCH = defineTool(
+    {
+      id: "splunk_execute",
+      description: "run SPL",
+      parameters: { type: "object", properties: { spl_query: { type: "string" } } },
+      execute: async () => ({ ok: true as const, rows: [{ dest_ip: "45.77.53.176", count: 412 }], rowCount: 1, capped: false, sourceSystem: "cisco:asa" }),
+    },
+    { maxRows: 10, timeoutMs: 1_000 },
+    true,
+  );
+
+  const DIED = "read tcp 172.18.0.3:46528->160.79.104.10:443: read: connection timed out";
+
+  const SPEC = {
+    arch: "threathunt",
+    approvals: [],
+    runtime: { max_turns: 4, result_cap: 8_000, recall_limit: 0 },
+    roles: { workers: { network_analyst: { prompt: "look", description: "traffic", output_schema: { type: "object" }, tools: [], needs: [] } } },
+  } as unknown as RunSpec;
+
+  // One tool call that answers, then the write-up call dies -- the exact shape of
+  // every failed dispatch in the run that prompted this.
+  function dying(): Harness<HuntKinds> {
+    return {
+      provider: scriptedProvider([
+        { calls: [{ tool: "splunk_execute", args: '{"spl_query":"index=botsv3"}' }], tokens: { input: 900 } },
+        { fail: DIED, tokens: { input: 40 } },
+      ]),
+      registry: registryOf([SEARCH], { network_analyst: ["splunk_execute"] }),
+      dispatch: localDispatch,
+      budget: budgetOf({ max_calls: 12, max_cost_usd: 5, max_wall_ms: 600_000, max_park_ms: 1_000 }, unmeteredQuota),
+      memory: nullMemory,
+      state: new InProcessState(),
+    } as unknown as Harness<HuntKinds>;
+  }
+
+  it("reports the failure and still returns what it gathered", async () => {
+    const harness = dying();
+    const dispatcher = workerDispatcher({ harness, spec: SPEC, run_id: "run-1", actions: [] });
+    const result = await dispatcher.dispatch({
+      dispatch_id: "dsp-1",
+      agent_id: "network_analyst",
+      query_intent: "find beaconing",
+      focus: "",
+      target_hypothesis_id: null,
+      scope: {},
+    } as never);
+
+    expect(result.failed).toBe(true);
+    // The query ran; only the write-up died. Its rows are the iteration's whole point.
+    expect(result.evidence).toHaveLength(1);
+    expect(result.evidence[0]!.provenance).toBe("unsummarised");
+    const gathered = result.evidence[0]!.payload["gathered"] as { tool: string; rows: unknown[] }[];
+    expect(gathered[0]!.tool).toBe("splunk_execute");
+    expect(gathered[0]!.rows).toEqual([{ dest_ip: "45.77.53.176", count: 412 }]);
+    // Still journaled as an executed call, which is what an analyst re-runs.
+    expect(result.calls?.map((call) => call.tool)).toEqual(["splunk_execute"]);
+    // The query and the write-up that died, both billed: a ceiling that cannot see
+    // failed work is a ceiling a failing run walks straight through. A provider that
+    // dies escapes emit()'s retry loop, so the write-up is billed once here -- in a
+    // deployment the gateway and the limiter are what retry it.
+    expect(harness.budget.spent.tokens.input).toBe(940);
+  });
+});
+
+// The worker prompt tells it to cite "the hypothesis ids given to you" and to report
+// in scope. Both were dropped in the port, so it was told neither.
+describe("what a worker is actually told", () => {
+  const REQUEST = {
+    dispatch_id: "dsp-1",
+    hunt_id: "hunt-1",
+    agent_id: "network_analyst",
+    query_intent: "find hosts beaconing outbound",
+    focus: "192.168.3.130 [entity ip:192.168.3.130]",
+    target_hypothesis_id: "hyp-7",
+    scope: { index: "botsv3", earliest: "2018-08-20", latest: "2018-08-21" },
+  };
+
+  it("names the hypothesis, the scope and the scenario", () => {
+    const rendered = renderDispatch(REQUEST as never, "Frothly, a brewing company, August 2018.");
+
+    expect(rendered).toContain("find hosts beaconing outbound");
+    expect(rendered).toContain("192.168.3.130");
+    // Without this the worker cannot set supports/weakens at all.
+    expect(rendered).toContain("This bears on hypothesis hyp-7.");
+    // Without this it invents its own index and window.
+    expect(rendered).toContain('"index":"botsv3"');
+    expect(rendered).toContain('"earliest":"2018-08-20"');
+    expect(rendered).toContain("Frothly, a brewing company");
+  });
+
+  // The lead and the critic both read the run's own brief. A worker told only the
+  // playbook's standing one is querying an estate nobody described to it.
+  it("carries the run's own brief, not only the playbook's", () => {
+    const rendered = renderDispatch(
+      REQUEST as never,
+      narrativeOf({ narrative: "Standing brief.", prompt: "The data spans 2018-08-19 to 2018-08-20 only." }),
+    );
+    expect(rendered).toContain("Standing brief.");
+    expect(rendered).toContain("2018-08-19 to 2018-08-20");
+  });
+
+  it("says nothing about a hypothesis or scope it was not given", () => {
+    const bare = renderDispatch({ ...REQUEST, focus: "", target_hypothesis_id: null, scope: {} } as never, "");
+    expect(bare).not.toContain("bears on hypothesis");
+    expect(bare).not.toContain("## Scope");
+    expect(bare).toContain("find hosts beaconing outbound");
+  });
+});
+
+// The critic argues against the records, so they arrive delimited: raw JSON reads as
+// the prompt's own voice, which is what every other evidence path prevents.
+describe("what the critic is actually told", () => {
+  const CHECK = {
+    hypothesis_id: "hyp-7",
+    statement: "credentials taken from HOST-42 were reused elsewhere",
+    narrative: "Frothly, August 2018.",
+    evidence: [
+      {
+        relation: "supports",
+        record: {
+          evidence_id: "ev-1",
+          source_system: "cisco:asa",
+          summary: "412 connections at 300s intervals",
+          why_notable: "low jitter",
+          payload: { dest_ip: "45.77.53.176" },
+          attacker_influenceable: false,
+        },
+      },
+    ],
+  };
+
+  it("delimits each record and states what the argument turns on", () => {
+    const rendered = renderNullCheck(CHECK as never);
+
+    expect(rendered).toContain("[hyp-7] credentials taken from HOST-42 were reused elsewhere");
+    expect(rendered).toContain('<vigil:evidence id="ev-1" relation="supports" source="cisco:asa" attacker_influenceable="false">');
+    expect(rendered).toContain("</vigil:evidence>");
+    expect(rendered).toContain("45.77.53.176");
+    expect(rendered).toContain("Frothly, August 2018.");
+  });
+
+  it("says so plainly when nothing is linked, rather than showing an empty list", () => {
+    expect(renderNullCheck({ ...CHECK, evidence: [] } as never)).toContain("Nothing is linked to this hypothesis.");
   });
 });

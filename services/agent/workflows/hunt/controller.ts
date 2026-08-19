@@ -25,6 +25,7 @@ import type {
   Enricher,
   WorkerDispatcher,
 } from "./ports.js";
+import { narrativeOf } from "./render.js";
 import { buildReport, renderCaseFile } from "./report.js";
 import { sanitize, sanitizeQuestion } from "./sanitize.js";
 import {
@@ -350,9 +351,7 @@ export async function startHunt(
     // The run's own brief joins the playbook's standing one. Journalled once, so
     // a replay shows exactly what the lead was told, and the critic argues the
     // null against the same context rather than against a shorter version of it.
-    narrative: [spec.narrative, spec.prompt && `## What this run is about\n\n${spec.prompt}`]
-      .filter((part) => part)
-      .join("\n\n"),
+    narrative: narrativeOf(spec),
     created_at: now,
     terminated_at: null,
     parked_at: null,
@@ -1843,19 +1842,28 @@ export class HuntController {
     const settled = this.ledger.projection.dispatches.get(result.dispatch_id)?.status;
     if (settled === undefined || settled === "complete") return [];
 
-    // A failed worker is evidence about visibility, not a lost turn.
+    // A failed worker is evidence about visibility, not a lost turn -- and the rows
+    // it did gather come too, so a dispatch that died at the write-up costs one call
+    // rather than the iteration.
     const records = result.failed
       ? [
           {
             source_system: "dispatcher",
-            summary: `worker failed: ${result.failure_reason}`,
-            payload: {},
+            // The reason itself stays out of the summary. Promoted to anomalous by
+            // salienceFloor, this text is the most prominent thing the lead reads,
+            // and "read tcp 172.18.0.3:46528->160.79.104.10:443" is a Docker bridge
+            // address and the model gateway. It belongs to the operator, who reads
+            // it from the payload and the dispatch record; the lead only needs to
+            // know a query could not be run.
+            summary: "a query the hunt wanted could not be run",
+            payload: { failure_reason: result.failure_reason },
             salience: "routine" as const,
-            why_notable: "a query the hunt wanted could not be run",
+            why_notable: "a blind spot in what this run could see, not a finding",
             provenance: TOOL_FAILURE,
             attacker_influenceable: false,
             instruction_like: false,
           },
+          ...result.evidence,
         ]
       : result.evidence;
 
@@ -1878,8 +1886,10 @@ export class HuntController {
       calls: result.calls ?? [],
     });
     // A gap record is a fact about visibility, not a finding, so it counts as
-    // neither evidence appended nor something worth enriching.
-    return result.failed ? [] : appended;
+    // neither evidence appended nor something worth enriching. What the dispatch
+    // salvaged is neither -- those rows are telemetry, and their entities are the
+    // leads the iteration was paid for.
+    return appended.filter((record) => record.provenance !== TOOL_FAILURE);
   }
 
   // The Hunt Lead recommends stopping; the controller decides. A refusal is not
