@@ -538,7 +538,7 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
           label="Hypothesis"
           value={hypothesis}
           onChange={setHypothesis}
-          placeholder="Lateral movement in the finance subnet…"
+          placeholder="Credentials taken from HOST-42 were reused on another host…"
           textarea
           hint={isHunt
             ? 'One belief per line, each a claim the hunt can argue against. The benign account is added for you as the claim to beat.'
@@ -683,6 +683,9 @@ interface HuntEvidence {
   instruction_like?: boolean
   provenance?: string
   is_gap?: boolean
+  /** Why the hunt could not look. Kept out of the summary so the hunt does not read
+   *  its own plumbing as telemetry, so this is the only place an operator sees it. */
+  gap_detail?: string | null
   bears_on?: { hypothesis_id: string; relation: string }[]
 }
 
@@ -1023,6 +1026,7 @@ function HuntEvidenceTable({ found, total }: { found: HuntEvidence[]; total: num
                   {one.why_notable && <div className="muted text-[11px]">{one.why_notable}</div>}
                   <div className="text-[11px] mt-0.5 flex gap-2 flex-wrap">
                     {one.is_gap && <span style={{ color: 'var(--high)' }}>could not look — a blind spot, not a finding</span>}
+                    {one.is_gap && one.gap_detail && <span className="muted mono break-all">{one.gap_detail}</span>}
                     {one.salience && !one.is_gap && <span className="muted">{one.salience}</span>}
                     {one.attack_technique && <span className="muted mono">{one.attack_technique}</span>}
                     {one.attacker_influenceable && <span style={{ color: 'var(--high)' }}>attacker-influenceable</span>}

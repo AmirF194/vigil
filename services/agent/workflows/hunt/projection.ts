@@ -63,6 +63,10 @@ export interface EvidenceView {
   // A blind spot rather than a finding. "We looked and it was not there" and "we
   // could not look" read identically until something separates them.
   is_gap: boolean;
+  // Why the hunt could not look, for the operator only. It is kept off the summary
+  // because that text reaches the lead as its most salient record, and a transport
+  // error names this deployment's own plumbing rather than the estate.
+  gap_detail: string | null;
   captured_at: string;
   // Which beliefs it bears on and how. Evidence attached to nothing is the case
   // worth seeing: it was gathered and then nobody linked it.
@@ -151,6 +155,7 @@ function evidenceView(
     instruction_like: record.instruction_like,
     provenance: record.provenance,
     is_gap: isGap(record),
+    gap_detail: typeof record.payload["failure_reason"] === "string" ? record.payload["failure_reason"] : null,
     captured_at: record.captured_at,
     bears_on: links
       .filter((link) => link.evidence_id === record.evidence_id)
