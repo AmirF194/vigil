@@ -394,3 +394,83 @@ describe('ending a run', () => {
     expect(screen.queryByRole('button', { name: /Stop/ })).toBeNull()
   })
 })
+
+// The panel reported "N pieces of evidence gathered" and nothing else, so for the
+// whole of a run -- which is when somebody is watching -- an operator could see
+// that it had found things and never what any of them were.
+describe('what the hunt has actually gathered', () => {
+  const record = (over = {}) => ({
+    evidence_id: 'ev-1',
+    iteration: 2,
+    source_system: 'splunk',
+    summary: 'HOST-42 reached 45.77.53.176 every 30s for four hours',
+    why_notable: 'low jitter across a long window',
+    salience: 'anomalous',
+    bears_on: [{ hypothesis_id: 'h-3431', relation: 'supports' }],
+    ...over,
+  })
+
+  const withEvidence = (records: object[], count = records.length) =>
+    renderPanel({ hunt: hunt({ evidence: records, evidence_count: count }) })
+
+  it('shows what a record says and which belief it bears on', () => {
+    withEvidence([record()])
+    tabTo(/^Evidence/)
+
+    expect(screen.getByText(/reached 45.77.53.176 every 30s/)).toBeInTheDocument()
+    expect(screen.getByText('low jitter across a long window')).toBeInTheDocument()
+    expect(screen.getByText(/supports h-3431/)).toBeInTheDocument()
+  })
+
+  // A record nobody linked is the case most worth seeing: it was gathered and then
+  // nothing was concluded from it.
+  it('says so when a record bears on nothing', () => {
+    withEvidence([record({ bears_on: [] })])
+    tabTo(/^Evidence/)
+
+    expect(screen.getByText('nothing yet')).toBeInTheDocument()
+  })
+
+  // The two flags the verdict gate reads, so an operator can see why support did
+  // not carry rather than only that it did not.
+  it('marks a record a verdict cannot rest on alone', () => {
+    withEvidence([record({ attacker_influenceable: true, instruction_like: true })])
+    tabTo(/^Evidence/)
+
+    expect(screen.getByText('attacker-influenceable')).toBeInTheDocument()
+    expect(screen.getByText('reads as instruction')).toBeInTheDocument()
+  })
+
+  it('separates a blind spot from a finding', () => {
+    withEvidence([record({ is_gap: true, summary: 'worker failed: 504 timeout' })])
+    tabTo(/^Evidence/)
+
+    expect(screen.getByText(/a blind spot, not a finding/)).toBeInTheDocument()
+  })
+
+  // Capped by the projection, and the count is the untruncated total, so the panel
+  // has to say it is showing a subset rather than implying that is all there was.
+  it('says when it is showing fewer records than the run gathered', () => {
+    withEvidence([record()], 120)
+    tabTo(/^Evidence/)
+
+    expect(screen.getByText(/showing 1 of 120/)).toBeInTheDocument()
+  })
+
+  it('offers no evidence view for a run that gathered none', () => {
+    renderPanel({ hunt: hunt({ evidence: [], evidence_count: 0 }) })
+
+    expect(screen.queryByRole('tab', { name: /^Evidence/ })).toBeNull()
+  })
+
+  // report.gaps only exists once the hunt writes a report, so mid-run the operator
+  // could not see what it had failed to look at -- the half that costs money to
+  // rediscover.
+  it('shows a gap while the run is still going, before any report exists', () => {
+    withEvidence([record({ is_gap: true, summary: 'stream:dns returned nothing in the window queried' })])
+    tabTo(/^Gaps/)
+
+    expect(screen.getByText('Visibility gaps (1)')).toBeInTheDocument()
+    expect(screen.getByText(/stream:dns returned nothing/)).toBeInTheDocument()
+  })
+})

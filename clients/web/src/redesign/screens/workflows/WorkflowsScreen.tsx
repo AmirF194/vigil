@@ -667,6 +667,25 @@ interface HuntStanding {
   /** hunt_spec, operator or base_rate — which belief the operator put up themselves. */
   provenance?: string
 }
+/** One record the hunt gathered. The panel used to report a count and nothing
+ *  else, so an operator watching a run could read "4 pieces of evidence gathered"
+ *  and never what any of them said — for the whole of the run, which is when
+ *  somebody is watching. */
+interface HuntEvidence {
+  evidence_id: string
+  iteration: number
+  source_system: string
+  summary: string
+  why_notable?: string
+  salience?: string
+  attack_technique?: string | null
+  attacker_influenceable?: boolean
+  instruction_like?: boolean
+  provenance?: string
+  is_gap?: boolean
+  bears_on?: { hypothesis_id: string; relation: string }[]
+}
+
 /** What the hunt could not answer. A blind spot, not a finding. */
 interface HuntGap {
   evidence_id: string
@@ -716,6 +735,8 @@ interface HuntView {
   outcome?: string | null
   iteration: number
   evidence_count: number
+  /** Capped by the projection; evidence_count stays the untruncated total. */
+  evidence?: HuntEvidence[]
   cost_usd?: number
   // What this run was granted, extensions included — so progress is against the
   // budget the operator asked for rather than against the shipped default.
@@ -905,19 +926,24 @@ function StopRun({ runId, onStopped }: { runId: string; onStopped: () => void })
   )
 }
 
-type HuntTab = 'hyp' | 'gaps' | 'esc' | 'report'
+type HuntTab = 'hyp' | 'evidence' | 'gaps' | 'esc' | 'report'
 
 /** Five stacked tables ran the panel past the bottom of the modal and squeezed
  *  prose into a sideways scroll. They are four views of one run, so they are tabs;
  *  a view with nothing in it is not offered rather than offered empty. */
 function HuntTabs({ d, hunt }: { d: WfRunDetail; hunt: HuntView }) {
-  const gaps = hunt.report?.gaps ?? []
+  const found = hunt.evidence ?? []
+  // Live rather than only from the finalized report: report.gaps exists once the
+  // hunt writes a report, so mid-run the operator could not see what it had failed
+  // to look at — which is the half of a hunt that costs money to rediscover.
+  const gaps = hunt.report?.gaps ?? found.filter((one) => one.is_gap).map(liveGap)
   const checkpoints = hunt.report?.checkpoints ?? []
   const handoffs = hunt.handoffs ?? []
   const report = hunt.report_markdown ?? d.result_summary ?? ''
   const supervision = handoffs.length + checkpoints.length
   const tabs: [HuntTab, string, number | null][] = [
     ['hyp', 'Hypotheses', hunt.hypotheses.length],
+    ...(hunt.evidence_count > 0 ? ([['evidence', 'Evidence', hunt.evidence_count]] as [HuntTab, string, number][]) : []),
     ...(gaps.length > 0 ? ([['gaps', 'Gaps', gaps.length]] as [HuntTab, string, number][]) : []),
     ...(supervision > 0 ? ([['esc', 'Escalations & checkpoints', supervision]] as [HuntTab, string, number][]) : []),
     ['report', 'Report', null],
@@ -937,6 +963,7 @@ function HuntTabs({ d, hunt }: { d: WfRunDetail; hunt: HuntView }) {
         ))}
       </div>
       {shown === 'hyp' && <HuntStandings hunt={hunt} />}
+      {shown === 'evidence' && <HuntEvidenceTable found={found} total={hunt.evidence_count} />}
       {shown === 'gaps' && <HuntGaps gaps={gaps} />}
       {shown === 'esc' && (
         <>
@@ -948,6 +975,64 @@ function HuntTabs({ d, hunt }: { d: WfRunDetail; hunt: HuntView }) {
         ? <div className="muted text-[12.5px] py-3">The report is written when the hunt reaches a terminal state — completed, cancelled, or stopped at its budget.</div>
         : <ReportBody md={report} />)}
     </>
+  )
+}
+
+/** A gap the projection reports live. query_intent belongs to the dispatch, which
+ *  the finalized report joins in and a live read cannot, so the summary carries it. */
+function liveGap(one: HuntEvidence): HuntGap {
+  return {
+    evidence_id: one.evidence_id,
+    iteration: one.iteration,
+    summary: one.summary,
+    hypothesis_id: one.bears_on?.[0]?.hypothesis_id ?? null,
+  }
+}
+
+/** What the hunt has gathered, and what each record bears on. Gaps are folded in
+ *  rather than hidden: "we looked and it was not there" and "we could not look" are
+ *  both here, and the flag says which. */
+function HuntEvidenceTable({ found, total }: { found: HuntEvidence[]; total: number }) {
+  if (found.length === 0) {
+    return <div className="muted text-[12.5px] py-3">{total} record(s) gathered, none reported by this run yet.</div>
+  }
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div className="muted text-[11.5px] mb-2">
+        Newest first{found.length < total && `, showing ${found.length} of ${total}`}.
+      </div>
+      <div className="table-wrap">
+        <table className="tbl">
+          <thead><tr><th className="tight">Turn</th><th className="tight">Source</th><th>What it says</th><th className="tight">Bears on</th></tr></thead>
+          <tbody>
+            {found.map((one) => (
+              <tr key={one.evidence_id}>
+                <td className="muted tight">{one.iteration}</td>
+                <td className="muted tight">{one.source_system || '—'}</td>
+                <td>
+                  {one.summary}
+                  {one.why_notable && <div className="muted text-[11px]">{one.why_notable}</div>}
+                  <div className="text-[11px] mt-0.5 flex gap-2 flex-wrap">
+                    {one.is_gap && <span style={{ color: 'var(--high)' }}>could not look — a blind spot, not a finding</span>}
+                    {one.salience && !one.is_gap && <span className="muted">{one.salience}</span>}
+                    {one.attack_technique && <span className="muted mono">{one.attack_technique}</span>}
+                    {one.attacker_influenceable && <span style={{ color: 'var(--high)' }}>attacker-influenceable</span>}
+                    {one.instruction_like && <span style={{ color: 'var(--crit)' }}>reads as instruction</span>}
+                  </div>
+                </td>
+                <td className="muted tight">
+                  {(one.bears_on ?? []).length === 0
+                    ? 'nothing yet'
+                    : (one.bears_on ?? []).map((link) => (
+                        <div key={link.hypothesis_id}>{link.relation} {link.hypothesis_id}</div>
+                      ))}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   )
 }
 
