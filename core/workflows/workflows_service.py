@@ -68,9 +68,16 @@ def _asked_hypotheses(parameters: Optional[Dict[str, Any]]) -> List[str]:
 # is the shortest real claim seen in a definition ("a host is beaconing"), and a
 # verb is what separates a claim from a topic.
 MIN_HYPOTHESIS_WORDS = 4
+# "ed " catches a regular past tense and nothing else, so "data left the estate over
+# DNS" -- a claim that can be shown false -- was refused for spelling its verb
+# irregularly. Widening the list only ever admits more claims: a subject label such
+# as "credential access" still carries no verb to match.
 _TOPIC_VERBS = (
     " is ", " are ", " was ", " were ", " has ", " have ", " had ", " been ",
     " will ", " can ", " could ", " does ", " do ", " did ", " ran ", " runs ",
+    " left ", " took ", " sent ", " got ", " made ", " came ", " went ", " saw ",
+    " broke ", " held ", " kept ", " lost ", " found ", " gave ", " began ",
+    " wrote ", " read ", " built ", " brought ", " spoke ", " stole ", " hid ",
     "s to ", "ing ", "ed ",
 )
 

@@ -281,6 +281,36 @@ async def test_the_cost_ceiling_rides_the_job(monkeypatch, asked, expected):
         assert set(captured["job"]["request"]["overrides"]) == {"budgets"}
 
 
+# A hunt argues the null against a claim, so the shape gate is deliberate. It is a
+# heuristic though, and "ed " recognised only a regular past tense: a real claim that
+# spelled its verb irregularly was refused alongside the subject labels it is for.
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "data left the estate over DNS",
+        "HOST-42 sent 4GB to 45.77.53.176",
+        "the attacker stole the signing key",
+        "an operator took the backup offsite",
+        "credentials taken from HOST-42 were reused elsewhere",
+    ],
+)
+def test_a_claim_is_a_claim_however_its_verb_is_spelled(statement):
+    from core.workflows.workflows_service import _not_a_claim
+
+    assert _not_a_claim(statement) is False
+
+
+# Still refused, which is the point: widening the verbs must not admit a subject.
+@pytest.mark.parametrize(
+    "statement",
+    ["credential access", "credential access and escalation", "idk", "lateral movement via RDP"],
+)
+def test_a_subject_is_still_not_a_claim(statement):
+    from core.workflows.workflows_service import _not_a_claim
+
+    assert _not_a_claim(statement) is True
+
+
 # The run is where the belief has to exist, because the run is where a person is
 # there to be told. The definition ships none on purpose.
 @pytest.mark.asyncio
