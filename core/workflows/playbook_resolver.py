@@ -303,7 +303,7 @@ HUNT_MAX_WORKERS = 4
 CALLS_PER_ITERATION = (HUNT_MAX_WORKERS + 2) * (int(DEFAULT_RUNTIME["max_turns"]) + 2)
 HUNT_BUDGETS = {
     "max_calls": HUNT_ITERATIONS * CALLS_PER_ITERATION,
-    "max_cost_usd": 3.0,
+    "max_cost_usd": 15.0,
     "max_wall_ms": 1_800_000,
 }
 

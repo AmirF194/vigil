@@ -30,6 +30,11 @@ ROUTER_META = RouterMeta(
 )
 logger = logging.getLogger(__name__)
 
+# What gives a run something to work on. A turn count or a cost ceiling says how
+# far to go and never where, so neither is a target: on its own either one would
+# enqueue a run with nothing to run on.
+TARGET_PARAMS = frozenset({"finding_id", "case_id", "context", "hypothesis"})
+
 
 # -----------------------------------------------------------------------------
 # Pydantic schemas
@@ -46,6 +51,10 @@ class WorkflowExecuteRequest(BaseModel):
     # Turns, not model calls. Bounded here so a typo cannot enqueue a run that
     # spends for an hour before anything reads the number.
     iterations: Optional[int] = Field(default=None, ge=1, le=40)
+    # What the caller is willing to spend on this one question, which is not a
+    # property of the definition. Bounded for the same reason as the turn count:
+    # a mistyped ceiling is money, and 100 is far above any observed hunt.
+    max_cost_usd: Optional[float] = Field(default=None, gt=0, le=100)
 
 
 class WorkflowPhaseSchema(BaseModel):
@@ -357,7 +366,7 @@ async def execute_workflow(
 
         parameters = {k: v for k, v in request.model_dump().items() if v is not None}
 
-        if not parameters:
+        if not TARGET_PARAMS & parameters.keys():
             raise HTTPException(
                 status_code=400,
                 detail=(

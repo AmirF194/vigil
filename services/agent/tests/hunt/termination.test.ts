@@ -483,4 +483,20 @@ describe("turns and model calls are different budgets", () => {
   it("honours a hard ceiling the config states for itself", () => {
     expect(specWith({ max_iterations: 30, hard_max_iterations: 31 }).termination.hard_max_iterations).toBe(31);
   });
+
+  // The same fix as the turn count's, on the ceiling it was not applied to: a
+  // caller raising the cost ceiling past twice the shipped default had the spec
+  // refused outright, so the run never opened a ledger to be told why.
+  it("rides the cost ceiling on the budget a caller asked for", () => {
+    const raised = { max_iterations: 8, max_calls: 5_000, max_cost_usd: 40, max_wall_ms: 1, max_park_ms: 1 };
+    const spec = huntSpec({ ...huntSpecFor({ budgets: raised }), thresholds: {} });
+    expect(spec.budgets.max_cost_usd).toBe(40);
+    expect(spec.termination.hard_max_cost_usd).toBe(80);
+  });
+
+  it("still honours a cost ceiling the config states for itself", () => {
+    const raised = { max_iterations: 8, max_calls: 5_000, max_cost_usd: 40, max_wall_ms: 1, max_park_ms: 1 };
+    const spec = huntSpec({ ...huntSpecFor({ budgets: raised }), thresholds: { hard_max_cost_usd: 41 } });
+    expect(spec.termination.hard_max_cost_usd).toBe(41);
+  });
 });

@@ -33,6 +33,27 @@ def _asked_iterations(parameters: Optional[Dict[str, Any]]) -> Optional[int]:
         return None
 
 
+# The harness already takes an overrides block naming budgets or runtime and
+# refuses anything else, so a cost ceiling needs no new contract -- only for this
+# side to stop dropping it. None leaves the resolver's, which is the shipped one.
+def _asked_overrides(parameters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    stated = (parameters or {}).get("max_cost_usd")
+    if stated is None:
+        return None
+    try:
+        ceiling = float(stated)
+    except (TypeError, ValueError):
+        return None
+    return {"budgets": {"max_cost_usd": ceiling}} if ceiling > 0 else None
+
+
+# The optional half of StartRequest is declared optional on both sides, so a key
+# carrying None is not the same as an absent one: JSON null reaches TypeScript as a
+# value, and a reader that checks `=== undefined` takes it as one.
+def _omit_unset(request: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in request.items() if value is not None}
+
+
 def _asked_hypotheses(parameters: Optional[Dict[str, Any]]) -> List[str]:
     stated = (parameters or {}).get("hypothesis") or ""
     return [line.strip() for line in str(stated).splitlines() if line.strip()]
@@ -397,19 +418,22 @@ class WorkflowsService:
             # The definition's, not a constant: threat-hunt drives the hypothesis
             # loop and the other four walk their phases, from one entry point.
             run_kind=workflow.run_kind,
-            request={
-                # A reference, not a path: the agent layer asks for the resolved
-                # layers at run start, so an edited definition reaches the next run.
-                "arch": "",
-                "playbook": f"{WORKFLOW_SCHEME}{workflow.id}",
-                "config": "",
-                "prompt": self._build_target_context(parameters),
-                # On the job rather than in the playbook: what this caller wants
-                # tested belongs to this run, and the reference names a definition
-                # every run of it shares.
-                "hypotheses": _asked_hypotheses(parameters),
-                "iterations": _asked_iterations(parameters),
-            },
+            request=_omit_unset(
+                {
+                    # A reference, not a path: the agent layer asks for the resolved
+                    # layers at run start, so an edited definition reaches the next run.
+                    "arch": "",
+                    "playbook": f"{WORKFLOW_SCHEME}{workflow.id}",
+                    "config": "",
+                    "prompt": self._build_target_context(parameters),
+                    # On the job rather than in the playbook: what this caller wants
+                    # tested belongs to this run, and the reference names a definition
+                    # every run of it shares.
+                    "hypotheses": _asked_hypotheses(parameters),
+                    "iterations": _asked_iterations(parameters),
+                    "overrides": _asked_overrides(parameters),
+                }
+            ),
             enqueued_by=triggered_by or "api",
         )
         try:

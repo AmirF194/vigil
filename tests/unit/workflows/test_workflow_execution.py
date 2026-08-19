@@ -239,4 +239,43 @@ async def test_the_turn_count_rides_the_job(monkeypatch, asked, expected):
             "threat-hunt", {"finding_id": "f-1", **asked}
         )
 
-    assert captured["job"]["request"]["iterations"] == expected
+    assert captured["job"]["request"].get("iterations") == expected
+    assert ("iterations" in captured["job"]["request"]) is (expected is not None)
+
+
+# The harness has always taken an overrides block naming budgets; this side dropped
+# it, so the only way to change what a hunt may spend was to edit the resolver.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "asked,expected",
+    [
+        ({"max_cost_usd": 25}, {"budgets": {"max_cost_usd": 25.0}}),
+        ({"max_cost_usd": "7.5"}, {"budgets": {"max_cost_usd": 7.5}}),
+        ({}, None),
+        ({"max_cost_usd": "lots"}, None),
+        ({"max_cost_usd": 0}, None),
+    ],
+)
+async def test_the_cost_ceiling_rides_the_job(monkeypatch, asked, expected):
+    monkeypatch.setattr(
+        WorkflowsService, "get_workflow", lambda self, wid: _make_workflow(wid)
+    )
+    captured = {}
+
+    async def _enqueue(job, job_id=None):
+        captured["job"] = job
+        return "job-1"
+
+    with patch(
+        "core.workflows.workflow_run_service.WorkflowRunService.begin_run",
+        return_value="run-1",
+    ), patch("core.agents.queue.enqueue_run", new=AsyncMock(side_effect=_enqueue)):
+        await WorkflowsService().execute_workflow(
+            "threat-hunt", {"finding_id": "f-1", **asked}
+        )
+
+    assert captured["job"]["request"].get("overrides") == expected
+    # withOverrides refuses anything but budgets or runtime, so a stray key here
+    # would fail the run at spec assembly rather than be ignored.
+    if expected is not None:
+        assert set(captured["job"]["request"]["overrides"]) == {"budgets"}

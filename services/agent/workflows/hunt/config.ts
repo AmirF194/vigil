@@ -89,6 +89,7 @@ export function terminationOf(spec: RunSpec): Termination {
     ...over(DEFAULT_TERMINATION, spec.thresholds),
     hard_max_iterations: spec.thresholds["hard_max_iterations"] ?? 2 * budgets.max_iterations,
     hard_max_calls: spec.thresholds["hard_max_calls"] ?? 2 * budgets.max_calls,
+    hard_max_cost_usd: spec.thresholds["hard_max_cost_usd"] ?? 2 * budgets.max_cost_usd,
   };
 }
 

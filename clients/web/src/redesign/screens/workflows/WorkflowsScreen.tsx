@@ -404,10 +404,10 @@ interface WfLimits {
 /** The ceiling, not an estimate. Observed cost per model call varies several-fold
  *  across runs because the transcript grows, so a per-turn figure would be
  *  invented precision; what is actually true is where the run stops. */
-function turnsHint(asked: string, limits: WfLimits | null): string {
+function turnsHint(asked: string, cost: string, limits: WfLimits | null): string {
   const turns = asked.trim() === '' ? limits?.budgets?.max_iterations : Number(asked)
-  const cap = limits?.budgets?.max_cost_usd
-  const where = cap === undefined ? '' : ` It stops at $${cap.toFixed(2)} whatever happens.`
+  const cap = cost.trim() === '' ? limits?.budgets?.max_cost_usd : Number(cost)
+  const where = cap === undefined || !Number.isFinite(cap) ? '' : ` It stops at $${cap.toFixed(2)} whatever happens.`
   if (turns === undefined) return 'Turns the hunt may take before it stops and reports.'
   return `${turns} turn(s): each is a lead decision, the workers it dispatches and the pass that argues against them.${where}`
 }
@@ -438,6 +438,7 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
   const [context, setContext] = useState('')
   const [hypothesis, setHypothesis] = useState('')
   const [iterations, setIterations] = useState('')
+  const [maxCost, setMaxCost] = useState('')
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // The run this modal started. Held so the modal can stay open and watch it
@@ -471,6 +472,8 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
   const isHunt = wf.runKind === 'hunt'
   const turns = Number(iterations)
   const turnsBad = iterations.trim() !== '' && (!Number.isInteger(turns) || turns < 1 || turns > 40)
+  const cost = Number(maxCost)
+  const costBad = maxCost.trim() !== '' && (!Number.isFinite(cost) || cost <= 0 || cost > 100)
 
   const params = {
     ...(findingId.trim() && { finding_id: findingId.trim() }),
@@ -480,8 +483,12 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
   }
   // A turn count is not a target: on its own it says how long to run and never
   // what to run on, so it is kept out of the check that a run has something to do.
-  const withTurns = { ...params, ...(isHunt && !turnsBad && iterations.trim() && { iterations: turns }) }
-  const canRun = Object.keys(params).length > 0 && !turnsBad && !starting
+  const withTurns = {
+    ...params,
+    ...(isHunt && !turnsBad && iterations.trim() && { iterations: turns }),
+    ...(isHunt && !costBad && maxCost.trim() && { max_cost_usd: cost }),
+  }
+  const canRun = Object.keys(params).length > 0 && !turnsBad && !costBad && !starting
 
   const run = async () => {
     setStarting(true)
@@ -526,7 +533,18 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
             value={iterations}
             onChange={setIterations}
             placeholder={String(limits?.budgets?.max_iterations ?? 8)}
-            hint={turnsBad ? 'A whole number of turns between 1 and 40.' : turnsHint(iterations, limits)}
+            hint={turnsBad ? 'A whole number of turns between 1 and 40.' : turnsHint(iterations, maxCost, limits)}
+          />
+        )}
+        {isHunt && (
+          <Field
+            label="Cost ceiling"
+            value={maxCost}
+            onChange={setMaxCost}
+            placeholder={(limits?.budgets?.max_cost_usd ?? 15).toFixed(2)}
+            hint={costBad
+              ? 'A dollar amount above 0 and no more than 100.'
+              : 'Dollars this run may spend before it stops and reports on what it has. The turn count above is the other ceiling; whichever it reaches first ends the run.'}
           />
         )}
         <div className="flex justify-end gap-2.5 pt-1">

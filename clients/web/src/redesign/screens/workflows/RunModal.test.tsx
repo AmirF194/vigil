@@ -85,6 +85,34 @@ describe('what the run will cost', () => {
     expect(await screen.findByText(/^3 turn\(s\)/)).toBeInTheDocument()
   })
 
+  it('sends the ceiling the operator typed, not the shipped one', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([]))
+    open()
+    await screen.findByText(/It stops at/)
+
+    fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing' } })
+    fireEvent.change(screen.getByLabelText(/Cost ceiling/), { target: { value: '25' } })
+    expect(await screen.findByText(/It stops at \$25\.00 whatever happens/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /Run workflow/ }))
+
+    await waitFor(() => expect(execute).toHaveBeenCalledWith('threat-hunt', {
+      context: 'beaconing', max_cost_usd: 25,
+    }))
+  })
+
+  it('refuses to start on a ceiling that is not money', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([]))
+    open()
+    await screen.findByText(/It stops at/)
+
+    fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing' } })
+    fireEvent.change(screen.getByLabelText(/Cost ceiling/), { target: { value: '-3' } })
+
+    expect(await screen.findByText(/above 0 and no more than 100/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Run workflow/ })).toBeDisabled()
+  })
+
   it('offers no iterations field for a workflow that walks phases', async () => {
     getWorkflow.mockResolvedValueOnce({ data: {} })
     open('compose')

@@ -222,6 +222,19 @@ def test_the_arch_fans_out_to_the_workers_the_budget_assumes():
     assert int(match.group(1)) == HUNT_MAX_WORKERS
 
 
+# The cost ceiling is stated on both sides, and the agent layer derives the hard
+# per-hunt limit from its own copy. A resolver that hands over more than the agent
+# layer's default is refused at spec assembly -- which is how a raised ceiling
+# turns into a run that never starts.
+def test_both_sides_ship_the_same_cost_ceiling():
+    from core.workflows.playbook_resolver import HUNT_BUDGETS
+
+    types_ts = (ROOT / "services" / "agent" / "workflows" / "hunt" / "types.ts").read_text()
+    stated = re.search(r"max_cost_usd: ([\d.]+),", types_ts)
+    assert stated is not None, "types.ts no longer states max_cost_usd"
+    assert float(stated.group(1)) == HUNT_BUDGETS["max_cost_usd"]
+
+
 # A turn count that the call meter trips first is a number nothing enforces --
 # which is the bug this pair replaced, where 24 calls ended a hunt at turn 2.
 def test_the_call_ceiling_leaves_room_for_the_turns_it_ships_with():

@@ -113,7 +113,7 @@ export const CALLS_PER_ITERATION = callsPerIteration(4, 8);
 export const DEFAULT_BUDGETS: Budgets = {
   max_iterations: 8,
   max_calls: 8 * CALLS_PER_ITERATION,
-  max_cost_usd: 3.0,
+  max_cost_usd: 15.0,
   max_wall_ms: 1_800_000,
   max_park_ms: DEFAULT_PARK_MS,
 };

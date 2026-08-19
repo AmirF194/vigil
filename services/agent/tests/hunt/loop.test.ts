@@ -190,8 +190,12 @@ describe("bounded re-prompt", () => {
   });
 
   it("terminates a stalled hunt that has spent its budget", async () => {
-    const { ledger } = await newLedger();
-    // Each attempt costs more than the whole budget allows.
+    // The ceiling is stated here rather than borrowed from the shipped default:
+    // the premise is "one attempt costs more than the budget", and reading the
+    // default made that premise change whenever the default did.
+    const { ledger } = await newLedger({
+      budgets: { max_iterations: 8, max_calls: 5_000, max_cost_usd: 1, max_wall_ms: 1_800_000, max_park_ms: 604_800_000 },
+    });
     const provider = new StubbornProvider(UNCITED_ABANDON, 3);
 
     await expect(new HuntController(ledger, provider).advanceIteration()).rejects.toThrow(InvalidDecision);
