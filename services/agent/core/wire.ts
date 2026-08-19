@@ -68,7 +68,14 @@ class OpenAiSurface implements Provider {
     if ((emitModes.get(mode) ?? "schema") === "schema") {
       try {
         const format = { type: "json_schema" as const, json_schema: { name: "emission", strict: false, schema } };
-        return turnOf(await this.call({ model: this.model, messages, response_format: format }, request.signal));
+        const turn = turnOf(await this.call({ model: this.model, messages, response_format: format }, request.signal));
+        // A gateway that drops response_format answers 200 with an object of the
+        // model's own invention, which reads as a schema-invalid answer and costs
+        // two retries against a schema it was never shown. Falling through to the
+        // tool, whose parameters the same gateway does forward, is the only fix
+        // available from this side.
+        if (honours(turn.content, schema)) return turn;
+        emitModes.set(mode, "tool");
       } catch (error) {
         if (statusOf(error) !== 400) throw error;
         emitModes.set(mode, "tool");
@@ -89,8 +96,32 @@ class OpenAiSurface implements Provider {
     );
     // The emission arrived as the tool's arguments. It is returned as content so
     // the loop validates one shape whichever mode produced it.
-    const emitted = turn.tool_calls.find((call) => call.tool === EMIT_TOOL);
-    return { ...turn, content: emitted === undefined ? turn.content : emitted.args, tool_calls: [] };
+    const emitted = emissionOf(turn);
+    if (emitted !== undefined) return { ...turn, content: emitted, tool_calls: [] };
+
+    // Asked for the emission and handed a call to something else: a provider that
+    // does not enforce tool_choice reaches for a tool name out of the transcript
+    // instead. That left content empty, which every caller above reads as an
+    // unparseable answer and spends its retries on. Said plainly, it is answerable.
+    const called = turn.tool_calls.map((call) => call.tool).join(", ");
+    const corrected = turnOf(
+      await this.call(
+        {
+          model: this.model,
+          messages: [
+            ...messages,
+            {
+              role: "user",
+              content: `You called ${called === "" ? "no function" : called}, which is not available here. Call ${EMIT_TOOL} with your final answer, and call nothing else.`,
+            },
+          ],
+          tools: [{ type: "function", function: emit }],
+          tool_choice: { type: "function", function: { name: EMIT_TOOL } },
+        },
+        request.signal,
+      ),
+    );
+    return { ...corrected, content: emissionOf(corrected) ?? "", tool_calls: [] };
   }
 
   // Streamed, and not for the deltas: a buffered completion is subject to the
@@ -117,6 +148,27 @@ class OpenAiSurface implements Provider {
       return assemble(stream);
     });
   }
+}
+
+// The forced call's arguments, or undefined when the model called something else.
+function emissionOf(turn: Turn): string | undefined {
+  return turn.tool_calls.find((call) => call.tool === EMIT_TOOL)?.args;
+}
+
+// Whether an emission looks like the schema's rather than the model's own: every
+// required property present. Shallow on purpose -- this decides which wire to use,
+// and the caller validates properly.
+function honours(content: string, schema: Record<string, unknown>): boolean {
+  const required = schema["required"];
+  if (!Array.isArray(required) || required.length === 0) return true;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null) return false;
+  return required.every((key) => typeof key === "string" && key in (parsed as Record<string, unknown>));
 }
 
 // One completion out of its chunks. A tool call arrives split across them: the
