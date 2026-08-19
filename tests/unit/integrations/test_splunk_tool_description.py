@@ -76,6 +76,19 @@ def test_carries_the_date_span_and_says_why_it_matters(monkeypatch):
     assert "not an absence of evidence" in described
 
 
+# Verified against the running deployment, not read off Splunk's docs: the console
+# form is silently empty through the REST search, so advising it would send a model
+# down the same dead end this description exists to close.
+def test_names_the_time_formats_that_work_and_the_one_that_does_not(monkeypatch):
+    described = _describe(_load(monkeypatch, _ROWS))["splunk_execute"]
+
+    assert "2018-08-19T00:00:00" in described
+    assert "epoch second" in described
+    assert "08/19/2018:00:00:00" in described and "does NOT take" in described
+    # There is no such parameter, so telling it to set one would waste a turn.
+    assert "no `latest` parameter" in described
+
+
 # nl_search takes no time range at all, so the same map is a warning rather than
 # an instruction: it cannot act on it.
 def test_warns_that_the_natural_language_tool_cannot_set_a_range(monkeypatch):

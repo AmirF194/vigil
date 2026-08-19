@@ -96,11 +96,18 @@ _SUMMARY_SPL = (
     "BY index, sourcetype | sort - count | head 40"
 )
 _SUMMARY_ROWS = 40
+# Every accepted form here was tried against this path rather than taken from
+# Splunk's docs: the console's own MM/DD/YYYY:HH:MM:SS is silently empty through
+# the REST search, which is the same dead end this text exists to prevent.
 _WHY_THE_SPAN_MATTERS = (
     "The date span is the point: `earliest` defaults to -24h, so a historical "
-    "dataset returns nothing unless you set `earliest` and `latest` to cover the "
-    "span above. Empty results against a span you did not cover are a gap in what "
-    "you looked at, not an absence of evidence."
+    "dataset returns nothing at all unless you widen it to cover the span above. "
+    "Empty results against a span you did not cover are a gap in what you looked "
+    "at, not an absence of evidence.\n"
+    "`earliest` takes a relative offset (-15y), an ISO 8601 timestamp "
+    "(2018-08-19T00:00:00) or an epoch second. It does NOT take Splunk's console "
+    "form (08/19/2018:00:00:00), which returns nothing here. There is no `latest` "
+    "parameter; the window always ends now, which covers any past span."
 )
 _summary_cache: Optional[str] = None
 
