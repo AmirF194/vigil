@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
+from typing import Optional
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
@@ -79,14 +81,89 @@ def generate_spl(query: str, indexes=None):
     return {"spl_query": spl, "pattern": pattern}
 
 
+# What this deployment actually holds, in the tool's own description. Told only
+# "Execute SPL query", a model has to guess an index and a time range, and a wrong
+# guess comes back empty rather than wrong -- which reads as "no evidence" and is
+# really "no visibility". A hunt spent three iterations that way against a 2018
+# dataset it kept querying with the -24h default.
+#
+# Lifted from the DuckDB adapter on the threat-hunt branch, which put
+# information_schema into its description and is why that path queried accurately.
+# In the description rather than as a tool the lead must remember to call: there is
+# no turn to spend on it and no way to skip it.
+_SUMMARY_SPL = (
+    "| tstats count, min(_time) AS earliest, max(_time) AS latest WHERE index=* "
+    "BY index, sourcetype | sort - count | head 40"
+)
+_SUMMARY_ROWS = 40
+_WHY_THE_SPAN_MATTERS = (
+    "The date span is the point: `earliest` defaults to -24h, so a historical "
+    "dataset returns nothing unless you set `earliest` and `latest` to cover the "
+    "span above. Empty results against a span you did not cover are a gap in what "
+    "you looked at, not an absence of evidence."
+)
+_summary_cache: Optional[str] = None
+
+
+def _fmt_span(row: dict) -> str:
+    def when(key: str) -> str:
+        try:
+            stamp = datetime.fromtimestamp(float(row[key]), timezone.utc)
+        except (KeyError, TypeError, ValueError, OSError):
+            return "?"
+        return stamp.strftime("%Y-%m-%d")
+
+    return f"{when('earliest')}..{when('latest')}"
+
+
+# Best effort by design: a summary that cannot be read leaves the plain description
+# rather than failing list_tools, because a server answering no tools at all is
+# worse than one whose description is thin.
+def _telemetry_summary() -> str:
+    global _summary_cache
+    if _summary_cache is not None:
+        return _summary_cache
+
+    _summary_cache = ""
+    service = get_splunk_service()
+    if service is None:
+        return _summary_cache
+    try:
+        rows = service.search(
+            _SUMMARY_SPL, earliest_time="-20y", max_count=_SUMMARY_ROWS
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not summarise Splunk telemetry: %s", exc)
+        return _summary_cache
+
+    lines = [
+        f"  index={row.get('index')} sourcetype={row.get('sourcetype')} "
+        f"count={row.get('count')} {_fmt_span(row)}"
+        for row in (rows or [])
+        if row.get("index")
+    ]
+    if not lines:
+        return _summary_cache
+
+    held = "\n".join(lines)
+    _summary_cache = (
+        "\n\nWhat this deployment holds "
+        "(index, sourcetype, event count, UTC date span):\n"
+        f"{held}\n\n{_WHY_THE_SPAN_MATTERS}"
+    )
+    return _summary_cache
+
+
 @server.list_tools()
 async def handle_list_tools():
+    telemetry = _telemetry_summary()
     return [
         types.Tool(name="splunk_generate_spl", description="Generate SPL from natural language",
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "indexes": {"type": "array", "items": {"type": "string"}}
             }, "required": ["query"]}),
-        types.Tool(name="splunk_execute", description="Execute SPL query",
+        types.Tool(name="splunk_execute",
+            description="Execute SPL query" + telemetry,
             inputSchema={"type": "object", "properties": {
                 "spl_query": {"type": "string"},
                 "earliest": {"type": "string", "default": "-24h"},
@@ -100,7 +177,10 @@ async def handle_list_tools():
             inputSchema={"type": "object", "properties": {
                 "hostname": {"type": "string"}, "hours": {"type": "integer", "default": 24}
             }, "required": ["hostname"]}),
-        types.Tool(name="splunk_nl_search", description="Natural language search (generate + execute)",
+        types.Tool(name="splunk_nl_search",
+            description="Natural language search (generate + execute). Cannot "
+                        "express a time range, so it reaches only data inside the "
+                        "default window." + telemetry,
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "max_results": {"type": "integer", "default": 100}
             }, "required": ["query"]}),
