@@ -1236,18 +1236,38 @@ function HuntStandings({ hunt }: { hunt: HuntView }) {
 function OpenCheckpoint({ hunt }: { hunt: HuntView }) {
   const open = hunt.open_checkpoint
   const [busy, setBusy] = useState<string | null>(null)
-  const [said, setSaid] = useState<string | null>(null)
+  const [failed, setFailed] = useState<string | null>(null)
+  // Which question was answered, not merely that one was. The projection keeps
+  // reporting the checkpoint until the run journals a resolution, so without the
+  // id a second question would arrive already wearing the first one's answer.
+  const [answered, setAnswered] = useState<{ checkpoint_id: string; kind: string } | null>(null)
   const [why, setWhy] = useState('')
   if (!open) return null
 
   const answer = (kind: 'approve' | 'reject') => {
     setBusy(kind)
-    setSaid(null)
+    setFailed(null)
     workflowApi
       .steer(hunt.run_id ?? '', kind, why.trim(), { checkpoint_id: open.checkpoint_id })
-      .then(() => setSaid(`${kind} sent — the run picks it up at its next turn`))
-      .catch((e) => setSaid(errMsg(e)))
+      .then(() => { setAnswered({ checkpoint_id: open.checkpoint_id, kind }); setWhy('') })
+      .catch((e) => setFailed(errMsg(e)))
       .finally(() => setBusy(null))
+  }
+
+  // Answered, and the run has not caught up yet. The question was the whole of
+  // this panel and it is settled, so it collapses to what was sent rather than
+  // leaving a wall of text under a heading that no longer applies — it is waiting
+  // on the run now, not on a person. It clears itself when the resolution reaches
+  // the ledger and the projection stops reporting an open checkpoint.
+  if (answered?.checkpoint_id === open.checkpoint_id) {
+    return (
+      <div className="modal-section run-ask" style={{ borderLeftColor: 'var(--ok)', background: 'var(--ok-dim)' }}>
+        <div className="flex items-center gap-2 text-[12.5px]">
+          <span style={{ color: 'var(--ok)', display: 'inline-flex' }}><Icon name="check" size={15} /></span>
+          <span><b>{answered.kind}</b> sent. The run picks it up at its next turn.</span>
+        </div>
+      </div>
+    )
   }
 
   const unbound = (open.context?.['unbound_capabilities'] as string[] | undefined) ?? []
@@ -1275,7 +1295,7 @@ function OpenCheckpoint({ hunt }: { hunt: HuntView }) {
           onChange={(e) => setWhy(e.target.value)}
         />
       </div>
-      {said && <div className="muted text-[11.5px] mt-2">{said}</div>}
+      {failed && <div className="text-[11.5px] mt-2" style={{ color: 'var(--crit)' }}>{failed}</div>}
     </div>
   )
 }

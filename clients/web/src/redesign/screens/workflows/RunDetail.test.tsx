@@ -356,6 +356,39 @@ describe('answering a checkpoint the hunt is parked on', () => {
     expect(screen.getByText(/No tool here answers telemetry_search/)).toBeInTheDocument()
   })
 
+  // The projection keeps reporting the checkpoint until the run journals a
+  // resolution, so the panel stayed as a wall of text under "Waiting on you" with
+  // both buttons live — after the operator had already answered, and while it was
+  // waiting on the run rather than on them.
+  it('collapses to what was sent once it is answered', async () => {
+    withCheckpoint()
+
+    fireEvent.click(screen.getByRole('button', { name: 'approve' }))
+
+    expect(await screen.findByText(/picks it up at its next turn/)).toBeInTheDocument()
+    expect(screen.queryByText(/Waiting on you/)).toBeNull()
+    expect(screen.queryByText(/Two consecutive worker dispatches/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'approve' })).toBeNull()
+  })
+
+  // Otherwise a second question arrives already wearing the first one's answer,
+  // and the run waits on somebody who has been told it is handled.
+  it('asks again when the run raises a different question', async () => {
+    const { rerender } = withCheckpoint()
+    fireEvent.click(screen.getByRole('button', { name: 'approve' }))
+    await screen.findByText(/picks it up at its next turn/)
+
+    rerender(
+      <RunDetail
+        d={detail({ hunt: hunt({ run_id: 'run-1', open_checkpoint: parked({ checkpoint_id: 'cp-later', question: 'Mark h-3431 proven?' }) }) })}
+        onSteered={() => {}}
+      />,
+    )
+
+    expect(screen.getByText('Mark h-3431 proven?')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'approve' })).toBeInTheDocument()
+  })
+
   it('shows nothing when the run is waiting on no one', () => {
     renderPanel({ hunt: hunt() })
 
