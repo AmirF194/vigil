@@ -136,7 +136,13 @@ def _upsert_provider_key(
     body.setdefault("name", f"default-{provider_name}-key")
     body.setdefault("weight", 1)
     body.setdefault("enabled", True)
-    body["value"] = {"value": key_value, "type": "plain_text"}
+    # A bare string. Wrapped as {"value": ..., "type": "plain_text"} this Bifrost
+    # accepts the write with a 200 and stores the serialized wrapper as the
+    # credential -- it reads back masked as {"va***xt"}, the JSON's own first and
+    # last characters, and every call then 401s with "invalid x-api-key". Nothing
+    # says so: the push succeeded, the secret store is right, and only the gateway
+    # knows. Verified against the running image rather than inferred.
+    body["value"] = key_value
     if models is not None:
         body["models"] = models
     body.setdefault("models", [])
