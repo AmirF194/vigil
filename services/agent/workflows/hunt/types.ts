@@ -40,20 +40,6 @@ export const ACTIONS_REQUIRING_CITATION: ReadonlySet<DecisionAction> = new Set([
   "EXPAND",
 ]);
 
-// What the controller actually does something about. An arch may only declare
-// these: a verb that is merely in the vocabulary would be journaled, change
-export const EXECUTABLE_ACTIONS = [
-  "INVESTIGATE",
-  "EXPAND",
-  "PIVOT",
-  "DEEPEN",
-  "ABANDON",
-  "VALIDATE",
-  "CHECKPOINT",
-  "CONCLUDE",
-  "HANDOFF_IR",
-] as const satisfies readonly DecisionAction[];
-
 // parked is the budget checkpoint: the hunt has stopped spending and waits on an
 // operator to extend, conclude or abort it. It advances nothing until then, so it
 export type HuntStatus = "pending_approval" | "active" | "parked" | "terminal";
