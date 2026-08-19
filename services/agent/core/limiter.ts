@@ -86,13 +86,23 @@ export class Limiter {
 
   private async withRetry<T>(call: () => Promise<T>): Promise<T> {
     let lastError: unknown;
+    let blind = 0;
     for (let attempt = 0; attempt < this.attempts; attempt += 1) {
       try {
         return await call();
       } catch (error) {
         const status = statusOf(error);
         if (status === 402) throw new GatewayExhausted((error as Error).message);
-        if (status !== undefined && !RETRYABLE.has(status)) throw error;
+        // No status is a connection that died rather than a gateway that answered,
+        // so it is worth one more attempt but not three: a ceiling the gateway
+        // enforces answers the same way every time, and three of those cost a role
+        // its whole dispatch in wall clock before it can fall back to less.
+        if (status === undefined) {
+          blind += 1;
+          if (blind > 1) throw error;
+        } else if (!RETRYABLE.has(status)) {
+          throw error;
+        }
         lastError = error;
         if (attempt === this.attempts - 1) break;
         const backoff = retryAfterMs(error) ?? 2 ** attempt * 500;
