@@ -142,9 +142,44 @@ class TestRefusals:
         assert _nothing_to_run(_hunt(hypotheses=["something to test"])) == ""
         assert _nothing_to_run(_hunt()) == "hypotheses"
         # The caller's belief counts: the shipped definition states none.
-        assert _nothing_to_run(_hunt(), {"hypothesis": "a host beacons"}) == ""
+        assert _nothing_to_run(_hunt(), {"hypothesis": "a host is beaconing to external C2"}) == ""
         assert _nothing_to_run(_hunt(), {"hypothesis": "   \n  "}) == "hypotheses"
         assert _nothing_to_run(_hunt(), {"context": "no belief here"}) == "hypotheses"
+
+    # Required is not the same as meaningful. Both of these cleared the not-blank
+    # check and were run: neither can be argued against, and both cost a budget to
+    # conclude nothing.
+    def test_a_topic_is_not_a_hypothesis(self):
+        from core.workflows.workflows_service import (WorkflowDefinition,
+                                                      _nothing_to_run)
+
+        def _hunt(**extra):
+            return WorkflowDefinition(
+                workflow_id="h", metadata={"run_kind": "hunt", **extra}, body="", file_path=""
+            )
+
+        for topic in ("idk", "credential access and escalation", "lateral movement"):
+            assert _nothing_to_run(_hunt(), {"hypothesis": topic}) == "claims", topic
+
+        for claim in (
+            "A host is beaconing to attacker-controlled infrastructure on a regular interval",
+            "Credentials taken from HOST-42 were reused elsewhere",
+            "the finance subnet has been scanned from inside",
+        ):
+            assert _nothing_to_run(_hunt(), {"hypothesis": claim}) == "", claim
+
+    # One real claim among several carries the run: the check is there to stop a
+    # board with nothing on it, not to mark an operator's wording.
+    def test_one_real_claim_is_enough(self):
+        from core.workflows.workflows_service import (WorkflowDefinition,
+                                                      _nothing_to_run)
+
+        hunt = WorkflowDefinition(
+            workflow_id="h", metadata={"run_kind": "hunt"}, body="", file_path=""
+        )
+        asked = {"hypothesis": "lateral movement\nCredentials from HOST-42 were reused elsewhere"}
+        assert _nothing_to_run(hunt, asked) == ""
+
 
     # The refusal moved to the run, where a person sees it. A definition declaring
     # none resolves fine -- that is the shipped case -- and execute_workflow is what

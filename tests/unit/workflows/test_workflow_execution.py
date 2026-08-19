@@ -290,8 +290,8 @@ async def test_the_cost_ceiling_rides_the_job(monkeypatch, asked, expected):
         ({"context": "beaconing"}, True),
         ({"finding_id": "f-1"}, True),
         ({"context": "beaconing", "hypothesis": "  \n "}, True),
-        ({"context": "beaconing", "hypothesis": "a host beacons"}, False),
-        ({"hypothesis": "a host beacons"}, False),
+        ({"context": "beaconing", "hypothesis": "a host is beaconing to external C2"}, False),
+        ({"hypothesis": "a host is beaconing to external C2"}, False),
     ],
 )
 async def test_a_hunt_needs_a_belief_from_someone(monkeypatch, asked, refused):

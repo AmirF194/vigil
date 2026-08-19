@@ -59,6 +59,30 @@ def _asked_hypotheses(parameters: Optional[Dict[str, Any]]) -> List[str]:
     return [line.strip() for line in str(stated).splitlines() if line.strip()]
 
 
+# A hunt argues the null against a claim. "idk" and "credential access and
+# escalation" both cleared the not-blank check and neither can be argued against:
+# the first says nothing and the second names a subject. Both were run, and both
+# cost a budget to conclude nothing.
+#
+# A heuristic, and it says so: it recognises a sentence, not a true one. Four words
+# is the shortest real claim seen in a definition ("a host is beaconing"), and a
+# verb is what separates a claim from a topic.
+MIN_HYPOTHESIS_WORDS = 4
+_TOPIC_VERBS = (
+    " is ", " are ", " was ", " were ", " has ", " have ", " had ", " been ",
+    " will ", " can ", " could ", " does ", " do ", " did ", " ran ", " runs ",
+    "s to ", "ing ", "ed ",
+)
+
+
+def _not_a_claim(statement: str) -> bool:
+    words = statement.split()
+    if len(words) < MIN_HYPOTHESIS_WORDS:
+        return True
+    padded = f" {statement.lower()} "
+    return not any(verb in padded for verb in _TOPIC_VERBS)
+
+
 # A hunt tests what it was given, from the definition or from this caller. Neither
 # is required to carry one on its own; between them one is, or the run would open a
 # ledger, spend a lead turn and conclude having tested nothing.
@@ -66,8 +90,12 @@ def _nothing_to_run(
     workflow: "WorkflowDefinition", parameters: Optional[Dict[str, Any]] = None
 ) -> str:
     if workflow.run_kind == HUNT_RUN_KIND:
-        stated = workflow.metadata.get("hypotheses") or _asked_hypotheses(parameters)
-        return "" if stated else "hypotheses"
+        if workflow.metadata.get("hypotheses"):
+            return ""
+        asked = _asked_hypotheses(parameters)
+        if not asked:
+            return "hypotheses"
+        return "claims" if all(_not_a_claim(one) for one in asked) else ""
     return "" if workflow.phases else "phases"
 
 
@@ -397,6 +425,15 @@ class WorkflowsService:
         # run is refused before it leaves a run record behind. The two loops read
         # different sections, so they are empty in different ways.
         missing = _nothing_to_run(workflow, parameters)
+        if missing == "claims":
+            return {
+                "success": False,
+                "error": (
+                    "A hypothesis has to be a claim the hunt can argue against. "
+                    "\"credential access\" names a subject; \"credentials taken "
+                    "from HOST-42 were reused elsewhere\" can be shown false."
+                ),
+            }
         if missing == "hypotheses":
             return {
                 "success": False,
