@@ -2,9 +2,10 @@
 // resolution a default import lands on module.exports.default. The named export
 // exists in both, so this one line satisfies `bundler` and NodeNext alike.
 import { Ajv, type ValidateFunction } from "ajv";
+import { GatewayExhausted } from "./limiter.js";
 import { ZERO_TOKENS, type Refusal, type SpendPayload, type TokenCounts } from "../contracts/budget.js";
 import type { CheckpointPayload, DispatchPayload, NewEvent, ResolutionPayload, TerminalPayload } from "../contracts/events.js";
-import type { RegisteredTool, ToolResult } from "../contracts/tool.js";
+import { ToolBoundsViolation, type RegisteredTool, type ToolResult } from "../contracts/tool.js";
 import {
   approvalId,
   TOOL_APPROVAL,
@@ -16,7 +17,7 @@ import {
   type TurnConfig,
 } from "./loop.js";
 import { ProviderError, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
-import { assemble, prefixOf, type Prefix } from "./context.js";
+import { assemble, prefixOf, type FoldPolicy, type Prefix } from "./context.js";
 import { scannerFor, wrap } from "./security.js";
 import type { State } from "./seams.js";
 
@@ -59,6 +60,11 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private readonly transcript: Message[] = [];
   private prefix: Prefix = { system: "", tools: [], recall: "" };
   private lastFold = 0;
+  // Null until a write-up dies. DEFAULT_FOLD keeps 40 messages, and a role that made
+  // twenty-nine tool calls lands just under it -- so the most expensive request it
+  // could possibly send is the one that goes unfolded. Retrying that identically is
+  // three times the cost for the same answer, so the retry sends less instead.
+  private tightened: FoldPolicy | null = null;
   private turns = 0;
   private capped = false;
   private prose = "";
@@ -73,7 +79,25 @@ class Run<T, Kinds extends Record<string, unknown>> {
     this.folder = new Folder(harness.state, cfg.run_id);
   }
 
+  // A provider that dies is a run that failed, which is what Outcome is for: it
+  // carries the status, the reason, and the calls already made. Letting the error
+  // escape instead threw all three away, so a role that made eight successful calls
+  // and then lost the one that writes up their answer reported having made none --
+  // one flaky call discarding every result behind it. Every workflow reads a failed outcome
+  // (status === "failed" || value === null), so this is the contract they were
+  // written against; only this path disagreed. An abort still throws, because a
+  // cancelled run is not a run that answered.
   async *execute(): TurnStream<T> {
+    try {
+      return yield* this.attempt();
+    } catch (error) {
+      if (this.cfg.signal?.aborted === true || hardStop(error)) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      return yield* announce(this.done("failed", null, reason));
+    }
+  }
+
+  private async *attempt(): TurnStream<T> {
     this.transcript.push(...(this.cfg.history ?? []));
 
     // Recalled once and rendered into the opening turn, never re-recalled per
@@ -204,7 +228,18 @@ class Run<T, Kinds extends Record<string, unknown>> {
       const refusal = await this.harness.budget.beginCall();
       if (refusal !== null) return this.exhausted(refusal);
 
-      const turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema });
+      // A write-up that dies on the wire has still gathered everything behind it, so
+      // the one thing worth changing before asking again is how much it is asked over.
+      let turn;
+      try {
+        turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema });
+      } catch (error) {
+        if (this.tightened !== null || this.cfg.signal?.aborted === true) throw error;
+        this.tightened = TIGHT_FOLD;
+        this.rejected.push(`the emission call failed (${(error as Error).message}); asked again over a folded transcript`);
+        attempt -= 1;
+        continue;
+      }
 
       const parsed = tryParse(turn.content);
       if (parsed !== undefined && validate(parsed)) {
@@ -228,7 +263,15 @@ class Run<T, Kinds extends Record<string, unknown>> {
   // Prefix, then the folded history, then a tail that is never persisted. What
   // summarising drops is the fold's to decide, and the edges are never dropped.
   private assembled(working = ""): Message[] {
-    const { messages, folded } = assemble(this.prefix, this.cfg.task, this.transcript, working, summariseFolded);
+    const policy = this.tightened ?? undefined;
+    const { messages, folded } = assemble(
+      this.prefix,
+      this.cfg.task,
+      this.transcript,
+      working,
+      summariseFolded,
+      ...(policy === undefined ? [] : ([policy] as const)),
+    );
     this.lastFold = folded;
     return messages;
   }
@@ -320,6 +363,17 @@ class Run<T, Kinds extends Record<string, unknown>> {
   }
 }
 
+// Not every throw is a turn that failed. A gateway with no budget left cannot serve
+// the next call either, so reporting it as one failed turn invites the caller to
+// retry into it; and a bounds violation is a defect in an adapter, which must not
+// read as a role that could not answer.
+function hardStop(error: unknown): boolean {
+  // A defect in this process is not a role that could not answer. Swallowing one into
+  // a failed outcome cost real debugging time: a mistyped name read as a dead gateway.
+  if (error instanceof TypeError || error instanceof ReferenceError || error instanceof SyntaxError) return true;
+  return error instanceof GatewayExhausted || error instanceof ToolBoundsViolation;
+}
+
 // The last event a run yields and the outcome it returns are the same thing, so
 // a caller that reads only the stream and one that awaits it agree.
 async function* announce<T>(outcome: Outcome<T>): TurnStream<T> {
@@ -378,6 +432,10 @@ class Folder<Kinds extends Record<string, unknown>> {
     };
   }
 }
+
+// Half the tail and a quarter of the ceiling: enough recent turns to write over, and
+// small enough that the retry is a different request rather than the same one.
+const TIGHT_FOLD: FoldPolicy = { head: 2, tail: 4, max_messages: 10 };
 
 // Names what was dropped rather than reproducing it: a summary that quotes the
 // middle back is the middle, and folds nothing.
