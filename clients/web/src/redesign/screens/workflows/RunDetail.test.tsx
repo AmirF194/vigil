@@ -507,3 +507,25 @@ describe('what the hunt has actually gathered', () => {
     expect(screen.getByText(/stream:dns returned nothing/)).toBeInTheDocument()
   })
 })
+
+// A run that stopped at the ceiling its operator set did what it was told. The
+// bridge wrote its reason into the error column and the panel rendered that under
+// a red "Error" heading, so "an operator accepted the stop at the budget
+// checkpoint" was shown as a fault.
+describe('why a finished run ended', () => {
+  it('states the reason beside the outcome rather than as an error', () => {
+    renderPanel({
+      status: 'completed',
+      hunt: hunt({ outcome: 'budget_terminated', reason: 'ran out of turns: iteration 3 of 3, having spent $0.11 of $14.00' }),
+    })
+
+    expect(screen.getByText(/Why it ended: ran out of turns: iteration 3 of 3/)).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Error' })).toBeNull()
+  })
+
+  it('still shows a real error as one', () => {
+    renderPanel({ status: 'failed', error: 'its spec cannot be built' })
+
+    expect(screen.getByRole('heading', { name: 'Error' })).toBeInTheDocument()
+  })
+})

@@ -25,7 +25,7 @@ import type {
   Enricher,
   WorkerDispatcher,
 } from "./ports.js";
-import { buildReport, caseFilePath, renderCaseFile, renderReport, reportPath } from "./report.js";
+import { buildReport, renderCaseFile } from "./report.js";
 import { sanitize, sanitizeQuestion } from "./sanitize.js";
 import {
   DEFAULT_DISPATCH,
@@ -66,6 +66,7 @@ import {
   type EvidenceRecord,
   type Expansion,
   type HuntOutcome,
+  type HuntState,
   type Hypothesis,
   type IterationResult,
   type NullCheckEvidence,
@@ -148,6 +149,25 @@ const NO_NULL_CHECK: NullCheckAttempt = { result: null, blocked: "", cost_usd: 0
 
 // A call that died mid-way still spent. Duck-typed rather than reaching into the
 // LLM module, so the controller stays free of it.
+// Which arm of the budget actually stopped the run, or null while both have room.
+// "budget exhausted" beside "$0.11 of $14.00" reads as a contradiction, and an
+// operator seeing it reasonably concludes the ceiling is broken -- when what ran
+// out was the turn count they set, which the same sentence never named.
+export function boundBy(hunt: HuntState): "iterations" | "cost" | null {
+  if (hunt.cost_usd >= hunt.budgets.max_cost_usd) return "cost";
+  if (hunt.iteration >= hunt.budgets.max_iterations) return "iterations";
+  return null;
+}
+
+// Both numbers either way, because the one with room is the answer to "then why
+// did it stop" and is the first thing an operator looks for.
+export function boundReason(hunt: HuntState): string {
+  const spend = `$${hunt.cost_usd.toFixed(4)} of $${hunt.budgets.max_cost_usd.toFixed(2)}`;
+  const turns = `iteration ${hunt.iteration} of ${hunt.budgets.max_iterations}`;
+  if (boundBy(hunt) === "cost") return `spent its allowance: ${spend}, at ${turns}`;
+  return `ran out of turns: ${turns}, having spent ${spend}`;
+}
+
 function spentBefore(error: unknown): number {
   const cost = (error as { cost_usd?: unknown }).cost_usd;
   return typeof cost === "number" ? cost : 0;
@@ -1112,9 +1132,7 @@ export class HuntController {
   // abort. Parked rather than terminated, because "the money ran out" is a
   private park(): string {
     const hunt = this.ledger.projection.hunt;
-    const reason =
-      `budget exhausted at iteration ${hunt.iteration} of ${hunt.budgets.max_iterations}, ` +
-      `$${hunt.cost_usd.toFixed(4)} of $${hunt.budgets.max_cost_usd.toFixed(2)}`;
+    const reason = boundReason(hunt);
 
     this.ledger.patch("hunt", hunt.hunt_id, {
       status: "parked",
@@ -1928,9 +1946,6 @@ export class HuntController {
   }
 
   private budgetExhausted(): boolean {
-    const hunt = this.ledger.projection.hunt;
-    return (
-      hunt.iteration >= hunt.budgets.max_iterations || hunt.cost_usd >= hunt.budgets.max_cost_usd
-    );
+    return boundBy(this.ledger.projection.hunt) !== null;
   }
 }

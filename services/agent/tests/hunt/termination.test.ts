@@ -7,7 +7,7 @@ import {
   huntSpec,
   type Termination,
 } from "../../workflows/hunt/config.js";
-import { HuntParked } from "../../workflows/hunt/controller.js";
+import { boundBy, boundReason, HuntParked } from "../../workflows/hunt/controller.js";
 import { steer } from "../../workflows/hunt/inbox.js";
 import type { DirectiveQueue } from "../../workflows/hunt/ports.js";
 import { ScriptedDecisionProvider } from "../../workflows/hunt/scripted.js";
@@ -160,7 +160,7 @@ describe("the budget checkpoint", () => {
     expect(result.hunt_status).toBe("parked");
     expect(ledger.projection.hunt.outcome).toBeNull();
     expect(ledger.projection.hunt.parked_at).not.toBeNull();
-    expect(ledger.projection.hunt.parked_reason).toMatch(/budget exhausted/);
+    expect(ledger.projection.hunt.parked_reason).toMatch(/ran out of turns|spent its allowance/);
 
     await expect(controllerFor(ledger, [INVESTIGATE]).advanceIteration()).rejects.toThrow(HuntParked);
     await expect(controllerFor(ledger, [INVESTIGATE]).advanceIteration()).rejects.toThrow(
@@ -498,5 +498,35 @@ describe("turns and model calls are different budgets", () => {
     const raised = { max_iterations: 8, max_calls: 5_000, max_cost_usd: 40, max_wall_ms: 1, max_park_ms: 1 };
     const spec = huntSpec({ ...huntSpecFor({ budgets: raised }), thresholds: { hard_max_cost_usd: 41 } });
     expect(spec.termination.hard_max_cost_usd).toBe(41);
+  });
+});
+
+// "budget exhausted" beside "$0.11 of $14.00" reads as a contradiction, and an
+// operator seeing it reasonably concludes the ceiling is broken. What ran out was
+// the turn count they set, which the sentence never named.
+describe("which arm of the budget stopped the run", () => {
+  const at = (iteration: number, cost_usd: number, max_iterations = 3, max_cost_usd = 14) =>
+    ({ iteration, cost_usd, budgets: { max_iterations, max_cost_usd } }) as never;
+
+  it("says turns when the turns ran out and the money did not", () => {
+    expect(boundBy(at(3, 0.11))).toBe("iterations");
+    expect(boundReason(at(3, 0.11))).toMatch(/ran out of turns: iteration 3 of 3/);
+    // The arm with room is the answer to "then why did it stop", so it is stated too.
+    expect(boundReason(at(3, 0.11))).toMatch(/having spent \$0\.1100 of \$14\.00/);
+  });
+
+  it("says spend when the money ran out first", () => {
+    expect(boundBy(at(1, 14))).toBe("cost");
+    expect(boundReason(at(1, 14))).toMatch(/spent its allowance: \$14\.0000 of \$14\.00/);
+    expect(boundReason(at(1, 14))).toMatch(/at iteration 1 of 3/);
+  });
+
+  // Cost first when both are gone: money is the one an operator cannot get back.
+  it("names spend when both arms are out", () => {
+    expect(boundBy(at(3, 14))).toBe("cost");
+  });
+
+  it("names nothing while both have room", () => {
+    expect(boundBy(at(1, 0.5))).toBeNull();
   });
 });

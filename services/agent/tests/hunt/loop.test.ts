@@ -101,7 +101,11 @@ describe("controller", () => {
     // Running out of money is a question for an operator, not a verdict.
     expect(result.hunt_status).toBe("parked");
     expect(result.hunt_outcome).toBeNull();
-    expect(result.note).toMatch(/budget exhausted/);
+    // Names the arm that bound, not just "budget": a run stopped at 3 of 3 turns
+    // while $0.11 of $14 was spent reads as a broken ceiling unless the sentence
+    // says which of the two ran out.
+    expect(result.note).toMatch(/ran out of turns: iteration 1 of 1/);
+    expect(result.note).toMatch(/having spent \$/);
   });
 
   it("rejects an uncited ABANDON but accepts a cited one", async () => {

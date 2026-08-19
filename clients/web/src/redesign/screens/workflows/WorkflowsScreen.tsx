@@ -733,6 +733,10 @@ interface HuntView {
   // Why it ended, which is not the same as whether it succeeded: a hunt stopped at
   // its ceiling finalises as completed, and saying only that hides the ceiling.
   outcome?: string | null
+  /** Why it ended, in the hunt's own words — which arm of the budget bound, or what
+   *  an operator did. Not an error: a run that stopped at its ceiling did what it
+   *  was told. */
+  reason?: string | null
   iteration: number
   evidence_count: number
   /** Capped by the projection; evidence_count stays the untruncated total. */
@@ -843,6 +847,9 @@ export function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => v
     <div className="run-detail">
       <RunBar d={d} hunt={hunt} onSteered={onSteered} />
       {hunt && <OpenCheckpoint hunt={hunt} />}
+      {hunt?.reason && !IN_FLIGHT.includes(d.status) && (
+        <div className="muted text-[12px] leading-[1.5] mt-2">Why it ended: {hunt.reason}</div>
+      )}
       {d.error && (
         <div className="modal-section">
           <h4 style={{ color: 'var(--crit)' }}>Error</h4>
@@ -868,7 +875,9 @@ function RunBar({ d, hunt, onSteered }: { d: WfRunDetail; hunt: HuntView | null;
   return (
     <div className="run-bar">
       <span className="pill" style={{ color: runStatusColor(d.status) }}><span className="dot" />{d.status}</span>
-      {hunt?.outcome && !IN_FLIGHT.includes(d.status) && <span className="muted text-[11.5px]">{hunt.outcome}</span>}
+      {hunt?.outcome && !IN_FLIGHT.includes(d.status) && (
+        <span className="muted text-[11.5px]" title={hunt.reason ?? undefined}>{hunt.outcome}</span>
+      )}
       <span className="mono text-[11.5px] text-tx-3">{d.run_id.slice(0, 13)}</span>
       <span className="flex-1" />
       <div className="meta">

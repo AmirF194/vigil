@@ -145,11 +145,18 @@ def record_terminal(
         approvals,
     )
 
+    status = TERMINAL_STATUS.get(update.outcome, "failed")
     run_service.finalize_run(
         run_id,
-        status=TERMINAL_STATUS.get(update.outcome, "failed"),
+        status=status,
         result_summary=update.summary or None,
-        error=None if update.outcome == "completed" else update.reason,
+        # Only a failure writes the error column. A hunt that stopped at the ceiling
+        # its operator set, or that an operator halted, has a reason rather than an
+        # error -- and the console renders this field under a red "Error" heading,
+        # so "an operator accepted the stop at the budget checkpoint" was being
+        # shown as a fault on a run that did exactly what it was told. The reason is
+        # still on the terminal event and in the report, which is where it belongs.
+        error=update.reason if status == "failed" else None,
         cost_usd=update.cost_usd,
     )
 
