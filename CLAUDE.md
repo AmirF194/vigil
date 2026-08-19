@@ -6,7 +6,7 @@ This file provides guidance for AI assistants (Claude Code and similar tools) wo
 
 ## Project Overview
 
-**Vigil** is an open-source, AI-native Security Operations Center (SOC) platform. It orchestrates 13 specialized AI agents via Claude to perform triage, investigation, threat hunting, forensics, and automated response across 40 security integrations.
+**Vigil** is an open-source, AI-native Security Operations Center (SOC) platform. It orchestrates 13 specialized AI agents via Claude to perform triage, investigation, threat hunting, forensics, and automated response across 41 security integrations.
 
 **Core pillars:**
 - **Agents** — 13 agents defined in `AGENT_CONFIGS`, which is the authoritative
@@ -20,7 +20,7 @@ This file provides guidance for AI assistants (Claude Code and similar tools) wo
   `run_kind: hunt` and runs the **hypothesis loop** instead — a Hunt Lead picks
   each move from what the evidence did to each belief, so its `phases:` block is
   a dispatch roster rather than an order.
-- **Integrations** — 40 MCP servers in `mcp-config.json` (Splunk, CrowdStrike, VirusTotal, Shodan, Timesketch, Jira, Slack, etc.). Count only dict-valued keys: the `mcpServers` object also holds 7 `_comment_*` string keys used as section separators.
+- **Integrations** — 41 MCP servers in `mcp-config.json` (Splunk, CrowdStrike, VirusTotal, Shodan, Timesketch, Jira, Slack, etc.). Count only dict-valued keys: the `mcpServers` object also holds 7 `_comment_*` string keys used as section separators.
 
 **Ports:**
 - Backend API: `http://localhost:6987`
@@ -64,7 +64,7 @@ vigil/
 │   ├── helm/             # Helm chart (vigil/)
 │   └── database/init/    # PostgreSQL init SQL (docker-compose: lex order by filename; Helm: values.yaml dbInit.sqlFiles)
 ├── scripts/              # Init and utility shell scripts
-├── mcp-config.json       # 40 MCP server definitions (+ `_comment_*` separator keys)
+├── mcp-config.json       # 41 MCP server definitions (+ `_comment_*` separator keys)
 └── env.example           # Template for all 220+ environment variables
 ```
 
@@ -290,7 +290,7 @@ Business logic lives in `services/`, not in API route handlers. A router lives w
 
 ### MCP Tool Access
 
-Agents access external tools through the MCP protocol. Tool definitions live in `mcp-config.json`, which spawns each in-repo server as its own `python3` subprocess. A vendor's server lives in that vendor's slice as `core/integrations/<vendor>/tool.py` (see [core/integrations/README.md](core/integrations/README.md) for the inventory and the outbound-HTTP conventions); `tools/mcp/` holds the servers that talk to Vigil's own services; the rest of the 40 entries are external servers. `services/mcp_service.py` coordinates tool access.
+Agents access external tools through the MCP protocol. Tool definitions live in `mcp-config.json`, which spawns each in-repo server as its own `python3` subprocess. A vendor's server lives in that vendor's slice as `core/integrations/<vendor>/tool.py` (see [core/integrations/README.md](core/integrations/README.md) for the inventory and the outbound-HTTP conventions); `tools/mcp/` holds the servers that talk to Vigil's own services; the rest of the 41 entries are external servers. `services/mcp_service.py` coordinates tool access.
 
 ### Database
 
