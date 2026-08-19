@@ -140,14 +140,22 @@ describe('after the run starts', () => {
 })
 
 describe('a hunt tests what the operator states', () => {
-  it('will not start on a target with no belief to test', async () => {
+  // Says so when Run is pressed rather than sitting dead through a sentence: a
+  // disabled button beside a hint reading "required" argues with the form instead
+  // of answering about the run.
+  it('says what is missing on Run rather than while the field is being typed', async () => {
     getWorkflow.mockResolvedValueOnce(limits([]))
     open()
     await screen.findByText(/It stops at/)
 
     fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing' } })
+    expect(screen.getByRole('button', { name: /Run workflow/ })).not.toBeDisabled()
 
-    expect(screen.getByRole('button', { name: /Run workflow/ })).toBeDisabled()
+    execute.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: /Run workflow/ }))
+
+    expect(await screen.findByText(/at least one in Hypothesis/)).toBeInTheDocument()
+    expect(execute).not.toHaveBeenCalled()
   })
 
   it('starts once a belief is stated', async () => {

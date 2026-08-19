@@ -488,13 +488,17 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
     ...(isHunt && !turnsBad && iterations.trim() && { iterations: turns }),
     ...(isHunt && !costBad && maxCost.trim() && { max_cost_usd: cost }),
   }
-  // A hunt ships no hypotheses, so the caller's is the whole board beside the base
-  // rate. Gated here as well as in the service: an operator should not spend a
-  // round trip to be told the run had nothing to test.
+  // Checked when Run is pressed rather than while the field is being filled in. A
+  // button that stays dead through a sentence, next to a hint that says "required",
+  // reads as an argument with the form instead of an answer about the run.
   const needsHypothesis = isHunt && hypothesis.trim() === ''
-  const canRun = Object.keys(params).length > 0 && !turnsBad && !costBad && !needsHypothesis && !starting
+  const canRun = Object.keys(params).length > 0 && !turnsBad && !costBad && !starting
 
   const run = async () => {
+    if (needsHypothesis) {
+      setError('A hunt tests a claim you state. Put at least one in Hypothesis — the benign account is added for you.')
+      return
+    }
     setStarting(true)
     setError(null)
     try {
@@ -537,7 +541,7 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
           placeholder="Lateral movement in the finance subnet…"
           textarea
           hint={isHunt
-            ? 'Required, one belief per line. Each goes on the board as its own claim to test. The benign account is added for you as the claim to beat.'
+            ? 'One belief per line, each a claim the hunt can argue against. The benign account is added for you as the claim to beat.'
             : undefined}
         />
         {isHunt && (
