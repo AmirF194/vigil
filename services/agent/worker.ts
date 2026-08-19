@@ -255,6 +255,12 @@ async function stopBecauseItCannotSucceed(
   error: unknown,
 ): Promise<boolean> {
   if (!(error instanceof SpecError)) return false;
+  // SpecError is not only about specs: the lead throws one when it emits no
+  // decision, and its reason for emitting none is often that the ledger holds an
+  // open checkpoint. A run waiting on a person is the one case that must never be
+  // killed for not progressing -- the next sweep succeeds the moment somebody
+  // answers, and killing it throws away the answer they were about to give.
+  if (await waitingOnSomeone(state, job.run_id)) return false;
 
   const reason = `its spec cannot be built: ${error.message}`;
   await state.append(job.run_id, [
@@ -366,6 +372,11 @@ const NOT_PROGRESS: ReadonlySet<string> = new Set(["resumed", "spend"]);
 
 async function abandonIfStalled(state: State, leases: Leases, job: RunJob): Promise<boolean> {
   const events = await state.read(job.run_id);
+  // A parked hunt is swept on every interval and journals a resume each time, so
+  // counting those as stalling would end every run that asked a question -- inside
+  // minutes, against a park TTL of a week. abandonIfParkedOut owns the case where
+  // nobody ever answers, and it waits max_park_ms to say so.
+  if (parkedFor(events) !== null) return false;
   let resumes = 0;
   for (let at = events.length - 1; at >= 0; at -= 1) {
     const kind = events[at]?.kind ?? "";
@@ -381,6 +392,13 @@ async function abandonIfStalled(state: State, leases: Leases, job: RunJob): Prom
   await mirrorFor().terminal(job.run_id, { outcome: "abandoned", reason, summary: "" });
   await reap(leases, job.run_id);
   return true;
+}
+
+// Whether anything is waiting on a person. Read fresh rather than passed in: the
+// callers reach here from a catch, where the events they read may predate the
+// checkpoint that the failure is about.
+async function waitingOnSomeone(state: State, runId: string): Promise<boolean> {
+  return parkedFor(await state.read(runId)) !== null;
 }
 
 // How long the oldest unanswered checkpoint has been waiting, or null when none

@@ -6,6 +6,7 @@ import type { RunJob } from "../../contracts/job.js";
 import { InProcessLeases } from "../../core/leases.js";
 import { InProcessState } from "../../core/state.js";
 import { advance, MAX_STALLED_RESUMES, resolveSpec, specOf } from "../../worker.js";
+import { SpecError } from "../../core/spec.js";
 import { scriptedHarness } from "../support/scripted-harness.js";
 import type { ScriptedTurn } from "../support/scripted-provider.js";
 
@@ -263,5 +264,56 @@ describe("a run that keeps being picked up and going nowhere", () => {
     await advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE));
 
     expect((await state.terminal(RUN))?.outcome).not.toBe("abandoned");
+  });
+});
+
+// Both guards shipped able to kill a run that was doing the one thing a hunt is
+// supposed to do when it runs out of road: ask. A parked run is swept on every
+// interval and journals a resume each time, and the lead throws a SpecError whose
+// reason is the open checkpoint itself -- so the stall count and the unbuildable-spec
+// path both fired on a run whose next sweep would have succeeded the moment somebody
+// answered. One died that way with an operator's approve already on its way.
+describe("a run waiting on a person", () => {
+  async function parked(resumes: number): Promise<InProcessState> {
+    const state = new InProcessState();
+    const spec = await resolveSpec(startJob());
+    await state.append(RUN, [
+      {
+        run_id: RUN, run_kind: "hunt", kind: "run",
+        payload: { run_kind: "hunt", spec, budgets: spec.budgets, seed: RUN, tenant_id: null, started_by: "test" },
+      },
+      {
+        run_id: RUN, run_kind: "hunt", kind: "checkpoint",
+        payload: { checkpoint_id: "cp-1", checkpoint_class: "budget_anomaly", question: "which index holds CloudTrail?" } as never,
+      },
+    ]);
+    for (let n = 0; n < resumes; n += 1) {
+      await state.append(RUN, [
+        { run_id: RUN, run_kind: "hunt", kind: "resumed", payload: { worker: "w", enqueued_by: "watchdog" } },
+      ]);
+    }
+    return state;
+  }
+
+  it("is not stalling, however many times it has been swept", async () => {
+    const state = await parked(MAX_STALLED_RESUMES * 3);
+
+    await advance(state, leases, resumeJob(), scriptedHarness(CONCLUDE)).catch(() => {});
+
+    expect((await state.terminal(RUN))?.outcome).not.toBe("abandoned");
+  });
+
+  it("survives the lead throwing because of the very checkpoint it is waiting on", async () => {
+    const state = await parked(1);
+    const failing = {
+      ...scriptedHarness(CONCLUDE),
+      build: () => { throw new SpecError("the lead emitted no decision: the ledger holds an open checkpoint, cp-1"); },
+    };
+
+    await advance(state, leases, resumeJob(), failing.build as never).catch(() => {});
+
+    // No terminal at all: the run is still answerable, and writing one would have
+    // thrown away the answer the operator was in the middle of giving.
+    expect(await state.terminal(RUN)).toBeNull();
   });
 });
