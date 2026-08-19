@@ -215,7 +215,7 @@ roles:
                 summary: { type: string }
                 salience: { type: string, enum: [routine, notable, anomalous] }
                 why_notable: { type: string }
-                payload: { type: object }
+                payload: { type: string, description: "The rows or aggregates as a JSON object, serialised to a string." }
                 supports: { type: array, items: { type: string } }
                 weakens: { type: array, items: { type: string } }
                 attacker_influenceable: { type: boolean }

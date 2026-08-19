@@ -213,6 +213,21 @@ export function salvaged(attempts: readonly Attempt[]): WorkerEvidence[] {
 
 // A worker's emission, as evidence records. Anything the schema did not require
 // is dropped rather than guessed at: the controller stamps identity and time.
+// Declared to the model as a JSON string: a schema saying only "object" is one a
+// provider's function calling cannot shape, and the call came back with no
+// arguments at all. An object is still accepted, because the ledger holds objects
+// and a scripted role hands one over directly.
+function payloadOf(raw: unknown): Record<string, unknown> {
+  if (typeof raw === "object" && raw !== null) return raw as Record<string, unknown>;
+  if (typeof raw !== "string" || raw.trim() === "") return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : { text: raw };
+  } catch {
+    return { text: raw };
+  }
+}
+
 export function evidenceFrom(answer: WorkerAnswer): WorkerEvidence[] {
   if (!Array.isArray(answer.results)) return [];
   return answer.results.map((row) => {
@@ -228,7 +243,7 @@ export function evidenceFrom(answer: WorkerAnswer): WorkerEvidence[] {
       summary: String(record["summary"] ?? ""),
       salience: (record["salience"] ?? "routine") as WorkerEvidence["salience"],
       why_notable: String(record["why_notable"] ?? ""),
-      payload: (record["payload"] ?? {}) as Record<string, unknown>,
+      payload: payloadOf(record["payload"]),
       ...(Array.isArray(record["supports"]) ? { supports: record["supports"] as string[] } : {}),
       ...(Array.isArray(record["weakens"]) ? { weakens: record["weakens"] as string[] } : {}),
       ...(typeof record["attacker_influenceable"] === "boolean"
