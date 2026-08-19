@@ -1,5 +1,6 @@
 import { drain, streamTurn } from "../../core/stream.js";
-import type { Harness } from "../../core/loop.js";
+import type { Attempt, Harness } from "../../core/loop.js";
+import { clamp } from "../../core/security.js";
 import type { RoleSpec, RunSpec } from "../../core/spec.js";
 import { SpecError } from "../../core/spec.js";
 import { renderDigest } from "./render.js";
@@ -13,6 +14,7 @@ import type {
   DispatchResult,
   NullCheckInput,
   NullCheckResult,
+  ToolCall,
   WorkerEvidence,
 } from "./types.js";
 
@@ -64,6 +66,26 @@ function spentOn(harness: Harness<HuntKinds>, before: number): number {
   return Math.max(0, harness.budget.spent.cost_usd - before);
 }
 
+// A call that throws has still been paid for. The harness journals the spend
+// either way, but the caller reads what a failure cost off the error --
+// spentBefore() in the controller expects error.cost_usd -- and a provider error
+// carries no such field, so the money vanished between the ledger and the budget.
+// One run journaled $0.79 of spend and reported $0.11: nine worker calls failed on
+// a dropped upstream stream, every one of them paid for, none of them counted.
+// A ceiling that cannot see failed work is a ceiling a failing run walks straight
+// through.
+export async function charged<T>(harness: Harness<HuntKinds>, before: number, call: Promise<T>): Promise<T> {
+  try {
+    return await call;
+  } catch (error) {
+    const spent = spentOn(harness, before);
+    if (spent > 0 && typeof error === "object" && error !== null && !("cost_usd" in error)) {
+      Object.defineProperty(error, "cost_usd", { value: spent, enumerable: false });
+    }
+    throw error;
+  }
+}
+
 // One digest in, one decision out. The digest is rendered rather than handed
 // over as an object, because what the lead reasons about is what it can read.
 export function decisionProvider(options: AdapterOptions): DecisionProvider {
@@ -72,8 +94,10 @@ export function decisionProvider(options: AdapterOptions): DecisionProvider {
   return {
     decide: async (digest: Digest, signal?: AbortSignal): Promise<DecisionResult> => {
       const before = options.harness.budget.spent.cost_usd;
-      const outcome = await drain(
-        streamTurn<Decision, HuntKinds>(turnFor(options, "lead", lead, renderDigest(digest), signal), options.harness),
+      const outcome = await charged(
+        options.harness,
+        before,
+        drain(streamTurn<Decision, HuntKinds>(turnFor(options, "lead", lead, renderDigest(digest), signal), options.harness)),
       );
       if (outcome.value === null) {
         if (outcome.refusal !== null) throw new BudgetRefused(outcome.reason);
@@ -146,18 +170,28 @@ export function workerDispatcher(options: AdapterOptions): WorkerDispatcher {
       // hunt mid-query is a narrower stop than the run losing its lease.
       const scoped = { ...options, ...(request.signal === undefined ? {} : { signal: request.signal }) };
       const task = [request.query_intent, request.focus && `Focus: ${request.focus}`].filter((part) => part).join("\n\n");
-      const outcome = await drain(
-        streamTurn<WorkerAnswer, HuntKinds>(turnFor(scoped, request.agent_id, worker, task), options.harness),
+      const outcome = await charged(
+        options.harness,
+        before,
+        drain(streamTurn<WorkerAnswer, HuntKinds>(turnFor(scoped, request.agent_id, worker, task), options.harness)),
       );
 
       const cost_usd = spentOn(options.harness, before);
       if (outcome.value === null) {
-        return { dispatch_id: request.dispatch_id, evidence: [], failed: true, failure_reason: outcome.reason, cost_usd };
+        return {
+          dispatch_id: request.dispatch_id,
+          evidence: [],
+          calls: callsOf(outcome.calls),
+          failed: true,
+          failure_reason: outcome.reason,
+          cost_usd,
+        };
       }
       const questions = Array.isArray(outcome.value.ips_to_check) ? outcome.value.ips_to_check : [];
       return {
         dispatch_id: request.dispatch_id,
         evidence: evidenceFrom(outcome.value),
+        calls: callsOf(outcome.calls),
         ...(questions.length === 0 ? {} : { questions }),
         failed: false,
         failure_reason: "",
@@ -165,6 +199,24 @@ export function workerDispatcher(options: AdapterOptions): WorkerDispatcher {
       };
     },
   };
+}
+
+// Total characters of tool output one dispatch may journal. Shared rather than
+// per-call: one 500-row answer must not crowd the record of the calls after it.
+const CALL_BUDGET = 16_000;
+
+// The execution log the audit trail needs. wrapped.text is what the worker was
+// actually shown -- already scrubbed, delimiter-safe and capped at result_cap by
+// wrap() -- so journaling it cannot drift from what the model read. Arguments are
+// the query itself, so they are what an analyst re-runs and are never dropped.
+export function callsOf(attempts: readonly Attempt[]): ToolCall[] {
+  if (attempts.length === 0) return [];
+  const share = Math.max(1, Math.floor(CALL_BUDGET / attempts.length));
+  return attempts.map(({ tool, args, wrapped }) => ({
+    tool,
+    arguments: clamp(args, share),
+    result: clamp(wrapped.text, share),
+  }));
 }
 
 interface CriticAnswer {
@@ -188,8 +240,10 @@ export function disconfirmationCritic(options: AdapterOptions): DisconfirmationC
       ]
         .filter((part) => part)
         .join("\n\n");
-      const outcome = await drain(
-        streamTurn<CriticAnswer, HuntKinds>(turnFor(options, "critic", critic, task), options.harness),
+      const outcome = await charged(
+        options.harness,
+        before,
+        drain(streamTurn<CriticAnswer, HuntKinds>(turnFor(options, "critic", critic, task), options.harness)),
       );
 
       const cost_usd = spentOn(options.harness, before);
