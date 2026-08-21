@@ -74,9 +74,9 @@ def test_python_binds_every_capability_the_arch_asks_for():
 
 def test_the_resolver_emits_nothing_the_arch_does_not_ask_for():
     unused = set(HUNT_CAPABILITIES) - _needs_in_arch()
-    assert not unused, (
-        f"the resolver binds capabilities no role asks for: {sorted(unused)}"
-    )
+    assert (
+        not unused
+    ), f"the resolver binds capabilities no role asks for: {sorted(unused)}"
 
 
 def test_every_capability_names_at_least_one_candidate():
@@ -142,9 +142,9 @@ def test_backend_candidates_are_in_the_tool_manifest():
 # narrowed to this list at spec build. Declaring nothing leaves the field an open
 # string; declaring the wrong things collapses every domain into one bucket.
 def test_the_definition_declares_a_telemetry_vocabulary():
-    assert _declared_domains(), (
-        "threat-hunt declares no data_domains, so source_system is unconstrained"
-    )
+    assert (
+        _declared_domains()
+    ), "threat-hunt declares no data_domains, so source_system is unconstrained"
 
 
 # Recorded runs show workers answering with their own agent id -- threat_hunter,
@@ -157,9 +157,9 @@ def test_no_declared_domain_is_the_name_of_a_worker():
     arch = yaml.safe_load(ARCH.read_text())
     overlap = set(_declared_domains()) & set(arch["roles"]["workers"])
 
-    assert not overlap, (
-        f"these data_domains name a worker rather than a domain: {sorted(overlap)}"
-    )
+    assert (
+        not overlap
+    ), f"these data_domains name a worker rather than a domain: {sorted(overlap)}"
 
 
 # The definition's phases block is the roster of who the lead may dispatch, and the
@@ -187,12 +187,15 @@ def test_both_sides_agree_what_a_turn_costs_in_calls():
         HUNT_MAX_WORKERS,
     )
 
-    types_ts = (ROOT / "services" / "agent" / "workflows" / "hunt" / "types.ts").read_text()
+    types_ts = (
+        ROOT / "services" / "agent" / "workflows" / "hunt" / "types.ts"
+    ).read_text()
 
     # The formula, so a change to either side's arithmetic is a failure here and
     # not a number that quietly stops matching.
     formula = re.search(
-        r"function callsPerIteration\(maxWorkers: number, maxTurns: number\): number \{\s*"
+        r"function callsPerIteration\(maxWorkers: number, "
+        r"maxTurns: number\): number \{\s*"
         r"return \(maxWorkers \+ 2\) \* \(maxTurns \+ 2\);",
         types_ts,
     )
@@ -200,7 +203,9 @@ def test_both_sides_agree_what_a_turn_costs_in_calls():
 
     # And the inputs, which are the half that actually drifts: the arch's fan-out
     # and the runtime's turn cap live in files neither side reads from the other.
-    stated = re.search(r"CALLS_PER_ITERATION = callsPerIteration\((\d+), (\d+)\)", types_ts)
+    stated = re.search(
+        r"CALLS_PER_ITERATION = callsPerIteration\((\d+), (\d+)\)", types_ts
+    )
     assert stated is not None, "types.ts no longer states CALLS_PER_ITERATION"
     workers, turns = int(stated.group(1)), int(stated.group(2))
 
@@ -229,7 +234,9 @@ def test_the_arch_fans_out_to_the_workers_the_budget_assumes():
 def test_both_sides_ship_the_same_cost_ceiling():
     from core.workflows.playbook_resolver import HUNT_BUDGETS
 
-    types_ts = (ROOT / "services" / "agent" / "workflows" / "hunt" / "types.ts").read_text()
+    types_ts = (
+        ROOT / "services" / "agent" / "workflows" / "hunt" / "types.ts"
+    ).read_text()
     stated = re.search(r"max_cost_usd: ([\d.]+),", types_ts)
     assert stated is not None, "types.ts no longer states max_cost_usd"
     assert float(stated.group(1)) == HUNT_BUDGETS["max_cost_usd"]

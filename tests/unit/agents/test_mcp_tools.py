@@ -20,7 +20,10 @@ SERVERS = [
 
 class TestSplittingTheName:
     def test_finds_the_server_and_the_tool(self):
-        assert split_tool_name("virustotal_lookup_ip", SERVERS) == ("virustotal", "lookup_ip")
+        assert split_tool_name("virustotal_lookup_ip", SERVERS) == (
+            "virustotal",
+            "lookup_ip",
+        )
 
     # The case a naive split on "_" gets wrong: splunk-selfhosted_search starts
     # with neither a clean prefix nor one underscore, and splunk is a real server
@@ -109,9 +112,12 @@ class TestIndicatorLookup:
 
     def test_accepts_a_single_value_as_well_as_a_batch(self, monkeypatch):
         run = self._lookup(monkeypatch, {})
-        assert run({"value": "evil.test", "indicator_type": "domain"})[0][
-            "indicator_value"
-        ] == "evil.test"
+        assert (
+            run({"value": "evil.test", "indicator_type": "domain"})[0][
+                "indicator_value"
+            ]
+            == "evil.test"
+        )
 
     # invalid_args at the bridge rather than an empty answer: a call with nothing
     # to look up is a defect, and the router reads a TypeError as exactly that.
@@ -133,9 +139,11 @@ class TestReachingTheClient:
             return ["splunk-selfhosted_splunk_nl_search"]
 
     @pytest.mark.asyncio
-    async def test_names_the_accessor_the_client_module_actually_exports(self, monkeypatch):
-        from core.agents.mcp_tools import MCPFailure, UNAVAILABLE, execute_mcp_tool
+    async def test_names_the_accessor_the_client_module_actually_exports(
+        self, monkeypatch
+    ):
         import core.integrations.mcp.client as client
+        from core.agents.mcp_tools import UNAVAILABLE, MCPFailure, execute_mcp_tool
 
         monkeypatch.setattr(client, "_process_client", None)
         with pytest.raises(MCPFailure) as raised:

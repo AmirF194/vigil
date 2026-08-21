@@ -11,9 +11,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from core.llm.harness.claude import ClaudeService
-from tests.fixtures.claude_responses import (MOCK_AUTH_ERROR,
-                                             MOCK_CONVERSATION_HISTORY,
-                                             MOCK_RATE_LIMIT_ERROR)
+from tests.fixtures.claude_responses import (
+    MOCK_AUTH_ERROR,
+    MOCK_CONVERSATION_HISTORY,
+    MOCK_RATE_LIMIT_ERROR,
+)
 
 
 class TestClaudeServiceInitialization:

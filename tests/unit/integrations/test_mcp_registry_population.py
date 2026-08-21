@@ -74,7 +74,12 @@ def _populate(tmp_path, monkeypatch, registry, connected, cached=CACHED, eager=T
 def test_registers_the_tools_of_a_connected_server(
     tmp_path, monkeypatch, fresh_registry
 ):
-    assert _populate(tmp_path, monkeypatch, fresh_registry, {"splunk": True, "shodan": True}) == 2
+    assert (
+        _populate(
+            tmp_path, monkeypatch, fresh_registry, {"splunk": True, "shodan": True}
+        )
+        == 2
+    )
     assert set(fresh_registry.get_tool_names()) == {
         "splunk_splunk_search",
         "shodan_shodan_host",
@@ -86,7 +91,12 @@ def test_skips_a_server_cached_but_not_connected_this_boot(
 ):
     # The cache is a warm-start artifact (#129). Registering a server that failed
     # to connect lets a model claim a capability it cannot exercise.
-    assert _populate(tmp_path, monkeypatch, fresh_registry, {"splunk": True, "shodan": False}) == 1
+    assert (
+        _populate(
+            tmp_path, monkeypatch, fresh_registry, {"splunk": True, "shodan": False}
+        )
+        == 1
+    )
     assert fresh_registry.get_tool_names() == ["splunk_splunk_search"]
 
 
@@ -122,7 +132,12 @@ def test_registers_nothing_when_the_cache_is_empty(
 def test_needs_no_llm_client(tmp_path, monkeypatch, fresh_registry):
     """The point of #632: constructing an LLM client is not how tools get discovered."""
     with patch.dict(sys.modules, {"core.llm.harness.claude": None}):
-        assert _populate(tmp_path, monkeypatch, fresh_registry, {"splunk": True, "shodan": True}) == 2
+        assert (
+            _populate(
+                tmp_path, monkeypatch, fresh_registry, {"splunk": True, "shodan": True}
+            )
+            == 2
+        )
     assert "splunk_splunk_search" in fresh_registry.get_tool_names()
 
 
@@ -156,7 +171,9 @@ def test_falls_back_to_the_in_memory_cache_when_no_file_exists(
     monkeypatch.setattr(registry_module, "REPO_ROOT", tmp_path, raising=False)
 
     with patch("core.config.REPO_ROOT", tmp_path):
-        with patch("core.integrations.mcp.client.process_mcp_client", return_value=client):
+        with patch(
+            "core.integrations.mcp.client.process_mcp_client", return_value=client
+        ):
             assert populate_from_cache(fresh_registry) == 1
     assert fresh_registry.get_tool_names() == ["threat_intel_lookup_ip"]
 
@@ -178,7 +195,9 @@ def test_falls_back_to_memory_when_the_cache_file_is_malformed(
     }
 
     with patch("core.config.REPO_ROOT", tmp_path):
-        with patch("core.integrations.mcp.client.process_mcp_client", return_value=client):
+        with patch(
+            "core.integrations.mcp.client.process_mcp_client", return_value=client
+        ):
             assert populate_from_cache(fresh_registry) == 1
     assert fresh_registry.get_tool_names() == ["threat_intel_lookup_ip"]
 
@@ -187,7 +206,9 @@ def test_creates_no_event_loop(tmp_path, monkeypatch, fresh_registry):
     # Reading a cache is synchronous. Spinning a loop here deadlocks a caller
     # that already has one running.
     with patch("asyncio.new_event_loop") as new_loop:
-        _populate(tmp_path, monkeypatch, fresh_registry, {"splunk": True, "shodan": True})
+        _populate(
+            tmp_path, monkeypatch, fresh_registry, {"splunk": True, "shodan": True}
+        )
     new_loop.assert_not_called()
 
 

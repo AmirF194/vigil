@@ -12,8 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from core.workflows.workflows_service import (WorkflowDefinition,
-                                              WorkflowsService)
+from core.workflows.workflows_service import WorkflowDefinition, WorkflowsService
 
 
 def _make_workflow(workflow_id: str = "wf-test"):
@@ -219,7 +218,12 @@ async def test_a_run_that_asked_nothing_puts_up_nothing(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "asked,expected",
-    [({"iterations": 3}, 3), ({"iterations": "5"}, 5), ({}, None), ({"iterations": "ten"}, None)],
+    [
+        ({"iterations": 3}, 3),
+        ({"iterations": "5"}, 5),
+        ({}, None),
+        ({"iterations": "ten"}, None),
+    ],
 )
 async def test_the_turn_count_rides_the_job(monkeypatch, asked, expected):
     monkeypatch.setattr(
@@ -303,7 +307,12 @@ def test_a_claim_is_a_claim_however_its_verb_is_spelled(statement):
 # Still refused, which is the point: widening the verbs must not admit a subject.
 @pytest.mark.parametrize(
     "statement",
-    ["credential access", "credential access and escalation", "idk", "lateral movement via RDP"],
+    [
+        "credential access",
+        "credential access and escalation",
+        "idk",
+        "lateral movement via RDP",
+    ],
 )
 def test_a_subject_is_still_not_a_claim(statement):
     from core.workflows.workflows_service import _not_a_claim
@@ -320,7 +329,13 @@ def test_a_subject_is_still_not_a_claim(statement):
         ({"context": "beaconing"}, True),
         ({"finding_id": "f-1"}, True),
         ({"context": "beaconing", "hypothesis": "  \n "}, True),
-        ({"context": "beaconing", "hypothesis": "a host is beaconing to external C2"}, False),
+        (
+            {
+                "context": "beaconing",
+                "hypothesis": "a host is beaconing to external C2",
+            },
+            False,
+        ),
         ({"hypothesis": "a host is beaconing to external C2"}, False),
     ],
 )
