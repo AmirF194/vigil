@@ -658,15 +658,22 @@ async def health_check():
     """Health check endpoint with storage backend info."""
     try:
         from core.storage.database_data_service import DatabaseDataService
-        from core.config import is_demo_mode
+        from core.config import is_demo_mode, state_dir_status
 
         service = DatabaseDataService()
         backend_info = service.get_backend_info()
+        state_dir = state_dir_status()
 
         return {
             "status": "healthy",
             "version": __version__,
             "demo_mode": is_demo_mode(),
+            # Booleans only — this route is public, and the resolved path names
+            # where credentials live. Full status: GET /api/config/state-directory.
+            "state_directory": {
+                "exists": state_dir["exists"],
+                "writable": state_dir["writable"],
+            },
             "storage": {
                 "backend": backend_info["backend"],
                 "database_available": backend_info.get("database_available", False),

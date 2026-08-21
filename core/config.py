@@ -21,44 +21,60 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 DEFAULT_SANDBOX_FILE_TYPES = "exe,dll,doc,docx,xls,xlsx,pdf,js,vbs,ps1,bat,msi"
 
 
-# Reads prefer ~/.vigil and fall back to the legacy ~/.deeptempo copy; writes
-# always target ~/.vigil, so data drifts over on the next save.
+# The State Directory: the one per-install directory holding what the metadata
+# DB does not. VIGIL_DIR if exported, else ~/.vigil — nothing else. A write that
+# cannot happen raises; callers that want to degrade catch it themselves.
+#
+# Reads fall back to the legacy ~/.deeptempo copy from before the rename; writes
+# always target the State Directory, so data drifts over on the next save.
 def vigil_path(*parts: str, write: bool = False) -> Path:
-    if "VIGIL_DIR" in os.environ:  # noqa: ENV001
-        target = Path(os.environ["VIGIL_DIR"])  # noqa: ENV001
-        legacy = target
-    elif "VIGIL_HOME" in os.environ:  # noqa: ENV001
-        target = Path(os.environ["VIGIL_HOME"]) / _VIGIL_DIRNAME  # noqa: ENV001
-        legacy = Path(os.environ["VIGIL_HOME"]) / _LEGACY_DIRNAME  # noqa: ENV001
+    # os.environ, not Settings: resolves before Settings is safe to build, so
+    # VIGIL_DIR must be exported rather than set in .env.
+    override = os.environ.get("VIGIL_DIR")  # noqa: ENV001 - pre-Settings bootstrap
+    if override:
+        target = legacy = Path(override)
     else:
         home = Path.home()  # per call, so tests can patch home
-        if home == Path("/"):
-            app_dir = Path("/app")
-            if app_dir.is_dir() and os.access(app_dir, os.W_OK):
-                home = app_dir
-            elif os.access("/tmp", os.W_OK):
-                home = Path("/tmp")
-        target = home / _VIGIL_DIRNAME
-        legacy = home / _LEGACY_DIRNAME
+        target, legacy = home / _VIGIL_DIRNAME, home / _LEGACY_DIRNAME
     if parts:
         target, legacy = target.joinpath(*parts), legacy.joinpath(*parts)
     if write:
-        try:
-            (target.parent if parts else target).mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logger.warning("Could not create directory for %s: %s; falling back to /tmp", target, e)
-            try:
-                tmp_target = Path("/tmp") / _VIGIL_DIRNAME
-                if parts:
-                    tmp_target = tmp_target.joinpath(*parts)
-                (tmp_target.parent if parts else tmp_target).mkdir(parents=True, exist_ok=True)
-                return tmp_target
-            except OSError:
-                pass
+        (target.parent if parts else target).mkdir(parents=True, exist_ok=True)
         return target
-    if not target.exists() and legacy.exists():
+    # Only ever a per-file shim. Asked for the directory itself it must answer
+    # with the State Directory, or the secrets backend adopts the legacy copy as
+    # its write target.
+    if parts and not target.exists() and legacy.exists():
         return legacy
     return target
+
+
+def state_dir_status() -> dict:
+    """Where the State Directory resolved to, and whether it can be written.
+
+    Read-only: never creates the directory, so a health probe cannot be the
+    thing that brings the credential store into existence. A directory that does
+    not exist yet is probed at its nearest existing ancestor, which answers the
+    question that matters — whether the first save will land.
+    """
+    path = vigil_path()
+    status: dict = {"path": str(path), "exists": path.is_dir()}
+    target = path
+    while not target.is_dir() and target != target.parent:
+        target = target.parent
+    # Unique per process: a shared name races with concurrent health probes,
+    # where one caller's unlink makes the other's look unwritable.
+    probe = target / f".vigil-write-probe.{os.getpid()}"
+    try:
+        probe.touch()
+        return {**status, "writable": True}
+    except OSError as exc:
+        return {**status, "writable": False, "error": str(exc)}
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -85,8 +101,6 @@ class Settings(BaseSettings):
     max_upload_size_mb: int = 500
     vigil_context_path: str = ""
     vigil_frontend_url: str = ""
-    vigil_dir: Optional[str] = None
-    vigil_home: Optional[str] = None
     mempalace_palace_path: Optional[str] = None
     # Call sites disagree on the default (shared_intel off, orchestrator on), so
     # this stays tri-state and each site supplies its own fallback.

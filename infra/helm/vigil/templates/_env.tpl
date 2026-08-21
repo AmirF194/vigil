@@ -25,9 +25,27 @@ chart-templated).
     name: {{ include "vigil.secret.fullname" . }}
 {{- end -}}
 
+{{/*
+State Directory. VIGIL_DIR is deliberately NOT in vigil.env: it must only be set
+where the volume is actually mounted, or a workload advertises a path it cannot
+write. Include all three together, or none.
+*/}}
+{{- define "vigil.stateEnv" -}}
+- name: VIGIL_DIR
+  value: {{ .Values.stateDirectory.mountPath | quote }}
+{{- end -}}
+
+{{- define "vigil.stateVolumeMount" -}}
+- name: vigil-state
+  mountPath: {{ .Values.stateDirectory.mountPath }}
+{{- end -}}
+
+{{- define "vigil.stateVolume" -}}
+- name: vigil-state
+  {{- toYaml .Values.stateDirectory.volume | nindent 2 }}
+{{- end -}}
+
 {{- define "vigil.env" -}}
-- name: HOME
-  value: "/tmp"
 - name: POSTGRES_HOST
   value: {{ include "vigil.postgres.host" . | quote }}
 - name: POSTGRES_PORT

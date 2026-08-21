@@ -6,7 +6,7 @@ import logging
 import json
 import re
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Mapping, Optional, Dict, List
 from datetime import datetime
 import os
 
@@ -26,7 +26,7 @@ _ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 # Placeholders that are path sentinels, not credentials — never treat as
 # required env vars.
-_PLACEHOLDER_BLACKLIST = {"workspaceFolder", "HOME", "PYTHONPATH"}
+_PLACEHOLDER_BLACKLIST = {"workspaceFolder", "HOME", "PYTHONPATH", "VIGIL_DIR"}
 
 
 def extract_required_env_vars(raw_env: Dict[str, str], raw_args: List[str]) -> List[str]:
@@ -213,8 +213,10 @@ class MCPServer:
 class MCPService:
     """Service for managing MCP servers."""
     
-    # Path to persist enabled/disabled state for each MCP server
-    _STATE_FILE = vigil_path("mcp_server_enabled.json")
+    # A filename, not a path: resolving at class-definition time is what crashed
+    # the daemon in #695, and would pin the read path while the write path
+    # resolves fresh.
+    _STATE_FILENAME = "mcp_server_enabled.json"
     
     def __init__(
         self,
@@ -256,8 +258,9 @@ class MCPService:
     def _load_enabled_state(self) -> Dict[str, bool]:
         """Load the enabled/disabled state from disk. Returns empty dict if no file."""
         try:
-            if self._STATE_FILE.exists():
-                with open(self._STATE_FILE, "r") as f:
+            state_file = vigil_path(self._STATE_FILENAME)
+            if state_file.exists():
+                with open(state_file, "r") as f:
                     data = json.load(f)
                 return data.get("enabled", {})
         except Exception as e:
@@ -267,7 +270,7 @@ class MCPService:
     def _save_enabled_state(self) -> None:
         """Persist the enabled/disabled state to disk."""
         try:
-            write_path = vigil_path("mcp_server_enabled.json", write=True)
+            write_path = vigil_path(self._STATE_FILENAME, write=True)
             with open(write_path, "w") as f:
                 json.dump({"enabled": self._enabled_servers}, f, indent=2)
         except Exception as e:
@@ -300,31 +303,30 @@ class MCPService:
         """Return a dict of server_name -> enabled for every known server."""
         return {name: self.is_server_enabled(name) for name in self.servers}
     
-    def _substitute_env_vars(self, value: str) -> str:
-        """
-        Substitute environment variables in a string.
-        Supports ${VAR_NAME} and ${VAR_NAME:-default} formats.
+    def _substitute_env_vars(
+        self, value: str, env: Optional[Dict[str, str]] = None
+    ) -> str:
+        """Expand ``${VAR}`` and ``${VAR:-default}`` in a config string.
 
-        Args:
-            value: String that may contain environment variable references
-
-        Returns:
-            String with environment variables substituted
+        Resolves against ``env`` — the environment the child is actually spawned
+        with — so anything the spawn site pinned there is seen rather than
+        collapsed to an empty string.
         """
         import re
 
+        source: Mapping[str, str] = os.environ if env is None else env  # noqa: ENV001
         pattern = r'\$\{([^}:]+)(?::-((?:\$\{[^}]+\}|[^{}])*))?\}'
 
         def replace_var(match):
             var_name = match.group(1)
             default = match.group(2)
-            env_val = os.environ.get(var_name)  # noqa: ENV001 - operator export wins
+            env_val = source.get(var_name)  # operator export wins
             if env_val is None:
                 env_val = get_secret(var_name)  # UI-set credential, no restart needed
             if env_val is not None:
                 return env_val
             if default is not None:
-                return self._substitute_env_vars(default)
+                return self._substitute_env_vars(default, env)
             return ''
 
         prev = None
@@ -415,12 +417,15 @@ class MCPService:
                     # detection scans the raw config above, not this spawn env,
                     # so dormancy behavior is unchanged.
                     env = os.environ.copy()  # noqa: ENV001 - MCP child env
+                    # mcp-config.json refers to ${VIGIL_DIR}; an unset var would
+                    # substitute to "" and root child paths at "/".
+                    env.setdefault("VIGIL_DIR", str(vigil_path()))
                     # httpx ignores REQUESTS_CA_BUNDLE, so inheriting it is
                     # not enough.
                     env.update(ca_bundle_env())
                     env.update(
                         {
-                            k: self._substitute_env_vars(v)
+                            k: self._substitute_env_vars(v, env)
                             for k, v in raw_env_strs.items()
                         }
                     )
@@ -428,7 +433,7 @@ class MCPService:
 
                     # Get args and perform environment variable substitution
                     raw_args = list(server_config.get("args") or [])
-                    args = [self._substitute_env_vars(arg) for arg in raw_args]
+                    args = [self._substitute_env_vars(arg, env) for arg in raw_args]
 
                     # Capture declared credential placeholders *before*
                     # substitution collapses missing vars to empty strings
