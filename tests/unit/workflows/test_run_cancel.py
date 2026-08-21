@@ -139,7 +139,9 @@ class TestTheWholeStop:
         assert scheduled == []
 
     @pytest.mark.asyncio
-    async def test_holds_a_reference_so_the_escalation_is_not_collected(self, monkeypatch):
+    async def test_holds_a_reference_so_the_escalation_is_not_collected(
+        self, monkeypatch
+    ):
         monkeypatch.setattr(run_cancel, "force_terminal", lambda *a: None)
         task = run_cancel.escalate_later(RUN, "stop", delay=0.01)
 

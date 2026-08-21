@@ -110,6 +110,35 @@ class TestCapabilityBinding:
         # splunk-selfhosted is declared first, so it wins over elastic.
         assert bound[0]["id"] == "splunk-selfhosted_splunk_nl_search"
 
+    # The agent layer defaults to 30s when a spec states nothing, and a real search
+    # over a wide window crosses it. The timeout then reads as a gap in visibility --
+    # "no evidence" where the truth is "we gave up after thirty seconds".
+    def test_gives_a_telemetry_search_longer_than_the_agent_layer_default(self):
+        from core.workflows.playbook_resolver import _bound_capabilities
+
+        bound = _bound_capabilities(
+            ["telemetry_search"], {"splunk-selfhosted_splunk_execute": {}}
+        )
+
+        assert bound[0]["timeout_ms"] > 30_000
+        assert bound[0]["max_rows"] > 200
+
+    # A lookup reads a row and a search scans a corpus, so they do not share a ceiling.
+    def test_leaves_a_lookup_on_a_ceiling_a_lookup_can_meet(self):
+        from core.workflows.playbook_resolver import CAPABILITY_BOUNDS
+
+        assert (
+            CAPABILITY_BOUNDS["findings_search"]["timeout_ms"]
+            < CAPABILITY_BOUNDS["telemetry_search"]["timeout_ms"]
+        )
+
+    # Every capability the arch asks for, or one of them silently keeps the default it
+    # was the whole point of not keeping.
+    def test_states_bounds_for_every_capability_a_hunt_binds(self):
+        from core.workflows.playbook_resolver import CAPABILITY_BOUNDS
+
+        assert set(CAPABILITY_BOUNDS) == set(HUNT_CAPABILITIES)
+
     # Dropped rather than fatal: the hunt journals the drop as a visibility gap,
     # which is a better answer than refusing to run at all.
     def test_drops_a_capability_nothing_provides(self):
@@ -128,8 +157,7 @@ class TestRefusals:
     # A hunt has no phases, so the compose guard would refuse every one of them
     # before the resolver was ever reached.
     def test_a_hunt_is_refused_for_nothing_to_test_not_for_no_phases(self):
-        from core.workflows.workflows_service import (WorkflowDefinition,
-                                                      _nothing_to_run)
+        from core.workflows.workflows_service import WorkflowDefinition, _nothing_to_run
 
         def _hunt(**extra):
             return WorkflowDefinition(
@@ -142,7 +170,12 @@ class TestRefusals:
         assert _nothing_to_run(_hunt(hypotheses=["something to test"])) == ""
         assert _nothing_to_run(_hunt()) == "hypotheses"
         # The caller's belief counts: the shipped definition states none.
-        assert _nothing_to_run(_hunt(), {"hypothesis": "a host is beaconing to external C2"}) == ""
+        assert (
+            _nothing_to_run(
+                _hunt(), {"hypothesis": "a host is beaconing to external C2"}
+            )
+            == ""
+        )
         assert _nothing_to_run(_hunt(), {"hypothesis": "   \n  "}) == "hypotheses"
         assert _nothing_to_run(_hunt(), {"context": "no belief here"}) == "hypotheses"
 
@@ -150,19 +183,22 @@ class TestRefusals:
     # check and were run: neither can be argued against, and both cost a budget to
     # conclude nothing.
     def test_a_topic_is_not_a_hypothesis(self):
-        from core.workflows.workflows_service import (WorkflowDefinition,
-                                                      _nothing_to_run)
+        from core.workflows.workflows_service import WorkflowDefinition, _nothing_to_run
 
         def _hunt(**extra):
             return WorkflowDefinition(
-                workflow_id="h", metadata={"run_kind": "hunt", **extra}, body="", file_path=""
+                workflow_id="h",
+                metadata={"run_kind": "hunt", **extra},
+                body="",
+                file_path="",
             )
 
         for topic in ("idk", "credential access and escalation", "lateral movement"):
             assert _nothing_to_run(_hunt(), {"hypothesis": topic}) == "claims", topic
 
         for claim in (
-            "A host is beaconing to attacker-controlled infrastructure on a regular interval",
+            "A host is beaconing to attacker-controlled infrastructure "
+            "on a regular interval",
             "Credentials taken from HOST-42 were reused elsewhere",
             "the finance subnet has been scanned from inside",
         ):
@@ -171,15 +207,17 @@ class TestRefusals:
     # One real claim among several carries the run: the check is there to stop a
     # board with nothing on it, not to mark an operator's wording.
     def test_one_real_claim_is_enough(self):
-        from core.workflows.workflows_service import (WorkflowDefinition,
-                                                      _nothing_to_run)
+        from core.workflows.workflows_service import WorkflowDefinition, _nothing_to_run
 
         hunt = WorkflowDefinition(
             workflow_id="h", metadata={"run_kind": "hunt"}, body="", file_path=""
         )
-        asked = {"hypothesis": "lateral movement\nCredentials from HOST-42 were reused elsewhere"}
+        asked = {
+            "hypothesis": (
+                "lateral movement\nCredentials from HOST-42 were reused elsewhere"
+            )
+        }
         assert _nothing_to_run(hunt, asked) == ""
-
 
     # The refusal moved to the run, where a person sees it. A definition declaring
     # none resolves fine -- that is the shipped case -- and execute_workflow is what
@@ -240,9 +278,49 @@ class TestTheTurnBudget:
 # The console asks this before a run is started, so an operator learns the hunt
 # will run without a SIEM while it still costs nothing -- the same fact the run
 # journals as a deployment gap, moved to before the spend rather than after.
+# The same principle as the capability report, applied to the other thing a run needs
+# before it can hold itself to anything: a rate. Unpriced, the pool refuses the fourth
+# call, which is correct and arrives too late to be useful.
+class TestThePricingPreflight:
+    def test_answers_how_confidently_the_model_resolved(self):
+        from core.workflows.workflows_router import _pricing
+
+        reported = _pricing()
+        assert reported["model"]
+        assert reported["source"] in {"exact", "heuristic", "zero", "unknown"}
+
+    def test_calls_a_model_no_rate_table_carries_unknown(self, monkeypatch):
+        import core.llm.defaults as defaults
+        from core.workflows import workflows_router
+
+        monkeypatch.setattr(defaults, "DEFAULT_MODEL", "groq/some-model-nobody-priced")
+        assert workflows_router._pricing()["source"] == "unknown"
+
+    def test_prices_the_families_a_deployment_actually_runs(self):
+        from core.llm.cost.pricing_router import _priced_as
+        from core.llm.providers.registry import get_registry
+
+        registry = get_registry()
+        for model in (
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "openai/gpt-5",
+            "openai/o4-mini",
+            "vertex/gemini-3.5-flash",
+            "gemini-2.5-pro",
+            "bedrock/claude-sonnet-4",
+        ):
+            provider, bare = _priced_as("bifrost", model)
+            assert registry.get_pricing_source(bare, provider) != "unknown", model
+            assert registry.get_cost_rates(bare, provider)[0] > 0, model
+
+
 class TestTheCapabilityReport:
     def test_names_every_capability_the_arch_asks_for(self):
-        from core.workflows.playbook_resolver import HUNT_CAPABILITIES, capability_report
+        from core.workflows.playbook_resolver import (
+            HUNT_CAPABILITIES,
+            capability_report,
+        )
 
         report = capability_report(None)
         assert sorted(report["bound"] + report["unbound"]) == sorted(HUNT_CAPABILITIES)

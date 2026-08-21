@@ -39,8 +39,7 @@ RUN_STATUS = {WAITING: "paused", "running": "running", "completed": "running"}
 # A run nobody stopped and nothing broke. Aborted and abandoned both read as
 # crashes under "failed", and only one of the three is worth paging over.
 # budget_exhausted is the same mistake one step along: a hunt that stopped at the
-# ceiling its operator set did what it was told, and the outcome the projection
-# carries says which of the two kinds of "completed" it was.
+# ceiling its operator set did what it was told.
 TERMINAL_STATUS = {
     "completed": "completed",
     "budget_exhausted": "completed",
@@ -150,19 +149,15 @@ def record_terminal(
         run_id,
         status=status,
         result_summary=update.summary or None,
-        # Only a failure writes the error column. A hunt that stopped at the ceiling
-        # its operator set, or that an operator halted, has a reason rather than an
-        # error -- and the console renders this field under a red "Error" heading,
-        # so "an operator accepted the stop at the budget checkpoint" was being
-        # shown as a fault on a run that did exactly what it was told. The reason is
-        # still on the terminal event and in the report, which is where it belongs.
+        # Only a failure writes the error column, which the console renders under a
+        # red heading. A run stopped at its ceiling has a reason, not an error, and
+        # that reason is on the terminal event and in the report.
         error=update.reason if status == "failed" else None,
         cost_usd=update.cost_usd,
     )
 
-    # The case the run was started from, if it was started from one. Selecting it
-    # was read-only before: it pasted case detail into the prompt and nothing came
-    # back, so a hunt's report lived only in the run row.
+    # The case the run was started from, so its report reaches the case rather than
+    # living only in the run row.
     origin = _origin_case(run_id, run_service)
     if origin:
         _record_report(origin, run_id, update)
@@ -177,9 +172,11 @@ def _origin_case(run_id: str, run_service: WorkflowRunService) -> str:
     return str(case_id) if case_id else ""
 
 
-# Appended rather than written over: a case accumulates what was done to it, and
-# the description is the analyst's own. activities is the list the case UI reads.
-def _add_activity(case_id: str, activity_type: str, description: str, details: Dict[str, Any]) -> None:
+# Appended rather than written over: a case accumulates what was done to it, and the
+# description is the analyst's own. activities is the list the case UI reads.
+def _add_activity(
+    case_id: str, activity_type: str, description: str, details: Dict[str, Any]
+) -> None:
     from core.storage.database_data_service import DatabaseDataService
 
     data = DatabaseDataService()
@@ -209,7 +206,9 @@ def _record_report(case_id: str, run_id: str, update: TerminalUpdate) -> None:
             {"run_id": run_id, "outcome": update.outcome, "cost_usd": update.cost_usd},
         )
     except Exception:  # noqa: BLE001 — the run ended either way
-        logger.exception("could not record the report of %s on case %s", run_id, case_id)
+        logger.exception(
+            "could not record the report of %s on case %s", run_id, case_id
+        )
 
 
 # A run that ended by handing work over opens the case that receives it. The agent
@@ -228,8 +227,7 @@ def _open_case(run_id: str, handoff: TerminalHandoff, origin: str = "") -> None:
         logger.exception("could not open %s handed off by %s", handoff.case_id, run_id)
         return
 
-    # Both directions, so neither case is a dead end: the escalation keeps its own
-    # triage-able record and the case it came out of says what it produced.
+    # Both directions, so neither case is a dead end.
     if origin and opened:
         _record_handoff(origin, run_id, handoff, opened.get("case_id", ""))
 
@@ -238,12 +236,15 @@ def _with_origin(markdown: str, origin: str) -> str:
     return f"{markdown}\n\n_Escalated from case {origin}._\n" if origin else markdown
 
 
-def _record_handoff(case_id: str, run_id: str, handoff: TerminalHandoff, opened: str) -> None:
+def _record_handoff(
+    case_id: str, run_id: str, handoff: TerminalHandoff, opened: str
+) -> None:
     try:
         _add_activity(
             case_id,
             "agent_run_handoff",
-            f"Escalated to incident response as {opened or handoff.case_id}: {handoff.title}",
+            f"Escalated to incident response as "
+            f"{opened or handoff.case_id}: {handoff.title}",
             {"run_id": run_id, "case_id": opened, "handoff_id": handoff.case_id},
         )
     except Exception:  # noqa: BLE001 — the case it opened is the deliverable

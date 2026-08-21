@@ -1,14 +1,10 @@
-# What stopping a run actually takes. Cancel used to write workflow_runs.status
-# and nothing else -- no directive, no lease, no job -- so the worker kept
-# spending and later overwrote the row with its own terminal. An operator's only
-# working stop was killing the process.
-#
-# Two steps, because one is not enough on its own. The directive is cooperative
-# and lets the hunt settle itself, which is the only way to get a report out of
-# it. The terminal is the backstop for a run whose worker is dead, wedged in a
-# model call, or failing deterministically -- worker.ts short-circuits on a
-# terminal, so writing one stops the next attempt and stops the sweeper
-# re-enqueuing it forever.
+"""Stopping a run, in two steps.
+
+The directive is cooperative and lets the hunt settle itself, which is the only
+way to get a report out of it. The terminal is the backstop for a worker that is
+dead, wedged or failing deterministically: worker.ts short-circuits on one, which
+also stops the sweeper re-enqueuing the run forever.
+"""
 
 from __future__ import annotations
 
@@ -20,22 +16,17 @@ from typing import Any, Dict, Optional, Set
 
 from sqlalchemy import text
 
-from core.agents.directives import (
-    RunAlreadyEnded,
-    UnknownRun,
-    enqueue_directive,
-)
+from core.agents.directives import RunAlreadyEnded, UnknownRun, enqueue_directive
 from core.storage.connection import get_db_session
 
 logger = logging.getLogger(__name__)
 
-# How long the run gets to stop itself before one is written for it. Long enough
-# for an iteration boundary and the 500ms abort poll around dispatch; short
-# enough that an operator who pressed stop does not sit watching spend.
+# How long the run gets to stop itself before one is written for it: an iteration
+# boundary and the 500ms abort poll, without leaving an operator watching spend.
 ESCALATE_AFTER_S = 30.0
 
-# asyncio holds only a weak reference to a bare task, so a escalation left to the
-# garbage collector may never run at all.
+# asyncio holds only a weak reference to a bare task, so an escalation left to the
+# garbage collector may never run.
 _pending: Set["asyncio.Task[None]"] = set()
 
 EVENT_SCHEMA_VERSION = 1
@@ -49,8 +40,8 @@ def _is_run_id(run_id: str) -> bool:
     return True
 
 
-# Cooperative. A run with no ledger or an already-journaled terminal is not a
-# failure here: the row still wants finalising, and that is the caller's job.
+# Cooperative. A run with no ledger or an already-journaled terminal is not a failure
+# here: the row still wants finalising, which is the caller's job.
 def request_stop(run_id: str, reason: str, actor: str) -> bool:
     if not _is_run_id(run_id):
         return False
@@ -66,8 +57,8 @@ def request_stop(run_id: str, reason: str, actor: str) -> bool:
     return False
 
 
-# The backstop. Idempotent by the terminal's own index: a run that settled itself
-# in the meantime keeps its outcome and its report, and this writes nothing.
+# The backstop. Idempotent by the terminal's own index, so a run that settled itself
+# keeps its outcome and its report.
 def force_terminal(run_id: str, reason: str) -> bool:
     if not _is_run_id(run_id):
         return False
@@ -107,11 +98,13 @@ def force_terminal(run_id: str, reason: str) -> bool:
 
 async def _escalate(run_id: str, reason: str, delay: float) -> None:
     await asyncio.sleep(delay)
-    await asyncio.to_thread(force_terminal, run_id, f"{reason} (did not stop on request)")
+    await asyncio.to_thread(
+        force_terminal, run_id, f"{reason} (did not stop on request)"
+    )
 
 
-# Scheduled rather than awaited: the operator gets their answer now, and the run
-# gets its chance to end honestly first.
+# Scheduled rather than awaited: the operator gets an answer now, and the run gets
+# its chance to end honestly first.
 def escalate_later(
     run_id: str, reason: str, delay: float = ESCALATE_AFTER_S
 ) -> Optional["asyncio.Task[None]"]:

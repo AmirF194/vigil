@@ -50,9 +50,8 @@ def _mcp_catalogue(registry: Optional["MCPRegistry"]) -> List[Dict[str, Any]]:
         return []
     try:
         tools = registry.get_all_tools()
-        # An empty registry is indistinguishable from a deployment carrying no
-        # integrations, and the two resolve differently: fill it from the tools
-        # cache before concluding a capability has nothing to bind to.
+        # An empty registry and a deployment with no integrations resolve differently,
+        # so fill from the cache before concluding a capability binds to nothing.
         if not tools:
             from core.integrations.mcp.registry import populate_from_cache
 
@@ -72,9 +71,8 @@ class Candidate:
     server: Optional[str]
     tools: Tuple[str, ...]
 
-    # registry.get_all_tools() flattens to {server}_{tool}, and a server whose own
-    # tool names already carry its name doubles the prefix -- elastic_search_logs
-    # on server elastic is elastic_elastic_search_logs. Built rather than guessed.
+    # get_all_tools() flattens to {server}_{tool}, doubling the prefix when a server's
+    # own names already carry it. Built rather than guessed.
     def names(self) -> Tuple[str, ...]:
         if self.server is None:
             return self.tools
@@ -82,17 +80,16 @@ class Candidate:
 
 
 # What an arch means when it asks for a capability, in the order a deployment
-# should prefer. First one present wins; none present drops the capability, and
-# the hunt journals that drop as a visibility gap rather than running blind.
+# should prefer. First present wins; none present drops the capability, which the hunt
+# journals as a visibility gap rather than running blind.
 CAPABILITIES: Dict[str, Tuple[Candidate, ...]] = {
     "telemetry_search": (
         # In-repo servers, verified against their own list_tools() by a ratchet.
-        # splunk_execute first: it takes earliest, and nl_search cannot express a
-        # time range at all, so a hunt looking further back than a day gets none.
+        # splunk_execute first: it takes earliest, which nl_search cannot express.
         Candidate("splunk-selfhosted", ("splunk_execute", "splunk_nl_search")),
         Candidate("elastic", ("elastic_search_logs", "elastic_search_by_ioc")),
-        # Third-party servers: their names cannot be verified from this repo, so
-        # these are preferences matched against whatever the server reports.
+        # Third-party servers: unverifiable from this repo, so these are preferences
+        # matched against whatever the server reports.
         Candidate("splunk", ("run_splunk_search", "search", "oneshot_search")),
         Candidate("azure-sentinel", ("query", "run_query", "search")),
         Candidate("gcp-secops", ("search_security_events", "search")),
@@ -106,6 +103,18 @@ CAPABILITIES: Dict[str, Tuple[Candidate, ...]] = {
     ),
     "findings_search": (Candidate(None, ("search_findings",)),),
     "similar_findings": (Candidate(None, ("nearest_neighbors",)),),
+}
+
+
+# What one call of a capability may take and return, decided by the capability rather
+# than the server: a telemetry search scans a corpus, an indicator lookup reads a row.
+# The agent layer's 30s default is not a SIEM timeout, and a search that crosses it
+# reaches the hunt as a gap in visibility rather than as a search that was cut off.
+CAPABILITY_BOUNDS: Dict[str, Dict[str, int]] = {
+    "telemetry_search": {"timeout_ms": 120_000, "max_rows": 500},
+    "indicator_lookup": {"timeout_ms": 60_000, "max_rows": 200},
+    "findings_search": {"timeout_ms": 30_000, "max_rows": 200},
+    "similar_findings": {"timeout_ms": 30_000, "max_rows": 200},
 }
 
 
@@ -127,6 +136,7 @@ def _bound_capabilities(
                     "provides": capability,
                     "description": entry.get("description", ""),
                     "parameters": entry.get("input_schema") or {},
+                    **CAPABILITY_BOUNDS.get(capability, {}),
                 }
             )
             break
@@ -138,8 +148,8 @@ def _bound_capabilities(
     return bound
 
 
-# Flattened once, so a caller matching against the catalogue and the ratchet
-# checking the same names read from one definition.
+# Flattened once, so the caller matching the catalogue and the ratchet checking it
+# read from one definition.
 def _candidate_names(capability: str) -> Tuple[str, ...]:
     return tuple(
         name
@@ -260,7 +270,9 @@ def resolve(
     # Refused rather than run: a playbook with no steps completes instantly having
     # done nothing, which reads exactly like a run that worked.
     if not phases:
-        raise UnknownPlaybook(f"{workflow_id} declares no phases; there is nothing to run")
+        raise UnknownPlaybook(
+            f"{workflow_id} declares no phases; there is nothing to run"
+        )
 
     tools = _tools_of(phases, registry)
     _drop_missing(phases, [tool["id"] for tool in tools])
@@ -293,38 +305,38 @@ def resolve(
 
 # What the threathunt arch asks for, by capability. Duplicated across the language
 # boundary for the same reason RUN_KINDS is, and held to it by a ratchet.
-HUNT_CAPABILITIES = ("findings_search", "similar_findings", "telemetry_search", "indicator_lookup")
+HUNT_CAPABILITIES = (
+    "findings_search",
+    "similar_findings",
+    "telemetry_search",
+    "indicator_lookup",
+)
 
 # A hunt is bounded by iterations rather than phases, and each one costs a lead
-# turn, its workers and the critic. The two are separate ceilings: max_calls is a
-# backstop against a runaway turn, and the agent layer raises it to match whatever
-# turn count a run asks for. Held apart because one number read as both ended a
-# hunt three turns into a budget that said twenty-four.
+# turn, its workers and the critic. Separate ceilings: max_calls only backstops a
+# runaway turn, and the agent layer raises it to match the turn count a run asks for.
 HUNT_ITERATIONS = 8
 
-# A turn is not one call: it dispatches up to this many workers, each running its
-# own tool loop of DEFAULT_RUNTIME["max_turns"] calls, and the lead and the pass
-# that argues against them each run one too. The two spare turns per agent are the
-# emission retries a schema-invalid answer costs. Mirrored from
-# services/agent/workflows/hunt/types.ts, and held to it by a ratchet -- a flat
-# guess here sat four times under what a fan-out turn really spends.
+# A turn dispatches up to this many workers, each running its own tool loop, plus the
+# lead and the critic; the two spare turns per agent are the emission retries.
+# Mirrored from services/agent/workflows/hunt/types.ts and held to it by a ratchet.
 HUNT_MAX_WORKERS = 4
 CALLS_PER_ITERATION = (HUNT_MAX_WORKERS + 2) * (int(DEFAULT_RUNTIME["max_turns"]) + 2)
+# 90 minutes of wall: at several minutes an iteration, a half-hour ceiling ends the
+# hunt on the clock with most of its cost budget unspent.
 HUNT_BUDGETS = {
     "max_calls": HUNT_ITERATIONS * CALLS_PER_ITERATION,
     "max_cost_usd": 15.0,
-    "max_wall_ms": 1_800_000,
+    "max_wall_ms": 5_400_000,
 }
 
-# Under thresholds rather than budgets: the agent layer's budget block is a fixed
-# key set it refuses additions to, and a turn is the hunt's unit, not the harness's.
+# Under thresholds rather than budgets: the agent layer's budget block refuses added
+# keys, and a turn is the hunt's unit rather than the harness's.
 HUNT_THRESHOLDS = {"max_iterations": HUNT_ITERATIONS}
 
 
-# What this deployment can and cannot answer, without resolving a whole playbook.
-# The console asks before a run is started, so an operator is told the hunt will
-# run without a SIEM while it still costs nothing -- the same fact the hunt
-# journals as a deployment gap, moved to before the spend rather than after.
+# What this deployment can and cannot answer, without resolving a whole playbook. The
+# console asks before a run starts, so the deployment gap is told before the spend.
 def capability_report(
     registry: Optional["MCPRegistry"] = None,
 ) -> Dict[str, List[str]]:
@@ -338,6 +350,7 @@ def capability_report(
         "bound": [name for name in HUNT_CAPABILITIES if name in bound],
         "unbound": [name for name in HUNT_CAPABILITIES if name not in bound],
     }
+
 
 # The null hypothesis on the board from the start. Without it the benign
 # explanation is only ever an objection, never a competing claim -- which is the
@@ -366,9 +379,8 @@ def resolve_hunt(
     if definition is None:
         raise UnknownPlaybook(f"no such workflow: {workflow_id}")
 
-    # Empty is the shipped case, not an error: threat-hunt declares no hypotheses
-    # because what a hunt tests belongs to the caller. A run with none from either
-    # source is refused in execute_workflow, which is where a person sees why.
+    # Empty is the shipped case, not an error: what a hunt tests belongs to the caller.
+    # A run with none from either source is refused in execute_workflow.
     hypotheses = _strings(definition.metadata.get("hypotheses"))
 
     playbook = {
@@ -389,7 +401,8 @@ def resolve_hunt(
         "model": model or DEFAULT_MODEL,
         "budgets": dict(HUNT_BUDGETS),
         "runtime": DEFAULT_RUNTIME,
-        "tools": _bound_capabilities(list(HUNT_CAPABILITIES), _tool_catalogue(registry)) + [_expand_tool()],
+        "tools": _bound_capabilities(list(HUNT_CAPABILITIES), _tool_catalogue(registry))
+        + [_expand_tool()],
         # The hunt gates on its own checkpoint classes, which are a property of
         # what it is about to conclude rather than of a tool it happens to call.
         "approvals": [],
@@ -410,7 +423,9 @@ def _expand_tool() -> Dict[str, Any]:
         "parameters": {
             "type": "object",
             "required": ["evidence_ids"],
-            "properties": {"evidence_ids": {"type": "array", "items": {"type": "string"}}},
+            "properties": {
+                "evidence_ids": {"type": "array", "items": {"type": "string"}}
+            },
         },
     }
 

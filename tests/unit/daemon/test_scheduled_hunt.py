@@ -27,7 +27,9 @@ class _Angry:
         raise RuntimeError("the database is down")
 
 
-def _scheduler(findings=None, queue=True, data=None) -> Tuple[TaskScheduler, Optional[asyncio.Queue]]:
+def _scheduler(
+    findings=None, queue=True, data=None
+) -> Tuple[TaskScheduler, Optional[asyncio.Queue]]:
     scheduler = TaskScheduler(SchedulerConfig())
     scheduler._data_service = data if data is not None else _Data(findings)
     if not queue:
@@ -80,7 +82,9 @@ class TestTheScheduledHuntOpensARun:
 
 class TestWhatTheHuntIsSteeredToward:
     async def test_asks_about_the_techniques_the_estate_is_showing(self):
-        scheduler, intake = _scheduler([_finding("T1071.001"), _finding("T1071.001"), _finding("T1078")])
+        scheduler, intake = _scheduler(
+            [_finding("T1071.001"), _finding("T1071.001"), _finding("T1078")]
+        )
 
         await scheduler._run_threat_hunt()
 

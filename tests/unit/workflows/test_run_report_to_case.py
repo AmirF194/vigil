@@ -61,8 +61,13 @@ def _terminate(update: TerminalUpdate, trigger_context: Dict[str, Any], cases: _
     ), patch(
         "core.workflows.run_bridge_router.authorise"
     ):
-        record_terminal(run_id="run-1", update=update, authorization="Bearer x",
-                        run_service=runs, approvals=None)
+        record_terminal(
+            run_id="run-1",
+            update=update,
+            authorization="Bearer x",
+            run_service=runs,
+            approvals=None,
+        )
     return runs
 
 
@@ -74,7 +79,9 @@ class TestTheReportReachesTheCase:
     def test_appends_the_report_to_the_case_the_run_was_started_from(self):
         cases = _Cases({"case-1": {"case_id": "case-1", "activities": []}})
         _terminate(
-            TerminalUpdate(outcome="completed", reason="done", summary=REPORT, cost_usd=4.18),
+            TerminalUpdate(
+                outcome="completed", reason="done", summary=REPORT, cost_usd=4.18
+            ),
             {"case_id": "case-1"},
             cases,
         )
@@ -88,8 +95,14 @@ class TestTheReportReachesTheCase:
     # Appended, never written over: the description is the analyst's own and a
     # case accumulates what was done to it.
     def test_keeps_what_the_case_already_recorded(self):
-        cases = _Cases({"case-1": {"case_id": "case-1", "activities": [{"activity_type": "note"}]}})
-        _terminate(TerminalUpdate(outcome="completed", summary=REPORT), {"case_id": "case-1"}, cases)
+        cases = _Cases(
+            {"case-1": {"case_id": "case-1", "activities": [{"activity_type": "note"}]}}
+        )
+        _terminate(
+            TerminalUpdate(outcome="completed", summary=REPORT),
+            {"case_id": "case-1"},
+            cases,
+        )
 
         assert [a["activity_type"] for a in _activities(cases, "case-1")] == [
             "note",
@@ -98,7 +111,11 @@ class TestTheReportReachesTheCase:
 
     def test_a_run_started_from_no_case_touches_none(self):
         cases = _Cases({"case-1": {"case_id": "case-1", "activities": []}})
-        _terminate(TerminalUpdate(outcome="completed", summary=REPORT), {"finding_id": "f-1"}, cases)
+        _terminate(
+            TerminalUpdate(outcome="completed", summary=REPORT),
+            {"finding_id": "f-1"},
+            cases,
+        )
 
         assert _activities(cases, "case-1") == []
 
@@ -107,7 +124,9 @@ class TestTheReportReachesTheCase:
     def test_a_case_that_is_gone_does_not_fail_the_terminal(self):
         cases = _Cases({})
         runs = _terminate(
-            TerminalUpdate(outcome="completed", summary=REPORT), {"case_id": "case-gone"}, cases
+            TerminalUpdate(outcome="completed", summary=REPORT),
+            {"case_id": "case-gone"},
+            cases,
         )
 
         assert runs.finalized["status"] == "completed"
@@ -115,7 +134,9 @@ class TestTheReportReachesTheCase:
     def test_still_finalises_the_run_row(self):
         cases = _Cases({"case-1": {"case_id": "case-1", "activities": []}})
         runs = _terminate(
-            TerminalUpdate(outcome="completed", summary=REPORT), {"case_id": "case-1"}, cases
+            TerminalUpdate(outcome="completed", summary=REPORT),
+            {"case_id": "case-1"},
+            cases,
         )
 
         assert runs.finalized["result_summary"] == REPORT
@@ -123,12 +144,16 @@ class TestTheReportReachesTheCase:
 
 
 class TestEscalationsLinkBothWays:
-    HANDOFF = TerminalHandoff(case_id="case-25aac39c", title="beaconing host", markdown="# IR case")
+    HANDOFF = TerminalHandoff(
+        case_id="case-25aac39c", title="beaconing host", markdown="# IR case"
+    )
 
     def test_opens_its_own_case_so_the_escalation_stays_triageable(self):
         cases = _Cases({"case-1": {"case_id": "case-1", "activities": []}})
         _terminate(
-            TerminalUpdate(outcome="completed", summary=REPORT, handoffs=[self.HANDOFF]),
+            TerminalUpdate(
+                outcome="completed", summary=REPORT, handoffs=[self.HANDOFF]
+            ),
             {"case_id": "case-1"},
             cases,
         )
@@ -138,7 +163,9 @@ class TestEscalationsLinkBothWays:
     def test_names_the_case_it_came_out_of(self):
         cases = _Cases({"case-1": {"case_id": "case-1", "activities": []}})
         _terminate(
-            TerminalUpdate(outcome="completed", summary=REPORT, handoffs=[self.HANDOFF]),
+            TerminalUpdate(
+                outcome="completed", summary=REPORT, handoffs=[self.HANDOFF]
+            ),
             {"case_id": "case-1"},
             cases,
         )
@@ -148,12 +175,18 @@ class TestEscalationsLinkBothWays:
     def test_and_the_case_it_came_out_of_names_it(self):
         cases = _Cases({"case-1": {"case_id": "case-1", "activities": []}})
         _terminate(
-            TerminalUpdate(outcome="completed", summary=REPORT, handoffs=[self.HANDOFF]),
+            TerminalUpdate(
+                outcome="completed", summary=REPORT, handoffs=[self.HANDOFF]
+            ),
             {"case_id": "case-1"},
             cases,
         )
 
-        handoffs = [a for a in _activities(cases, "case-1") if a["activity_type"] == "agent_run_handoff"]
+        handoffs = [
+            a
+            for a in _activities(cases, "case-1")
+            if a["activity_type"] == "agent_run_handoff"
+        ]
         assert len(handoffs) == 1
         assert handoffs[0]["details"]["case_id"] == cases.created[0]["case_id"]
 
@@ -161,7 +194,9 @@ class TestEscalationsLinkBothWays:
     def test_an_escalation_with_no_origin_opens_a_case_and_links_nothing(self):
         cases = _Cases({})
         _terminate(
-            TerminalUpdate(outcome="completed", summary=REPORT, handoffs=[self.HANDOFF]),
+            TerminalUpdate(
+                outcome="completed", summary=REPORT, handoffs=[self.HANDOFF]
+            ),
             {},
             cases,
         )

@@ -1,10 +1,11 @@
 """Workflows API endpoints for SOC workflow management and execution."""
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+
 from core.agents.projections import read_projection
 from core.deps import (
     provide_approvals,
@@ -30,9 +31,8 @@ ROUTER_META = RouterMeta(
 )
 logger = logging.getLogger(__name__)
 
-# What gives a run something to work on. A turn count or a cost ceiling says how
-# far to go and never where, so neither is a target: on its own either one would
-# enqueue a run with nothing to run on.
+# What gives a run something to work on. A turn count or a cost ceiling says how far
+# to go and never where, so neither is a target.
 TARGET_PARAMS = frozenset({"finding_id", "case_id", "context", "hypothesis"})
 
 
@@ -48,13 +48,14 @@ class WorkflowExecuteRequest(BaseModel):
     case_id: Optional[str] = None
     context: Optional[str] = None
     hypothesis: Optional[str] = None
-    # Turns, not model calls. Bounded here so a typo cannot enqueue a run that
-    # spends for an hour before anything reads the number.
+    # Turns, not model calls. Bounded so a typo cannot enqueue an hour of spend.
     iterations: Optional[int] = Field(default=None, ge=1, le=40)
-    # What the caller is willing to spend on this one question, which is not a
-    # property of the definition. Bounded for the same reason as the turn count:
-    # a mistyped ceiling is money, and 100 is far above any observed hunt.
+    # What the caller will spend on this question, which is not a property of the
+    # definition. Bounded because a mistyped ceiling is money.
     max_cost_usd: Optional[float] = Field(default=None, gt=0, le=100)
+    # Whether the hunt stops and asks before it spends. The policy defaults to auto,
+    # so a headless run advances with nobody at a terminal.
+    approve_hypotheses: Optional[bool] = None
 
 
 class WorkflowPhaseSchema(BaseModel):
@@ -291,8 +292,7 @@ async def generate_workflow(
 # -----------------------------------------------------------------------------
 
 
-# Read from the resolver, not restated: a second copy of the shipped turn count
-# would drift from the one every run is actually built with.
+# Read from the resolver, not restated, so it cannot drift from what runs are built on.
 def _hunt_defaults() -> Tuple[int, float]:
     from core.workflows.playbook_resolver import HUNT_BUDGETS, HUNT_THRESHOLDS
 
@@ -300,7 +300,7 @@ def _hunt_defaults() -> Tuple[int, float]:
 
 
 # Best effort: a registry that cannot be read reports nothing missing rather than
-# blocking the modal, because a wrong warning is worse than a late one.
+# blocking the modal.
 def _capabilities(registry: Any) -> Dict[str, Any]:
     from core.workflows.playbook_resolver import capability_report
 
@@ -309,6 +309,22 @@ def _capabilities(registry: Any) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("could not read bound capabilities: %s", exc)
         return {"bound": [], "unbound": []}
+
+
+# What the run will be charged at, and how confidently. An unpriced model is refused a
+# few calls in, correctly but after the spend, so it is said here instead.
+def _pricing() -> Dict[str, Any]:
+    from core.llm.cost.pricing_router import _priced_as
+    from core.llm.defaults import DEFAULT_MODEL
+    from core.llm.providers.registry import get_registry
+
+    try:
+        provider, model = _priced_as("bifrost", DEFAULT_MODEL)
+        source = get_registry().get_pricing_source(model, provider)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not read the rate for the default model: %s", exc)
+        return {"model": DEFAULT_MODEL, "source": "unknown"}
+    return {"model": DEFAULT_MODEL, "source": source}
 
 
 @router.get("/workflows/{workflow_id}")
@@ -328,10 +344,10 @@ async def get_workflow(
                 detail=f"Workflow not found: {workflow_id}",
             )
         # Only a hunt has turns to budget or capabilities to be missing. Answered
-        # here so the console can say what the run will cost and what it will not
-        # be able to see, before the operator spends anything on finding out.
+        # here so the console says both before the operator spends anything.
         if _is_hunt(service, workflow_id):
             workflow["capabilities"] = _capabilities(registry)
+            workflow["pricing"] = _pricing()
             workflow["budgets"] = {
                 "max_iterations": _hunt_defaults()[0],
                 "max_cost_usd": _hunt_defaults()[1],
@@ -509,10 +525,8 @@ async def cancel_workflow_run(
     if run.get("status") == "paused" and pending:
         return await resume_run(run_id, pending[0].action_id, rejected_by)
 
-    # Ask the run to stop, then make sure it does. Marking the row alone left the
-    # worker spending and overwriting the row with its own terminal later; the
-    # abort lets a hunt settle itself and write a report, and the escalation
-    # behind it covers a worker that is dead, wedged, or failing every attempt.
+    # Ask the run to stop, then make sure it does: the abort lets a hunt settle itself
+    # and write a report, and the escalation behind it covers a worker that cannot.
     stopped = stop_run(run_id, request.reason, rejected_by)
 
     run_service.finalize_run(
@@ -527,6 +541,53 @@ async def cancel_workflow_run(
         "rejection_reason": request.reason,
         **stopped,
     }
+
+
+@router.post("/workflows/runs/{run_id}/narrate")
+async def narrate_workflow_run(
+    run_id: str,
+    run_service: WorkflowRunService = Depends(provide_workflow_runs),
+):
+    """Write a fresh account of ``run_id`` from its ledger.
+
+    Answerable whichever state the run is in, a finished one included:
+    the write-up reads the record and appends to it, so it needs neither
+    the run's lease nor its loop.
+    """
+    from core.agents.projections import write_narrative
+
+    if not run_service.get_run(run_id):
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    try:
+        return {"success": True, "narrative": await write_narrative(run_id)}
+    except Exception as exc:  # noqa: BLE001 — the operator is owed the reason
+        logger.error("could not write up run %s: %s", run_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+
+
+@router.delete("/workflows/runs/{run_id}")
+async def delete_workflow_run(
+    run_id: str,
+    run_service: WorkflowRunService = Depends(provide_workflow_runs),
+):
+    """Remove a finished run from the listings.
+
+    A mark, not a drop: the row and the agent ledger behind it stay
+    readable by run_id, because that ledger is the only account of what
+    the agents did. A run still in flight is refused — cancel it first,
+    so nothing is hidden while a worker is still writing to it.
+    """
+    run = run_service.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    if run.get("status") in ("running", "paused"):
+        raise HTTPException(
+            status_code=409,
+            detail="This run has not finished. Cancel it before removing it.",
+        )
+    if not run_service.delete_run(run_id):
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    return {"success": True, "run_id": run_id}
 
 
 @router.get("/workflows/{workflow_id}/runs")
