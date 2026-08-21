@@ -1107,7 +1107,7 @@ describe('the moves table', () => {
     expect(why.textContent).toContain('ip:192.168.70.186')
     expect(why.textContent).toContain('threat_hunter')
     // On carries the belief reference and nothing that has to wrap.
-    expect(cells.at(-1)!.textContent).toBe('H1')
+    expect(cells[cells.length - 1].textContent).toBe('H1')
   })
 })
 
