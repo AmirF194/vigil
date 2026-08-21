@@ -1,0 +1,8 @@
+{
+  "alert_id": "alert-dup",
+  "entity": "10.0.0.100",
+  "rule_name": "beaconing re-fired on same host",
+  "severity": "high",
+  "timestamp": "2026-08-21T09:04:00.000Z",
+  "raw": { "dest": "45.77.53.176", "bytes": 39980 }
+}

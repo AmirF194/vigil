@@ -1,0 +1,7 @@
+{
+  "alert_id": "alert-sparse",
+  "entity": "host:web-07",
+  "severity": "medium",
+  "timestamp": "2026-08-21T09:08:00.000Z",
+  "raw": { "note": "no rule name — a ragged alert the coordinator must still handle" }
+}

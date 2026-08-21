@@ -1,0 +1,8 @@
+{
+  "alert_id": "alert-novel",
+  "entity": "10.0.0.100",
+  "rule_name": "outbound beaconing to rare destination",
+  "severity": "high",
+  "timestamp": "2026-08-21T09:00:00.000Z",
+  "raw": { "dest": "45.77.53.176", "bytes": 40213 }
+}
