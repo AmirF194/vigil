@@ -53,7 +53,11 @@ def _bifrost_base_url() -> str:
 # Providers whose Bifrost key is not an API secret we own. Ollama's key holds
 # a URL under ``ollama_key_config`` with an empty ``value``, and its allow-list
 # is the static wildcard, so there is nothing for us to push.
-_UNMANAGED_PROVIDER_TYPES = frozenset({"ollama"})
+#
+# Vertex for the same reason: its credential is a service-account file, and
+# ``discovery.py`` has no fetcher for its catalog, so a managed sync would push an
+# allow-list refusing every model. The seeded wildcard in the Bifrost config is it.
+_UNMANAGED_PROVIDER_TYPES = frozenset({"ollama", "vertex"})
 
 # Read-only/derived fields Bifrost returns but rejects or ignores on write.
 # ``value`` is dropped separately — see the module docstring on masking.
@@ -136,12 +140,9 @@ def _upsert_provider_key(
     body.setdefault("name", f"default-{provider_name}-key")
     body.setdefault("weight", 1)
     body.setdefault("enabled", True)
-    # A bare string. Wrapped as {"value": ..., "type": "plain_text"} this Bifrost
-    # accepts the write with a 200 and stores the serialized wrapper as the
-    # credential -- it reads back masked as {"va***xt"}, the JSON's own first and
-    # last characters, and every call then 401s with "invalid x-api-key". Nothing
-    # says so: the push succeeded, the secret store is right, and only the gateway
-    # knows. Verified against the running image rather than inferred.
+    # A bare string: wrapped as {"value": ..., "type": "plain_text"} this Bifrost
+    # accepts the write and stores the serialized wrapper as the credential, after
+    # which every call 401s. Verified against the running image rather than inferred.
     body["value"] = key_value
     if models is not None:
         body["models"] = models
@@ -399,8 +400,6 @@ async def sync_all_provider_models() -> Dict[str, Any]:
 
 async def _do_sync_all_provider_models() -> Dict[str, Any]:
     # Deferred imports to keep module load cheap.
-    from core.storage.connection import get_db_manager
-    from core.storage.models import LLMProviderConfig
     from core.llm.providers import discovery
     from core.llm.providers.registry import (
         _FALLBACK_MODELS_BY_PROVIDER,
@@ -409,6 +408,8 @@ async def _do_sync_all_provider_models() -> Dict[str, Any]:
         get_extra_model_ids,
         record_live_meta,
     )
+    from core.storage.connection import get_db_manager
+    from core.storage.models import LLMProviderConfig
 
     db_manager = get_db_manager()
     if db_manager._engine is None:
