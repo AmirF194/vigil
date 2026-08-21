@@ -181,10 +181,8 @@ def _normalised(tool: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # Whether this deployment dials every configured MCP server at startup. Defined here
-# because populate_from_cache reads it and services/api/main.py enforces it, and two
-# copies of one rule drift. Off by default under DEV_MODE, where an optional stdio
-# server with a stale executable would otherwise hold up a local backend; an explicit
-# setting wins either way.
+# because populate_from_cache reads it and services/api/main.py enforces it. Off by
+# default under DEV_MODE; an explicit setting wins either way.
 def eager_connect_enabled() -> bool:
     from core.config import get_settings
 

@@ -129,6 +129,26 @@ def test_leaves_the_plain_description_when_it_cannot_look(monkeypatch, rows, ser
     assert len(described) == 5
 
 
+# This server starts with the backend, which on a fresh deployment is before anyone has
+# entered a credential. Caching the resulting empty summary left every hunt for the life
+# of the process querying blind -- the same failure this description exists to close.
+def test_looks_again_after_a_deployment_that_was_not_configured_yet(monkeypatch):
+    module = _load(monkeypatch, _ROWS)
+    unreachable = {"still": True}
+
+    class _Service:
+        def search(self, query, earliest_time="-24h", max_count=1000):
+            if unreachable["still"]:
+                raise RuntimeError("splunk is unreachable")
+            return _ROWS
+
+    monkeypatch.setattr(module, "get_splunk_service", lambda: _Service())
+    assert _describe(module)["splunk_execute"] == "Execute SPL query"
+
+    unreachable["still"] = False
+    assert "index=botsv3" in _describe(module)["splunk_execute"]
+
+
 def test_asks_splunk_once_however_often_the_tools_are_listed(monkeypatch):
     module = _load(monkeypatch, _ROWS)
     calls = {"n": 0}
