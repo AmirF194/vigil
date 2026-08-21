@@ -77,6 +77,70 @@ describe('what a finished hunt shows an operator', () => {
     expect(screen.getByText('—')).toBeInTheDocument()
   })
 
+  // The screen a real run left behind: nine beliefs, every column identical, because
+  // every informative field on a standing is written at verdict time and nothing
+  // resolved. The rulings are on the ledger the whole time.
+  describe('how the evidence landed', () => {
+    const board = {
+      evidence_count: 3,
+      hypotheses: [
+        { hypothesis_id: 'h-c2', statement: 'this is attacker command-and-control', status: 'inconclusive', techniques_cited: ['T1071.001'], resolution_reason: 'hunt ended (budget_terminated) with the hypothesis unresolved', provenance: 'operator' },
+        { hypothesis_id: 'h-mining', statement: 'the port 3333 session is cryptocurrency mining', status: 'inconclusive', techniques_cited: [], resolution_reason: 'hunt ended (budget_terminated) with the hypothesis unresolved', provenance: 'operator' },
+        { hypothesis_id: 'h-frag', statement: 'at a regular interval, and at least one other host', status: 'inconclusive', techniques_cited: [], resolution_reason: 'hunt ended (budget_terminated) with the hypothesis unresolved', provenance: 'operator' },
+      ],
+      evidence: [
+        { evidence_id: 'ev-1', iteration: 1, source_system: 'net_flow', summary: '3,885 connections at a 30s interval', bears_on: [{ hypothesis_id: 'h-c2', relation: 'supports' }, { hypothesis_id: 'h-frag', relation: 'neither' }] },
+        { evidence_id: 'ev-2', iteration: 2, source_system: 'http', summary: 'PowerShell retrieved a 5.5MB logos.png over 3333', bears_on: [{ hypothesis_id: 'h-c2', relation: 'supports' }, { hypothesis_id: 'h-mining', relation: 'weakens' }, { hypothesis_id: 'h-frag', relation: 'neither' }] },
+        { evidence_id: 'ev-3', iteration: 3, source_system: 'endpoint', summary: 'sysmon shows powershell.exe opened the socket', bears_on: [{ hypothesis_id: 'h-c2', relation: 'supports' }, { hypothesis_id: 'h-mining', relation: 'weakens' }, { hypothesis_id: 'h-frag', relation: 'neither' }] },
+      ],
+    }
+
+    it('counts how the rulings landed on each belief, unresolved or not', () => {
+      renderPanel({ hunt: hunt(board) })
+      tabTo(/Hypotheses/)
+
+      const rows = screen.getAllByRole('row')
+      const c2 = rows.find((row) => row.textContent?.includes('command-and-control'))!
+      const mining = rows.find((row) => row.textContent?.includes('cryptocurrency mining'))!
+      expect(c2.textContent).toContain('3 for · 0 against')
+      expect(mining.textContent).toContain('0 for · 2 against')
+    })
+
+    // A belief every record was weighed against and set aside is not the same as one
+    // nobody has ruled on: the first is a hunt that looked.
+    it('tells a belief nothing bore on from one nothing has ruled on', () => {
+      renderPanel({ hunt: hunt(board) })
+      tabTo(/Hypotheses/)
+
+      const rows = screen.getAllByRole('row')
+      expect(rows.find((row) => row.textContent?.includes('at a regular interval'))!.textContent).toContain('not engaged')
+    })
+
+    it('says nothing is ruled yet before any evidence bears on a belief', () => {
+      renderPanel({ hunt: hunt({ ...board, evidence: [], evidence_count: 0 }) })
+      tabTo(/Hypotheses/)
+
+      expect(screen.getAllByText('nothing ruled yet').length).toBe(3)
+    })
+
+    // One run-level fact, said once. Printed per row it is the run bar's news again.
+    it('hoists the reason every belief shares out of the rows', () => {
+      renderPanel({ hunt: hunt(board) })
+      tabTo(/Hypotheses/)
+
+      expect(screen.getAllByText(/hunt ended \(budget_terminated\)/)).toHaveLength(1)
+    })
+
+    // Counted over what the projection carries, which is capped -- so a long run must
+    // not read as though the tally were the whole record.
+    it('says so when the rulings are counted over a truncated record', () => {
+      renderPanel({ hunt: hunt({ ...board, evidence_count: 63 }) })
+      tabTo(/Hypotheses/)
+
+      expect(screen.getByText(/Rulings counted over the 3 most recent/)).toBeInTheDocument()
+    })
+  })
+
   it('marks the belief the operator put up themselves', () => {
     renderPanel({
       hunt: hunt({
@@ -238,6 +302,273 @@ describe('the report', () => {
 
     expect(screen.getByText('the ledger says this')).toBeInTheDocument()
     expect(screen.queryByText('stale row copy')).toBeNull()
+  })
+
+  // Over half the rendered report was a flat re-listing of the evidence the tab next
+  // door shows as a table, under metadata the run bar shows better. The account is
+  // the part written nowhere else, so it is what the tab shows.
+  it('leads with the account rather than the metadata and the findings dump', () => {
+    renderPanel({
+      hunt: hunt({
+        report_markdown: '# Hunt report\n\n- **Cost:** $4.17\n\n## What the hunt found (34)\n\n- **iteration 5** (dns) — a record nobody needs twice',
+        narrative: {
+          summary: 'Two unrelated things happened, not one.',
+          what_happened: '### Incident 1\n\nA host beaconed to 45.77.53.176.',
+          next_steps: ['Isolate FYODOR-L'],
+          model_id: 'vertex/gemini-3.5-flash',
+          written_at: '2026-08-20T19:00:00.000Z',
+        },
+      }),
+    })
+
+    expect(screen.getByText('Two unrelated things happened, not one.')).toBeInTheDocument()
+    expect(screen.getByText(/A host beaconed to 45.77.53.176/)).toBeInTheDocument()
+    // The duplicated half is gone, and so is the metadata the run bar already shows.
+    expect(screen.queryByText(/a record nobody needs twice/)).toBeNull()
+    expect(screen.queryByText(/What the hunt found/)).toBeNull()
+  })
+
+  it('points at the tab that does show the records, with the count', () => {
+    renderPanel({ hunt: hunt({ report_markdown: 'x', narrative: { summary: 's', what_happened: 'w', next_steps: [], model_id: 'm', written_at: 'w' } }) })
+
+    expect(screen.getByText(/34 record\(s\) gathered/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Evidence/ }))
+    expect(screen.getByRole('tab', { name: /Evidence/, selected: true })).toBeInTheDocument()
+  })
+
+  // The markdown is what goes out on the terminal and onto a case. Not rendering it
+  // inline is not the same as taking it away.
+  it('keeps the whole report reachable', () => {
+    renderPanel({ hunt: hunt({ report_markdown: 'the whole thing', narrative: { summary: 's', what_happened: 'w', next_steps: [], model_id: 'm', written_at: 'w' } }) })
+
+    expect(screen.getByRole('button', { name: 'copy full report' })).toBeInTheDocument()
+  })
+
+  // A run from before there was a narrator, or one whose narrator could not answer.
+  it('falls back to the whole report when nothing wrote an account', () => {
+    renderPanel({ hunt: hunt({ report_markdown: '## Verdicts\n\nNothing was proven.' }) })
+
+    expect(screen.getByText('Nothing was proven.')).toBeInTheDocument()
+  })
+
+  it('gives what to do now its own tab, counted in the label', () => {
+    renderPanel({
+      hunt: hunt({
+        report_markdown: 'x',
+        narrative: { summary: 's', what_happened: 'w', next_steps: ['Isolate FYODOR-L', 'Block egress to 45.77.53.176'], model_id: 'm', written_at: 'w' },
+      }),
+    })
+
+    // The count is on the label, so the tab says how much is outstanding without
+    // being opened — which is what makes a tab safe here rather than a banner.
+    const tab = screen.getByRole('tab', { name: /Next steps/ })
+    expect(tab).toHaveTextContent('2')
+
+    fireEvent.click(tab)
+    expect(screen.getByText('What to do now')).toBeInTheDocument()
+    expect(screen.getByText('Isolate FYODOR-L')).toBeInTheDocument()
+    expect(screen.getByText('Block egress to 45.77.53.176')).toBeInTheDocument()
+  })
+
+  it('offers no such tab when the account named no actions', () => {
+    renderPanel({ hunt: hunt({ report_markdown: 'x', narrative: { summary: 's', what_happened: 'w', next_steps: [], model_id: 'm', written_at: 'w' } }) })
+
+    expect(screen.queryByRole('tab', { name: /Next steps/ })).toBeNull()
+    expect(screen.queryByText('What to do now')).toBeNull()
+  })
+
+  // The run bar carries the outcome, the iterations and the cost; "Why it ended" has
+  // a line of its own. The report's own header repeated all of it, so a failed run
+  // printed its reason three times on one screen.
+  it('drops the report header the run bar already shows', () => {
+    renderPanel({
+      hunt: hunt({
+        report_markdown: '# Hunt report\n\n- **Outcome:** failed\n- **Cost:** $0.00 of $100.00\n\n## Verdicts\n\nNothing was proven.',
+      }),
+    })
+
+    expect(screen.getByText('Nothing was proven.')).toBeInTheDocument()
+    expect(screen.queryByText(/\$0.00 of \$100.00/)).toBeNull()
+  })
+
+  it('does not print the error a second time when it is the reason', () => {
+    const reason = 'the Hunt Lead emitted nothing valid in 3 attempts'
+    renderPanel({ status: 'failed', error: reason, hunt: hunt({ status: 'terminal', reason, report_markdown: 'x' }) })
+
+    expect(screen.getAllByText(new RegExp(reason))).toHaveLength(1)
+    expect(screen.queryByText('Error')).toBeNull()
+  })
+
+  it('still shows an error that says something the reason does not', () => {
+    renderPanel({ status: 'failed', error: 'the worker died holding the lease', hunt: hunt({ status: 'terminal', reason: 'ran out of turns', report_markdown: 'x' }) })
+
+    expect(screen.getByText('Error')).toBeInTheDocument()
+    expect(screen.getByText(/the worker died holding the lease/)).toBeInTheDocument()
+  })
+
+  it('numbers the beliefs in board order and defines them on the board', () => {
+    renderPanel({
+      hunt: hunt({
+        hypotheses: [
+          { hypothesis_id: 'h-aaa', statement: 'first belief', status: 'active', techniques_cited: [], provenance: 'operator', resolution_reason: null, attack_technique: null },
+          { hypothesis_id: 'h-bbb', statement: 'second belief', status: 'inconclusive', techniques_cited: [], provenance: 'base_rate', resolution_reason: null, attack_technique: null },
+        ],
+      }),
+    })
+
+    fireEvent.click(screen.getByRole('tab', { name: /Hypotheses/ }))
+    expect(screen.getByTitle('h-aaa')).toHaveTextContent('H1')
+    expect(screen.getByTitle('h-bbb')).toHaveTextContent('H2')
+  })
+
+  // A reference the board does not hold is worth seeing, not eliding.
+  it('falls back to the id for a belief this projection never carried', () => {
+    renderPanel({
+      hunt: hunt({
+        evidence: [{
+          evidence_id: 'ev-1', iteration: 1, source_system: 'dns', summary: 'a record', why_notable: '',
+          salience: 'anomalous', attack_technique: null, attacker_influenceable: false, instruction_like: false,
+          provenance: 'worker', is_gap: false, gap_detail: null, captured_at: '2026-08-20T00:00:00Z',
+          bears_on: [{ hypothesis_id: 'h-not-on-the-board', relation: 'supports' }],
+        }],
+      }),
+    })
+
+    fireEvent.click(screen.getByRole('tab', { name: /Evidence/ }))
+    expect(screen.getByTitle('h-not-on-the-board')).toHaveTextContent('h-not-on-the-board')
+  })
+
+  // The lead rules every observation against every belief, so most rulings say
+  // "does not bear on". On one run 46 of 63 links were `neither`: three quarters of
+  // the column, saying nothing a reader can act on.
+  it('shows what a record bears on, not what it does not', () => {
+    renderPanel({
+      hunt: hunt({
+        evidence: [{
+            evidence_id: 'ev-1', iteration: 1, source_system: 'dns', summary: 'a record', why_notable: '',
+            salience: 'anomalous', attack_technique: null, attacker_influenceable: false, instruction_like: false,
+            provenance: 'worker', is_gap: false, gap_detail: null, captured_at: '2026-08-20T00:00:00Z',
+            bears_on: [{ hypothesis_id: 'h-3431', relation: 'supports' }, { hypothesis_id: 'h-other', relation: 'neither' }],
+          }],
+      }),
+    })
+
+    fireEvent.click(screen.getByRole('tab', { name: /Evidence/ }))
+    expect(screen.getByText(/supports/)).toBeInTheDocument()
+    expect(screen.queryByText(/neither/)).toBeNull()
+  })
+
+  it('tells a record it weighed and set aside from one nobody has ruled on', () => {
+    renderPanel({
+      hunt: hunt({
+        evidence: [{
+            evidence_id: 'ev-2', iteration: 1, source_system: 'dns', summary: 'a record', why_notable: '',
+            salience: 'anomalous', attack_technique: null, attacker_influenceable: false, instruction_like: false,
+            provenance: 'worker', is_gap: false, gap_detail: null, captured_at: '2026-08-20T00:00:00Z',
+            bears_on: [{ hypothesis_id: 'h-3431', relation: 'neither' }],
+          }],
+      }),
+    })
+
+    fireEvent.click(screen.getByRole('tab', { name: /Evidence/ }))
+    expect(screen.getByText('bears on none')).toBeInTheDocument()
+  })
+
+  // A negative result is evidence, and knowing the hunt looked matters. Folded
+  // rather than dropped.
+  it('folds routine records behind a count and opens them on request', () => {
+    renderPanel({
+      hunt: hunt({
+        evidence: [{
+            evidence_id: 'ev-3', iteration: 1, source_system: 'dns', summary: 'what was anomalous', why_notable: '',
+            salience: 'anomalous', attack_technique: null, attacker_influenceable: false, instruction_like: false,
+            provenance: 'worker', is_gap: false, gap_detail: null, captured_at: '2026-08-20T00:00:00Z',
+            bears_on: [],
+          }, {
+            evidence_id: 'ev-4', iteration: 1, source_system: 'dns', summary: 'nothing matched', why_notable: '',
+            salience: 'routine', attack_technique: null, attacker_influenceable: false, instruction_like: false,
+            provenance: 'worker', is_gap: false, gap_detail: null, captured_at: '2026-08-20T00:00:00Z',
+            bears_on: [],
+          }],
+      }),
+    })
+
+    fireEvent.click(screen.getByRole('tab', { name: /Evidence/ }))
+    expect(screen.getByText('what was anomalous')).toBeInTheDocument()
+    expect(screen.queryByText('nothing matched')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: '1 routine hidden' }))
+    expect(screen.getByText('nothing matched')).toBeInTheDocument()
+  })
+
+  // The account separates the incidents; rendering it as one markdown run throws that
+  // structure away on the way to the screen.
+  it('gives each incident the account separated its own card', () => {
+    renderPanel({
+      hunt: hunt({
+        report_markdown: 'x',
+        narrative: {
+          summary: 's',
+          what_happened: '### Memcached exploitation\n\nInbound UDP to 172.16.0.178.\n\n### Inbound SSH\n\nFrom 118.163.24.179.',
+          next_steps: [], model_id: 'm', written_at: 'w',
+        },
+      }),
+    })
+
+    expect(screen.getByText('Memcached exploitation')).toBeInTheDocument()
+    expect(screen.getByText('Inbound SSH')).toBeInTheDocument()
+    expect(screen.getByText(/Inbound UDP to 172.16.0.178/)).toBeInTheDocument()
+    // Numbered by the console: the writer's own headings do not number themselves,
+    // and "the second one" is how a person refers to a list out loud.
+    expect(screen.getByText('01')).toBeInTheDocument()
+    expect(screen.getByText('02')).toBeInTheDocument()
+  })
+
+  it('leaves an account that separated nothing as one piece', () => {
+    renderPanel({
+      hunt: hunt({
+        report_markdown: 'x',
+        narrative: { summary: 's', what_happened: 'One thing happened, told whole.', next_steps: [], model_id: 'm', written_at: 'w' },
+      }),
+    })
+
+    expect(screen.getByText('One thing happened, told whole.')).toBeInTheDocument()
+  })
+
+  // Nine chips saying "inconclusive" nine times is the board restated, not a verdict.
+  it('groups the standings by count rather than listing every belief', () => {
+    renderPanel({
+      hunt: hunt({
+        report_markdown: 'x',
+        narrative: { summary: 's', what_happened: 'w', next_steps: [], model_id: 'm', written_at: 'w' },
+        hypotheses: [
+          { hypothesis_id: 'h-a', statement: 'one', status: 'inconclusive', techniques_cited: [], provenance: 'operator', resolution_reason: null, attack_technique: null },
+          { hypothesis_id: 'h-b', statement: 'two', status: 'inconclusive', techniques_cited: [], provenance: 'operator', resolution_reason: null, attack_technique: null },
+          { hypothesis_id: 'h-c', statement: 'the benign account', status: 'active', techniques_cited: [], provenance: 'base_rate', resolution_reason: null, attack_technique: null },
+        ],
+      }),
+    })
+
+    // Two of the operator's, counted once. The base rate is machinery, not a belief
+    // they set out to test, so it is not in the count.
+    expect(screen.getByText('2 beliefs tested ▸')).toBeInTheDocument()
+    expect(screen.queryByText('3 beliefs tested ▸')).toBeNull()
+  })
+
+  it('marks the belief the loop seeded, and puts it after the ones asked for', () => {
+    renderPanel({
+      hunt: hunt({
+        hypotheses: [
+          { hypothesis_id: 'h-c', statement: 'the benign account', status: 'active', techniques_cited: [], provenance: 'base_rate', resolution_reason: null, attack_technique: null },
+          { hypothesis_id: 'h-a', statement: 'what I asked', status: 'active', techniques_cited: [], provenance: 'operator', resolution_reason: null, attack_technique: null },
+        ],
+      }),
+    })
+
+    fireEvent.click(screen.getByRole('tab', { name: /Hypotheses/ }))
+    expect(screen.getByText('the claim to beat')).toBeInTheDocument()
+    const rows = screen.getAllByRole('row').map((r) => r.textContent ?? '')
+    expect(rows.findIndex((t) => t.includes('what I asked'))).toBeLessThan(rows.findIndex((t) => t.includes('the benign account')))
   })
 
   it('still shows a plain result summary for a run that is not a hunt', () => {
@@ -452,7 +783,10 @@ describe('what the hunt has actually gathered', () => {
 
     expect(screen.getByText(/reached 45.77.53.176 every 30s/)).toBeInTheDocument()
     expect(screen.getByText('low jitter across a long window')).toBeInTheDocument()
-    expect(screen.getByText(/supports h-3431/)).toBeInTheDocument()
+    // Referred to by its place on the board, not by its hash. The id is one hover
+    // away, because it is what the ledger and the report use.
+    expect(screen.getByText(/supports/)).toBeInTheDocument()
+    expect(screen.getByTitle('h-3431')).toHaveTextContent('H1')
   })
 
   // A record nobody linked is the case most worth seeing: it was gathered and then
@@ -464,14 +798,42 @@ describe('what the hunt has actually gathered', () => {
     expect(screen.getByText('nothing yet')).toBeInTheDocument()
   })
 
-  // The two flags the verdict gate reads, so an operator can see why support did
-  // not carry rather than only that it did not.
+  // What the verdict gate reads, so an operator can see why support did not carry
+  // rather than only that it did not.
   it('marks a record a verdict cannot rest on alone', () => {
-    withEvidence([record({ attacker_influenceable: true, instruction_like: true })])
+    withEvidence([record({ sensor_attested: false, instruction_like: true })])
     tabTo(/^Evidence/)
 
-    expect(screen.getByText('attacker-influenceable')).toBeInTheDocument()
+    expect(screen.getByText('nothing sensor-attested')).toBeInTheDocument()
     expect(screen.getByText('reads as instruction')).toBeInTheDocument()
+  })
+
+  // "attacker-influenceable" was on every record of a real run: in a hunt the
+  // adversary's behaviour is the signal, so attacker-caused is universal and said
+  // nothing. What carries a verdict is whether the telemetry attested anything.
+  it('says a record is attested even where the adversary chose some of it', () => {
+    withEvidence([
+      record({
+        sensor_attested: true,
+        rests_on: [
+          { field: 'conn_count', authored: 'sensor' },
+          { field: 'dest_ip', authored: 'adversary' },
+        ],
+      }),
+    ])
+    tabTo(/^Evidence/)
+
+    expect(screen.queryByText('nothing sensor-attested')).toBeNull()
+    // And still names what the adversary did choose, which is the critic's best lever.
+    expect(screen.getByText('1 attacker-authored field')).toBeInTheDocument()
+  })
+
+  // A ledger written before the split carries the boolean and no basis at all.
+  it('falls back to the old flag on a run written before the split', () => {
+    withEvidence([record({ attacker_influenceable: true })])
+    tabTo(/^Evidence/)
+
+    expect(screen.getByText('nothing sensor-attested')).toBeInTheDocument()
   })
 
   it('separates a blind spot from a finding', () => {
@@ -512,6 +874,86 @@ describe('what the hunt has actually gathered', () => {
 // bridge wrote its reason into the error column and the panel rendered that under
 // a red "Error" heading, so "an operator accepted the stop at the budget
 // checkpoint" was shown as a fault.
+/* A parked hunt has not ended, so the run row still reads "running" and "Why it ended"
+   stays hidden — which left the console saying nothing at all about a hunt sitting at
+   its own ceiling waiting to be told what to do. Observed live: iteration 3 of 3, no
+   checkpoint, and nothing telling the operator to reach for Steer. */
+describe('a hunt waiting to be told what to do next', () => {
+  it('says it is waiting, and why, while the run still reads as running', () => {
+    renderPanel({
+      status: 'running',
+      hunt: hunt({
+        status: 'parked',
+        outcome: null,
+        open_checkpoint: null,
+        reason: 'ran out of turns: iteration 3 of 3, having spent $0.11 of $14.00',
+      }),
+    })
+
+    expect(screen.getByText(/Stopped and waiting: ran out of turns: iteration 3 of 3/)).toBeInTheDocument()
+    // And it names the way out, which is a control on this panel rather than a syntax
+    // the operator has to get right.
+    expect(screen.getByText(/below to let it carry on from here/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '+3 turns' })).toBeInTheDocument()
+  })
+
+  // `extend` with an empty note parsed to no grant, journaled a note saying so, and left
+  // the hunt parked at the ceiling it was asking to be let past. One real run spent 7 of
+  // 7 iterations with $14.50 unspent that way, then concluded with nothing proven.
+  it('sends a typed grant rather than prose the run has to parse', async () => {
+    const { workflowApi } = await import('../../../services/api')
+    renderPanel({
+      status: 'running',
+      hunt: hunt({ status: 'parked', outcome: null, open_checkpoint: null, reason: 'ran out of turns' }),
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: '+3 turns' }))
+
+    expect(workflowApi.steer).toHaveBeenCalledWith('run-1', 'extend', '', {
+      grant: { iterations: 3, cost_usd: 0, wall_ms: 0 },
+    })
+  })
+
+  // Turns are not always the arm that bound: the wall clock stops a hunt with money and
+  // iterations still on the board, and one press has to be able to buy the arm that ran out.
+  // A press disables the row until it settles, so each is its own render.
+  it.each([
+    ['+$5', { iterations: 0, cost_usd: 5, wall_ms: 0 }],
+    ['+30 min', { iterations: 0, cost_usd: 0, wall_ms: 1_800_000 }],
+  ])('grants what %s says', async (label, grant) => {
+    const { workflowApi } = await import('../../../services/api')
+    renderPanel({ status: 'running', hunt: hunt({ status: 'parked', outcome: null, open_checkpoint: null }) })
+
+    fireEvent.click(screen.getByRole('button', { name: label }))
+
+    expect(workflowApi.steer).toHaveBeenCalledWith('run-1', 'extend', '', { grant })
+  })
+
+  it('stays quiet while the hunt is actually working', () => {
+    renderPanel({ status: 'running', hunt: hunt({ status: 'active', outcome: null, open_checkpoint: null }) })
+
+    expect(screen.queryByText(/Stopped and waiting/)).toBeNull()
+  })
+
+  // A real checkpoint has its own panel with an approve and a reject on it; saying it
+  // twice, in two voices, would be worse than saying it once.
+  it('defers to the checkpoint panel when there is a checkpoint to answer', () => {
+    renderPanel({
+      status: 'running',
+      hunt: hunt({
+        status: 'parked',
+        outcome: null,
+        reason: 'awaiting an operator',
+        open_checkpoint: { checkpoint_id: 'cp-1', checkpoint_class: 'scope_extension', question: 'widen to 10.0.0.0/8?', raised_at: '2026-08-20T00:00:00Z', context: {} },
+      }),
+    })
+
+    // The checkpoint panel already says its own piece, with an approve and a reject on
+    // it; saying it twice in two voices would be worse than saying it once.
+    expect(screen.queryByText(/Stopped and waiting/)).toBeNull()
+  })
+})
+
 describe('why a finished run ended', () => {
   it('states the reason beside the outcome rather than as an error', () => {
     renderPanel({
@@ -527,5 +969,184 @@ describe('why a finished run ended', () => {
     renderPanel({ status: 'failed', error: 'its spec cannot be built' })
 
     expect(screen.getByRole('heading', { name: 'Error' })).toBeInTheDocument()
+  })
+})
+
+/* The standings say what the hunt believes and the evidence says what came back;
+   neither says which move the lead made, so a run in flight showed a turn counter
+   advancing over no account of what it decided. */
+describe('the moves the lead made', () => {
+  const moves = [
+    {
+      decision_id: 'dec-2',
+      iteration: 2,
+      action: 'VALIDATE',
+      rationale: 'the beaconing interval is worth putting up for a verdict',
+      target_hypothesis_id: 'h-3431',
+      rejected_attempts: ['VALIDATE must cite the evidence it rests on'],
+    },
+    {
+      decision_id: 'dec-1',
+      iteration: 1,
+      action: 'INVESTIGATE',
+      rationale: 'start on the flow telemetry',
+      query_intent: 'what did 10.0.0.5 talk to, and how regularly',
+      worker_agent_id: 'network_analyst',
+    },
+  ]
+
+  it('shows each decision, what it asked and what it targeted', () => {
+    renderPanel({ hunt: hunt({ moves }) })
+    tabTo(/Moves/)
+
+    expect(screen.getByText('VALIDATE')).toBeInTheDocument()
+    expect(screen.getByText(/start on the flow telemetry/)).toBeInTheDocument()
+    expect(screen.getByText(/what did 10.0.0.5 talk to/)).toBeInTheDocument()
+    expect(screen.getByText('network_analyst')).toBeInTheDocument()
+  })
+
+  it('says when a turn had to re-ask, which is the only account of one that stalled', () => {
+    renderPanel({ hunt: hunt({ moves }) })
+    tabTo(/Moves/)
+
+    expect(screen.getByText(/1 emission\(s\) refused first/)).toBeInTheDocument()
+  })
+
+  it('offers no tab at all on a run that recorded none', () => {
+    renderPanel({ hunt: hunt() })
+
+    expect(screen.queryByRole('tab', { name: /Moves/ })).toBeNull()
+  })
+})
+
+/* boost has always been a directive and it names a question_id the console never
+   showed, so the frontier was both invisible and unsteerable. */
+describe('the frontier', () => {
+  const open_questions = [
+    { question_id: 'q-1', question: '45.77.53.176', entity_key: 'ip:45.77.53.176', hypothesis_id: 'h-3431', spawned_iteration: 2 },
+  ]
+
+  it('lists the leads nobody has taken', () => {
+    renderPanel({ hunt: hunt({ open_questions }) })
+    tabTo(/Frontier/)
+
+    expect(screen.getByText('ip:45.77.53.176')).toBeInTheDocument()
+    expect(screen.getByTitle('h-3431')).toHaveTextContent('H1')
+  })
+
+  it('pins one for the next turn on a run still in flight', async () => {
+    const { workflowApi } = await import('../../../services/api')
+    renderPanel({ status: 'running', hunt: hunt({ status: 'active', open_questions }) })
+    tabTo(/Frontier/)
+    fireEvent.click(screen.getByRole('button', { name: /take next/ }))
+
+    expect(workflowApi.steer).toHaveBeenCalledWith('run-1', 'boost', '', { question_id: 'q-1' })
+  })
+
+  it('offers no control on a run that has ended', () => {
+    renderPanel({ hunt: hunt({ open_questions }) })
+    tabTo(/Frontier/)
+
+    expect(screen.queryByRole('button', { name: /take next/ })).toBeNull()
+  })
+})
+
+/* The lead directive grows what a hunt looks at and the controller has always
+   handled it; the console offered no way to send one. */
+describe('steering a hunt that is still going', () => {
+  it('puts an operator lead on the frontier, with the entity it is about', async () => {
+    const { workflowApi } = await import('../../../services/api')
+    renderPanel({ status: 'running', hunt: hunt({ status: 'active' }) })
+    fireEvent.change(screen.getByPlaceholderText(/A note for the run/), { target: { value: 'check the jump box too' } })
+    fireEvent.change(screen.getByPlaceholderText(/type:value/), { target: { value: 'ip:10.0.0.5' } })
+    fireEvent.click(screen.getByRole('button', { name: /add lead/ }))
+
+    expect(workflowApi.steer).toHaveBeenCalledWith('run-1', 'lead', 'check the jump box too', { entity_key: 'ip:10.0.0.5' })
+  })
+})
+
+
+// The two tables a reader spends the most time in, and the two that a real run made
+// unreadable: a 300-character raw emission in a table cell, and an ip wrapped one
+// character to a line down a tight column.
+describe('the moves table', () => {
+  const move = (over = {}) => ({
+    decision_id: 'd-1',
+    iteration: 7,
+    action: 'VALIDATE',
+    rationale: 'putting the primary hypothesis to a verdict',
+    ...over,
+  })
+
+  it('says why an emission was refused without reprinting the emission', () => {
+    const rejection =
+      '/query_intent must be string: { "action": "VALIDATE", "rationale": "With the hunt budget fully depleted on this final turn, we are putting our primary hypothesis h-1f0e78e3 to a verdict. The network flow telemetry confirms" }'
+    renderPanel({ hunt: hunt({ moves: [move({ rejected_attempts: [rejection] })] }) })
+    tabTo(/Moves/)
+
+    expect(screen.getByText(/1 emission\(s\) refused first — \/query_intent must be string/)).toBeInTheDocument()
+    expect(screen.queryByText(/network flow telemetry confirms/)).toBeNull()
+  })
+
+  it('says something rather than nothing when the refusal carries no complaint', () => {
+    renderPanel({ hunt: hunt({ moves: [move({ rejected_attempts: ['{"action":"NOPE"}'] })] }) })
+    tabTo(/Moves/)
+
+    expect(screen.getByText(/did not match the schema/)).toBeInTheDocument()
+  })
+
+  // In the tight On column an ip wrapped to one character a line, over eight lines.
+  it('carries the entity and the worker beside the rationale, not in the tight column', () => {
+    renderPanel({
+      hunt: hunt({ moves: [move({ target_entity: 'ip:192.168.70.186', worker_agent_id: 'threat_hunter', target_hypothesis_id: 'h-3431' })] }),
+    })
+    tabTo(/Moves/)
+
+    const cells = screen.getAllByRole('cell')
+    const why = cells.find((cell) => cell.textContent?.includes('putting the primary hypothesis'))!
+    expect(why.textContent).toContain('ip:192.168.70.186')
+    expect(why.textContent).toContain('threat_hunter')
+    // On carries the belief reference and nothing that has to wrap.
+    expect(cells.at(-1)!.textContent).toBe('H1')
+  })
+})
+
+describe('the evidence table', () => {
+  const record = (over = {}) => ({
+    evidence_id: 'ev-1',
+    iteration: 2,
+    source_system: 'endpoint',
+    summary: 'sysmon shows powershell.exe opened the socket',
+    salience: 'anomalous',
+    ...over,
+  })
+
+  // "weakens H6 / weakens H7 / weakens H9" stacked three lines down a narrow column
+  // and made the row taller than the summary it belongs to.
+  it('groups the beliefs a record bears on by relation', () => {
+    renderPanel({
+      hunt: hunt({
+        evidence_count: 1,
+        hypotheses: [
+          { hypothesis_id: 'h-a', statement: 'C2', status: 'active' },
+          { hypothesis_id: 'h-b', statement: 'mining', status: 'active' },
+          { hypothesis_id: 'h-c', statement: 'mining pool', status: 'active' },
+        ],
+        evidence: [
+          record({
+            bears_on: [
+              { hypothesis_id: 'h-a', relation: 'supports' },
+              { hypothesis_id: 'h-b', relation: 'weakens' },
+              { hypothesis_id: 'h-c', relation: 'weakens' },
+            ],
+          }),
+        ],
+      }),
+    })
+    tabTo(/Evidence/)
+
+    // One line per relation, so three rulings are two lines rather than three.
+    expect(screen.getByText(/^supports/).textContent?.replace(/\s+/g, ' ').trim()).toBe('supports H1')
+    expect(screen.getByText(/^weakens/).textContent?.replace(/\s+/g, ' ').trim()).toBe('weakens H2 H3')
   })
 })

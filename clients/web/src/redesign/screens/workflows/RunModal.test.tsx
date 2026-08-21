@@ -8,13 +8,14 @@ import { RunModal } from './WorkflowsScreen'
 const execute = vi.fn(() => Promise.resolve({ data: { run_id: 'run-abc12345' } }))
 const getWorkflow = vi.fn()
 const getRun = vi.fn(() => Promise.resolve({ data: { run_id: 'run-abc12345', status: 'running' } }))
+const steer = vi.fn(() => Promise.resolve({ data: {} }))
 
 vi.mock('../../../services/api', () => ({
   workflowApi: {
     execute: (...a: unknown[]) => execute(...(a as [])),
     get: (...a: unknown[]) => getWorkflow(...(a as [])),
     getRun: (...a: unknown[]) => getRun(...(a as [])),
-    steer: vi.fn(() => Promise.resolve({ data: {} })),
+    steer: (...a: unknown[]) => steer(...(a as [])),
     cancelRun: vi.fn(() => Promise.resolve({ data: {} })),
   },
   agentsApi: { listAgents: vi.fn(() => Promise.resolve({ data: { agents: [] } })) },
@@ -31,15 +32,35 @@ const wf = (runKind = 'hunt') => ({
   agents: [], cmds: [], source: 'file', useCase: '', runKind,
 })
 
-const limits = (unbound: string[]) => ({
+const limits = (unbound: string[], source = 'heuristic') => ({
   data: {
     capabilities: { bound: ['findings_search'], unbound },
     budgets: { max_iterations: 8, max_cost_usd: 3.0 },
+    pricing: { model: 'vertex/gemini-3.5-flash', source },
   },
 })
 
 const open = (runKind = 'hunt') =>
   render(<RunModal wf={wf(runKind)} onStarted={() => {}} onClose={() => {}} />)
+
+/* A cost ceiling nothing can measure is not a ceiling, so the hunt stops after its
+   first few calls. That refusal is right; arriving after the spend, naming neither the
+   model nor the remedy, is not. */
+describe('a model nothing can price', () => {
+  it('says so before the run rather than three calls in', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([], 'unknown'))
+    open()
+    expect(await screen.findByText(/Nothing here can price/)).toBeInTheDocument()
+    expect(screen.getByText(/vertex\/gemini-3.5-flash/)).toBeInTheDocument()
+  })
+
+  it('stays quiet when the model has a rate', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([], 'heuristic'))
+    open()
+    await waitFor(() => expect(getWorkflow).toHaveBeenCalled())
+    expect(screen.queryByText(/Nothing here can price/)).toBeNull()
+  })
+})
 
 describe('what the hunt will not be able to see', () => {
   it('names an unbound capability before anything is spent', async () => {
@@ -139,6 +160,61 @@ describe('after the run starts', () => {
   })
 })
 
+/* A hunt raises its approval checkpoint in the first second, so this modal is where
+   the operator meets it. It printed the question and put the answer a screen away:
+   the hunt sat parked looking like it offered no way to start. */
+describe('the checkpoint the hunt raises before it can start', () => {
+  const parked = {
+    data: {
+      run_id: 'run-abc12345',
+      status: 'parked',
+      hunt: {
+        run_id: 'run-abc12345',
+        status: 'parked',
+        iteration: 0,
+        evidence_count: 0,
+        hypotheses: [],
+        open_checkpoint: {
+          checkpoint_id: 'cp-2950de71',
+          checkpoint_class: 'hypothesis_approval',
+          question: 'Approve and start this hunt on 8 hypothesis(es), 8 from your request?',
+        },
+      },
+    },
+  }
+
+  const start = async () => {
+    getWorkflow.mockResolvedValueOnce(limits([]))
+    getRun.mockImplementation(() => Promise.resolve(parked))
+    open()
+    await screen.findByText(/It stops at/)
+    fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'beaconing on the finance subnet' } })
+    fireEvent.change(screen.getByLabelText(/Hypothesis/), { target: { value: 'a host beacons' } })
+    fireEvent.click(screen.getByRole('button', { name: /Run workflow/ }))
+  }
+
+  it('can be answered from here rather than only from the run panel', async () => {
+    await start()
+
+    expect(await screen.findByText(/Approve and start this hunt/)).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'approve' })).toBeInTheDocument()
+  })
+
+  it('sends the answer against the checkpoint it was asked about', async () => {
+    await start()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'approve' }))
+
+    await waitFor(() => expect(steer).toHaveBeenCalled())
+    expect(steer.mock.calls[0]).toEqual([
+      'run-abc12345',
+      'approve',
+      '',
+      { checkpoint_id: 'cp-2950de71' },
+    ])
+  })
+})
+
 describe('a hunt tests what the operator states', () => {
   // Says so when Run is pressed rather than sitting dead through a sentence: a
   // disabled button beside a hint reading "required" argues with the form instead
@@ -178,5 +254,44 @@ describe('a hunt tests what the operator states', () => {
     fireEvent.change(screen.getByLabelText('Context'), { target: { value: 'ransomware on HOST-42' } })
 
     expect(screen.getByRole('button', { name: /Run workflow/ })).not.toBeDisabled()
+  })
+})
+
+// A pasted paragraph with hard wraps becomes one belief per wrapped line: half a
+// sentence, a note to yourself, the criteria for the belief above. Nine beliefs
+// where four were meant doubles the matrix every later view is built from — and
+// the only place it is cheap to catch is before the run starts.
+describe('what the hypothesis field will actually put on the board', () => {
+  it('counts the beliefs the splitter will make', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([]))
+    render(<RunModal wf={wf()} onStarted={() => {}} onClose={() => {}} />)
+    fireEvent.change(screen.getByPlaceholderText(/Credentials taken from HOST-42/), {
+      target: { value: 'a host is beaconing out\nanother host is doing the same' },
+    })
+
+    expect(await screen.findByText('H1')).toBeInTheDocument()
+    expect(screen.getByText('H2')).toBeInTheDocument()
+    expect(screen.queryByText('H3')).toBeNull()
+  })
+
+  it('marks a line that reads as a fragment rather than a claim', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([]))
+    render(<RunModal wf={wf()} onStarted={() => {}} onClose={() => {}} />)
+    fireEvent.change(screen.getByPlaceholderText(/Credentials taken from HOST-42/), {
+      target: { value: 'A host is beaconing to 45.77.53.176 over HTTPS\nat a regular interval, and another host is too.' },
+    })
+
+    expect(await screen.findByText(/reads as a fragment/)).toBeInTheDocument()
+  })
+
+  it('says nothing when every line reads as a claim', async () => {
+    getWorkflow.mockResolvedValueOnce(limits([]))
+    render(<RunModal wf={wf()} onStarted={() => {}} onClose={() => {}} />)
+    fireEvent.change(screen.getByPlaceholderText(/Credentials taken from HOST-42/), {
+      target: { value: 'A host is beaconing out.\nData left over DNS.' },
+    })
+
+    expect(await screen.findByText('H1')).toBeInTheDocument()
+    expect(screen.queryByText(/reads as a fragment/)).toBeNull()
   })
 })

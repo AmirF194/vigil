@@ -4,7 +4,7 @@
    via useWorkflows / useAgents / useSkills, with loading / empty /
    error states. See REDESIGN_GAPS.md §9.
    ============================================================ */
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { Icon } from '../../shared/icons'
 import { EmptyState, Popup, TextInput, activateOnKey } from '../../shared/ui'
 import { Markdown } from '../../shared/Markdown'
@@ -179,6 +179,8 @@ function WorkflowCatalog({ goSettings }: { goSettings: ScreenProps['goSettings']
 /* ---------------- Workflow action modals ---------------- */
 
 /** dark-themed labeled text field for the modal forms */
+const INPUT_CLS = 'w-full bg-bg border border-line rounded-[7px] px-2.5 py-2 text-[13px] text-tx outline-none focus:border-accent-line'
+
 function Field({ label, value, onChange, placeholder, textarea, mono, hint, maxLength, list, rows = 3 }: {
   label: string
   value: string
@@ -191,7 +193,7 @@ function Field({ label, value, onChange, placeholder, textarea, mono, hint, maxL
   list?: string
   rows?: number
 }) {
-  const cls = `w-full bg-bg border border-line rounded-[7px] px-2.5 py-2 text-[13px] text-tx outline-none focus:border-accent-line${mono ? ' font-mono' : ''}`
+  const cls = `${INPUT_CLS}${mono ? ' font-mono' : ''}`
   return (
     <label className="flex flex-col gap-1.5">
       <span className="text-[11px] uppercase tracking-[0.06em] text-tx-3">{label}</span>
@@ -242,7 +244,7 @@ function ComboField({ label, value, onChange, placeholder, options, hint }: {
       <span className="text-[11px] uppercase tracking-[0.06em] text-tx-3">{label}</span>
       <div className="drop field-drop" ref={ref}>
         <input
-          className="w-full bg-bg border border-line rounded-[7px] px-2.5 py-2 text-[13px] text-tx font-mono outline-none focus:border-accent-line"
+          className={`${INPUT_CLS} font-mono`}
           value={value}
           placeholder={placeholder}
           onChange={(e) => { onChange(e.target.value); setOpen(true) }}
@@ -337,9 +339,8 @@ function DetailsModal({ wf, onClose }: { wf: Workflow; onClose: () => void }) {
   )
 }
 
-/** The run this modal just started. It confirms the run reached the server and
- *  hands off to History rather than becoming a second live view of it — the same
- *  panel in two places is the same panel kept in sync by hand. */
+/** Confirms the run reached the server, then hands off to History rather than
+ *  becoming a second live view of it. */
 function StartedRun({ runId, onView, onClose }: { runId: string; onView: () => void; onClose: () => void }) {
   const { detail, load } = useRunDetail(runId, true, 'running')
   useEffect(() => { void load() }, [load])
@@ -364,10 +365,8 @@ function StartedRun({ runId, onView, onClose }: { runId: string; onView: () => v
   )
 }
 
-/** The first seconds of the run, so that Started is a fact about the ledger and
- *  not just about the POST. A hunt raises its approval checkpoint immediately, and
- *  whether policy answered it or the operator has to is the one thing worth
- *  knowing before this closes. */
+/** The first seconds of the run, so Started is a fact about the ledger and not
+ *  just about the POST — a hunt raises its approval checkpoint immediately. */
 function StartedPreview({ detail }: { detail: WfRunDetail | null }) {
   if (detail === null) {
     return <div className="muted text-[12px] w-full text-left px-3 py-2.5 rounded-[9px] border border-line-soft bg-bg">Waiting for the run to open its ledger…</div>
@@ -384,26 +383,21 @@ function StartedPreview({ detail }: { detail: WfRunDetail | null }) {
           {hunt ? `Iteration ${hunt.iteration} · ${hunt.evidence_count} piece(s) of evidence` : 'No checkpoint raised.'}
         </div>
       )}
-      {open !== null && (
-        <>
-          <div className="text-[10.5px] uppercase tracking-[0.05em] text-tx-faint mt-2 mb-1">Waiting on you</div>
-          <div className="text-[12px] text-tx-2 leading-[1.5]">{open.question}</div>
-        </>
-      )}
+      {hunt !== null && <OpenCheckpoint hunt={hunt} />}
     </div>
   )
 }
 
-/** What a hunt costs at most and what this deployment cannot answer. Both are
- *  knowable before the run, and both used to be knowable only after it. */
+/** Pre-run facts: what a hunt costs at most, and what this deployment cannot answer. */
 interface WfLimits {
   capabilities?: { bound: string[]; unbound: string[] }
   budgets?: { max_iterations: number; max_cost_usd: number }
+  /** exact, heuristic, zero or unknown — how confidently the model's rate resolved. */
+  pricing?: { model: string; source: string }
 }
 
-/** The ceiling, not an estimate. Observed cost per model call varies several-fold
- *  across runs because the transcript grows, so a per-turn figure would be
- *  invented precision; what is actually true is where the run stops. */
+/** The ceiling, not an estimate: per-call cost varies several-fold as the transcript
+ *  grows, so a per-turn figure would be invented precision. */
 function turnsHint(asked: string, cost: string, limits: WfLimits | null): string {
   const turns = asked.trim() === '' ? limits?.budgets?.max_iterations : Number(asked)
   const cap = cost.trim() === '' ? limits?.budgets?.max_cost_usd : Number(cost)
@@ -412,10 +406,8 @@ function turnsHint(asked: string, cost: string, limits: WfLimits | null): string
   return `${turns} turn(s): each is a lead decision, the workers it dispatches and the pass that argues against them.${where}`
 }
 
-/** What the hunt will not be able to look at, said before it costs anything. The
- *  hunt journals the same fact as a visibility gap, but only once the run is over
- *  — and "nothing was proven" then reads as a fact about the estate rather than
- *  about this deployment. */
+/** What the hunt will not be able to look at, said before the run costs anything.
+ *  The same fact reaches the journal only once the run is over. */
 function Blindness({ unbound }: { unbound: string[] }) {
   if (unbound.length === 0) return null
   const blind = unbound.includes('telemetry_search')
@@ -429,21 +421,74 @@ function Blindness({ unbound }: { unbound: string[] }) {
   )
 }
 
-/** Run a workflow — collects a target, then starts it on the agent layer. The
-    run is enqueued and answers with an id, so this hands off to History, which
-    already reports phases, beliefs and whatever the run is waiting on. */
+/** One belief per line — the same split the server does, so a pasted paragraph
+ *  with hard wraps is shown as the beliefs it would really become. */
+function parsedHypotheses(text: string): string[] {
+  return text.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+}
+
+/** The two fragment shapes that turn up: a lead-in ending in a colon, and a
+ *  wrapped line that does not start a sentence. */
+function looksUnfinished(line: string): boolean {
+  return line.endsWith(':') || /^[a-z]/.test(line)
+}
+
+function HypothesisPreview({ text }: { text: string }) {
+  const beliefs = parsedHypotheses(text)
+  if (beliefs.length === 0) return null
+  const suspect = beliefs.filter(looksUnfinished).length
+
+  return (
+    <div className="hyp-preview">
+      <div className="hyp-preview-head">
+        This puts <b>{beliefs.length}</b> belief{beliefs.length === 1 ? '' : 's'} on the board, plus the benign
+        account as the claim to beat.
+      </div>
+      <ol className="hyp-preview-list">
+        {beliefs.map((belief, at) => (
+          <li key={at} className={looksUnfinished(belief) ? 'suspect' : undefined}>
+            <span className="hyp-preview-n">H{at + 1}</span>
+            <span>{belief}</span>
+          </li>
+        ))}
+      </ol>
+      {suspect > 0 && (
+        <div className="hyp-preview-warn">
+          {suspect === 1 ? 'One line reads' : `${suspect} lines read`} as a fragment rather than a claim — a
+          wrapped sentence, or a lead-in. One belief per line: join the wrapped ones up, and drop anything that
+          is not a claim the hunt can argue against.
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** An unpriced model cannot be held to a cost ceiling, so the hunt stops a few
+ *  calls in. Said here, before the spend, rather than after it. */
+function Unpriced({ pricing }: { pricing?: { model: string; source: string } }) {
+  if (pricing === undefined || pricing.source !== 'unknown') return null
+  return (
+    <div className="text-[12.5px] leading-[1.5]" style={{ color: 'var(--high)' }}>
+      Nothing here can price {pricing.model}, so the hunt cannot hold itself to a cost
+      ceiling and will stop after its first few calls rather than run uncosted. Set a rate
+      for it, or pick a model that has one, before starting.
+    </div>
+  )
+}
+
+/** Run a workflow — collects a target, starts it on the agent layer, then hands
+    off to History, which reports phases, beliefs and anything the run waits on. */
 export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: () => void; onClose: () => void }) {
   const [findingId, setFindingId] = useState('')
   const [caseId, setCaseId] = useState('')
   const [context, setContext] = useState('')
   const [hypothesis, setHypothesis] = useState('')
+  const [approve, setApprove] = useState(false)
   const [iterations, setIterations] = useState('')
   const [maxCost, setMaxCost] = useState('')
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // The run this modal started. Held so the modal can stay open and watch it
-  // rather than closing and leaving the operator to find it in History.
-  const [startedId, setStartedId] = useState<string | null>(null)
+  const [startedId, setStartedId] = useState<string | null>(null) // watched in place, rather than closing
   const [limits, setLimits] = useState<WfLimits | null>(null)
   // Suggestions for the ID fields, fetched from the live findings/cases lists.
   const [findingOpts, setFindingOpts] = useState<{ id: string; label: string }[]>([])
@@ -461,8 +506,6 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
       const list = (r.data?.cases || []) as { case_id: string; title?: string }[]
       setCaseOpts(list.map((c) => ({ id: c.case_id, label: c.title || '' })))
     }).catch(() => {})
-    // What this deployment can answer and what a run costs at most. Both are
-    // facts before the run rather than after it, which is the whole point.
     workflowApi.get(wf.id).then((r) => {
       if (!cancelled) setLimits(r.data as WfLimits)
     }).catch(() => {})
@@ -481,16 +524,14 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
     ...(context.trim() && { context: context.trim() }),
     ...(hypothesis.trim() && { hypothesis: hypothesis.trim() }),
   }
-  // A turn count is not a target: on its own it says how long to run and never
-  // what to run on, so it is kept out of the check that a run has something to do.
+  // A turn count says how long to run, never what to run on, so it is not a target.
   const withTurns = {
     ...params,
     ...(isHunt && !turnsBad && iterations.trim() && { iterations: turns }),
     ...(isHunt && !costBad && maxCost.trim() && { max_cost_usd: cost }),
+    ...(isHunt && approve && { approve_hypotheses: true }),
   }
-  // Checked when Run is pressed rather than while the field is being filled in. A
-  // button that stays dead through a sentence, next to a hint that says "required",
-  // reads as an argument with the form instead of an answer about the run.
+  // Checked on Run, not per keystroke: a button dead through a sentence reads as an argument.
   const needsHypothesis = isHunt && hypothesis.trim() === ''
   const canRun = Object.keys(params).length > 0 && !turnsBad && !costBad && !starting
 
@@ -505,9 +546,7 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
       const res = await workflowApi.execute(wf.id, withTurns)
       const started = (res.data as { run_id?: string })?.run_id ?? null
       setStarting(false)
-      // Without an id there is nothing to confirm or link to, so go straight to
-      // History rather than sitting on a form that looks like it did nothing.
-      if (started === null) onStarted()
+      if (started === null) onStarted() // nothing to confirm or link to
       else setStartedId(started)
     } catch (e) {
       setError(errMsg(e))
@@ -515,8 +554,6 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
     }
   }
 
-  // Started: confirm it, show the first thing the ledger says, and let the
-  // operator decide whether to follow it into History.
   if (startedId !== null) {
     return (
       <Popup open onClose={onClose} title={`Run · ${wf.name}`}>
@@ -530,6 +567,7 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
       <div className="flex flex-col gap-3.5">
         <p className="text-[12.5px] text-tx-3 leading-[1.5]">Provide at least one target, then start the run — the agents work it on the server and History reports where it got to. A finding or case gives the run something to work from, and the report comes back onto the case you pick. A hunt tests what you state: each line of Hypothesis goes on the board as its own belief, and the benign explanation goes up beside them as the claim to beat.</p>
         {error && <div className="text-[12.5px] leading-[1.5]" style={{ color: 'var(--crit)' }}>{error}</div>}
+        {isHunt && <Unpriced pricing={limits?.pricing} />}
         {isHunt && <Blindness unbound={limits?.capabilities?.unbound ?? []} />}
         <ComboField label="Finding ID" value={findingId} onChange={setFindingId} placeholder="f-20260614-3b5c585e" options={findingOpts} hint={findingOpts.length ? `${findingOpts.length} recent findings — start typing to filter.` : undefined} />
         <ComboField label="Case ID" value={caseId} onChange={setCaseId} placeholder="case-2026-0142" options={caseOpts} />
@@ -544,6 +582,7 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
             ? 'One belief per line, each a claim the hunt can argue against. The benign account is added for you as the claim to beat.'
             : undefined}
         />
+        {isHunt && <HypothesisPreview text={hypothesis} />}
         {isHunt && (
           <Field
             label="Iterations"
@@ -563,6 +602,16 @@ export function RunModal({ wf, onStarted, onClose }: { wf: Workflow; onStarted: 
               ? 'A dollar amount above 0 and no more than 100.'
               : 'Dollars this run may spend before it stops and reports on what it has. The turn count above is the other ceiling; whichever it reaches first ends the run.'}
           />
+        )}
+        {isHunt && (
+          <label className="flex items-start gap-2 text-[12.5px] leading-[1.5] text-tx-2 cursor-pointer">
+            <input type="checkbox" className="mt-0.5" checked={approve} onChange={(e) => setApprove(e.target.checked)} />
+            <span>
+              Ask me before it starts. The hunt puts its board up and waits for approval in
+              History rather than approving itself — which is what a run with nobody watching
+              has to do, and why nothing asked you last time.
+            </span>
+          </label>
         )}
         <div className="flex justify-end gap-2.5 pt-1">
           <button className="btn ghost" onClick={onClose}>Cancel</button>
@@ -626,16 +675,16 @@ function HistoryModal({ wf, onClose }: { wf: Workflow; onClose: () => void }) {
   useEffect(() => load(), [load])
 
   return (
-    <Popup open onClose={onClose} title={`History · ${wf.name}`} width={840}>
+    <Popup open onClose={onClose} title={`History · ${wf.name}`} width="min(1400px, 94vw)">
       {phase === 'loading' && <EmptyState loading compact icon="clock" title="Loading run history…" />}
       {phase === 'error' && <EmptyState error compact icon="alert" title="Couldn’t load history" body={error} primary={{ label: 'Retry', onClick: load, icon: 'refresh' }} />}
       {phase === 'ready' && runs.length === 0 && <EmptyState compact icon="clock" title="No runs yet" body="Run this workflow to capture execution history, duration, trigger, and cost." />}
       {phase === 'ready' && runs.length > 0 && (
         <div className="table-wrap">
           <table className="tbl">
-            <thead><tr><th /><th>Status</th><th>Started</th><th>Duration</th><th>Trigger</th><th>Cost</th></tr></thead>
+            <thead><tr><th /><th>Status</th><th>Started</th><th>Duration</th><th>Trigger</th><th>Cost</th><th /></tr></thead>
             <tbody>
-              {runs.map((r) => <RunRow key={r.run_id} run={r} />)}
+              {runs.map((r) => <RunRow key={r.run_id} run={r} onRemoved={load} />)}
             </tbody>
           </table>
         </div>
@@ -659,18 +708,13 @@ interface HuntStanding {
   statement: string
   status: string
   attack_technique?: string | null
-  /** What evidence bearing on this belief cited. Earned rather than declared: the
-   *  playbook's technique list is the vocabulary a citation is gated against, and
-   *  nothing labels a hypothesis with one. */
+  /** Techniques cited by evidence bearing on this belief — earned, not declared. */
   techniques_cited?: string[]
   resolution_reason?: string | null
   /** hunt_spec, operator or base_rate — which belief the operator put up themselves. */
   provenance?: string
 }
-/** One record the hunt gathered. The panel used to report a count and nothing
- *  else, so an operator watching a run could read "4 pieces of evidence gathered"
- *  and never what any of them said — for the whole of the run, which is when
- *  somebody is watching. */
+/** One record the hunt gathered. */
 interface HuntEvidence {
   evidence_id: string
   iteration: number
@@ -680,11 +724,16 @@ interface HuntEvidence {
   salience?: string
   attack_technique?: string | null
   attacker_influenceable?: boolean
+  /** Whether anything the finding rests on was attested by the telemetry rather than
+   *  authored by the adversary. The projection computes it, so the console shows the
+   *  rule a verdict is gated on rather than a second opinion about it. */
+  sensor_attested?: boolean
+  rests_on?: { field: string; authored: 'sensor' | 'adversary' | 'third_party' }[]
   instruction_like?: boolean
   provenance?: string
   is_gap?: boolean
-  /** Why the hunt could not look. Kept out of the summary so the hunt does not read
-   *  its own plumbing as telemetry, so this is the only place an operator sees it. */
+  /** Why the hunt could not look — kept out of the summary so plumbing is not read
+   *  as telemetry, which makes this the only place an operator sees it. */
   gap_detail?: string | null
   bears_on?: { hypothesis_id: string; relation: string }[]
 }
@@ -704,6 +753,39 @@ interface HuntCheckpoint {
   question: string
   resolution?: { answer: string; actor: string; text?: string } | null
 }
+/** A lead opened and not yet taken; an operator pins one with a boost directive. */
+interface HuntQuestion {
+  question_id: string
+  question: string
+  entity_key?: string | null
+  hypothesis_id?: string | null
+  spawned_iteration?: number
+}
+
+/** One move the Hunt Lead made. The rationale is the whole of why a hunt did what
+ *  it did, and rejected_attempts is the only account of a turn that stalled. */
+interface HuntMove {
+  decision_id: string
+  iteration: number
+  action: string
+  rationale: string
+  target_entity?: string | null
+  target_hypothesis_id?: string | null
+  query_intent?: string
+  worker_agent_id?: string | null
+  cost_usd?: number
+  rejected_attempts?: string[]
+}
+/** The account of the run, as data. next_steps arrive already normalised to
+ *  strings, so this side never has two shapes to read. */
+interface HuntNarrative {
+  summary: string
+  what_happened: string
+  next_steps: string[]
+  model_id: string
+  written_at: string
+}
+
 interface HuntHandoff {
   case_id: string
   hypothesis_id: string
@@ -730,28 +812,21 @@ interface HuntBudgets {
   max_cost_usd: number
 }
 interface HuntView {
-  // The projection has always carried it; the type never said so.
   run_id?: string
   status: string
-  // Why it ended, which is not the same as whether it succeeded: a hunt stopped at
-  // its ceiling finalises as completed, and saying only that hides the ceiling.
+  /** Why it ended, which is not whether it succeeded: a hunt stopped at its ceiling
+   *  finalises as completed. */
   outcome?: string | null
-  /** Why it ended, in the hunt's own words — which arm of the budget bound, or what
-   *  an operator did. Not an error: a run that stopped at its ceiling did what it
-   *  was told. */
+  /** Which arm of the budget bound, or what an operator did. Not an error. */
   reason?: string | null
   iteration: number
   evidence_count: number
   /** Capped by the projection; evidence_count stays the untruncated total. */
   evidence?: HuntEvidence[]
   cost_usd?: number
-  // What this run was granted, extensions included — so progress is against the
-  // budget the operator asked for rather than against the shipped default.
+  /** What this run was granted, extensions included — not the shipped default. */
   budgets?: HuntBudgets
   hypotheses: HuntStanding[]
-  // The whole record, not just its question. The wire has carried these fields
-  // since the projection did; the type stopped at the question, so a console that
-  // could see a run was waiting could not say what on, or answer it.
   open_checkpoint?: {
     checkpoint_id: string
     checkpoint_class?: string
@@ -761,7 +836,10 @@ interface HuntView {
   } | null
   report?: HuntReport | null
   report_markdown?: string | null
+  narrative?: HuntNarrative | null
   handoffs?: HuntHandoff[]
+  moves?: HuntMove[]
+  open_questions?: HuntQuestion[]
 }
 interface WfRunDetail extends WfRun {
   result_summary?: string | null
@@ -769,14 +847,11 @@ interface WfRunDetail extends WfRun {
   hunt?: HuntView | null
 }
 
-// A run in flight moves on its own. Fetched once, the panel showed the iteration
-// the run happened to be on when it was opened and never moved again.
 const RUN_POLL_MS = 5_000
 const IN_FLIGHT = ['running', 'paused', 'pending']
 
-/** One run's detail, refreshed while it is in flight. Extracted so the modal that
- *  started a run watches it with the same code the history row does — the run is
- *  the same run, and two pollers would be two answers to one question. */
+/** One run's detail, refreshed while it is in flight. Shared by the start modal and
+ *  the history row so one run has one poller. */
 export function useRunDetail(runId: string, watching: boolean, seed?: string) {
   const [detail, setDetail] = useState<WfRunDetail | null>(null)
   const [dphase, setDphase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
@@ -790,8 +865,7 @@ export function useRunDetail(runId: string, watching: boolean, seed?: string) {
     [runId],
   )
 
-  // Stops on its own when the run reaches a terminal status: a finished run has
-  // nothing further to report, and the row would otherwise poll for the session.
+  // Stops itself at a terminal status rather than polling for the session.
   const live = watching && IN_FLIGHT.includes(detail?.status ?? seed ?? 'running')
   useEffect(() => {
     if (!live) return
@@ -802,8 +876,42 @@ export function useRunDetail(runId: string, watching: boolean, seed?: string) {
   return { detail, dphase, setDphase, load }
 }
 
+/** Takes a finished run out of History. Two clicks rather than a browser confirm,
+ *  since the row is one of fifty. A run in flight is ended with cancel, not this. */
+function RemoveRun({ run, onRemoved }: { run: WfRun; onRemoved: () => void }) {
+  const [asked, setAsked] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [failed, setFailed] = useState<string | null>(null)
+
+  if (IN_FLIGHT.includes(run.status)) return null
+
+  const remove = () => {
+    setBusy(true)
+    setFailed(null)
+    workflowApi
+      .deleteRun(run.run_id)
+      .then(() => onRemoved())
+      .catch((e) => { setFailed(errMsg(e)); setBusy(false); setAsked(false) })
+  }
+
+  if (failed !== null) return <span className="text-[11px]" style={{ color: 'var(--crit)' }} title={failed}>failed</span>
+  if (!asked) {
+    return (
+      <button className="btn ghost icon" title="Remove this run from History" onClick={() => setAsked(true)}>
+        <Icon name="trash" size={13} />
+      </button>
+    )
+  }
+  return (
+    <span className="flex gap-1.5 items-center">
+      <button className="btn ghost text-[11px]" disabled={busy} onClick={remove}>{busy ? 'removing…' : 'remove'}</button>
+      <button className="btn ghost text-[11px]" disabled={busy} onClick={() => setAsked(false)}>keep</button>
+    </span>
+  )
+}
+
 /** A run row that lazily fetches its full detail (getRun) when expanded. */
-function RunRow({ run }: { run: WfRun }) {
+function RunRow({ run, onRemoved }: { run: WfRun; onRemoved: () => void }) {
   const [open, setOpen] = useState(false)
   const { detail, dphase, setDphase, load } = useRunDetail(run.run_id, open, run.status)
 
@@ -828,10 +936,11 @@ function RunRow({ run }: { run: WfRun }) {
         <td className="muted">{fmtDuration(run.duration_ms)}</td>
         <td className="muted">{run.triggered_by || '—'}</td>
         <td className="muted">{run.total_cost_usd ? `$${run.total_cost_usd.toFixed(3)}` : '—'}</td>
+        <td className="tight" onClick={(e) => e.stopPropagation()}><RemoveRun run={run} onRemoved={onRemoved} /></td>
       </tr>
       {open && (
         <tr className="run-detail-row">
-          <td colSpan={6}>
+          <td colSpan={7}>
             {dphase === 'loading' && <div className="muted" style={{ padding: '10px 4px' }}>Loading run detail…</div>}
             {dphase === 'error' && <div className="muted" style={{ padding: '10px 4px' }}>Couldn’t load run detail.</div>}
             {dphase === 'ready' && detail && <RunDetail d={detail} onSteered={load} />}
@@ -839,6 +948,54 @@ function RunRow({ run }: { run: WfRun }) {
         </tr>
       )}
     </>
+  )
+}
+
+/** A hunt that hit its own ceiling and waits to be told what to do next. It is not
+ *  a checkpoint and not an ending, so nothing else on the panel reports it. */
+function Parked({ hunt }: { hunt: HuntView }) {
+  if (hunt.status !== 'parked' || hunt.open_checkpoint) return null
+  return (
+    <div className="text-[12.5px] leading-[1.5] mt-2" style={{ color: 'var(--high)' }}>
+      Stopped and waiting: {hunt.reason || 'the hunt reached one of its own ceilings'}. It keeps
+      everything it has found: use <b>Keep going</b> below to let it carry on from here, or
+      conclude to have it write up what it has.
+    </div>
+  )
+}
+
+/** H1, H2 … in board order, so a table of records reads as beliefs rather than
+ *  hashes. The id stays on the element's title, since the ledger and report use it. */
+const HypLabels = createContext<ReadonlyMap<string, string>>(new Map())
+
+function labelsOf(hypotheses: readonly HuntStanding[]): ReadonlyMap<string, string> {
+  return new Map(hypotheses.map((h, at) => [h.hypothesis_id, `H${at + 1}`]))
+}
+
+/** Falls back to the id rather than hiding a reference the board does not hold: a
+ *  link to a hypothesis this projection never carried is worth seeing, not eliding. */
+function Hyp({ id }: { id?: string | null }) {
+  const labels = useContext(HypLabels)
+  if (!id) return <span className="muted">unattributed</span>
+  return <span className="hyp-ref" title={id}>{labels.get(id) ?? id}</span>
+}
+
+/** What the hunt is asking someone to do — the one thing here somebody acts on. */
+function HuntActions({ hunt }: { hunt: HuntView }) {
+  const steps = hunt.narrative?.next_steps ?? []
+  if (steps.length === 0) return null
+  return (
+    <div className="hunt-actions">
+      <div className="hunt-actions-head">What to do now</div>
+      <ol className="hunt-actions-list">
+        {steps.map((step, at) => (
+          <li key={at}>
+            <span className="hunt-actions-n">{at + 1}</span>
+            <span>{step}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
   )
 }
 
@@ -850,10 +1007,11 @@ export function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => v
     <div className="run-detail">
       <RunBar d={d} hunt={hunt} onSteered={onSteered} />
       {hunt && <OpenCheckpoint hunt={hunt} />}
+      {hunt && <Parked hunt={hunt} />}
       {hunt?.reason && !IN_FLIGHT.includes(d.status) && (
         <div className="muted text-[12px] leading-[1.5] mt-2">Why it ended: {hunt.reason}</div>
       )}
-      {d.error && (
+      {d.error && d.error !== hunt?.reason && (
         <div className="modal-section">
           <h4 style={{ color: 'var(--crit)' }}>Error</h4>
           <pre className="font-mono text-[11.5px] leading-[1.5] whitespace-pre-wrap m-0" style={{ color: 'var(--crit)' }}>{d.error}</pre>
@@ -865,9 +1023,8 @@ export function RunDetail({ d, onSteered }: { d: WfRunDetail; onSteered: () => v
   )
 }
 
-/** What the run is doing and the one control that ends it. Stop belongs with the
- *  run's own status rather than among the steering directives: those are notes the
- *  lead reads at its next turn, this ends the run and its spend. */
+/** What the run is doing, and Stop. It sits with the status rather than among the
+ *  steering directives, which are only notes the lead reads at its next turn. */
 function RunBar({ d, hunt, onSteered }: { d: WfRunDetail; hunt: HuntView | null; onSteered: () => void }) {
   const cost = hunt?.cost_usd ?? d.total_cost_usd
   const budgets = hunt?.budgets
@@ -902,9 +1059,8 @@ function RunBar({ d, hunt, onSteered }: { d: WfRunDetail; hunt: HuntView | null;
   )
 }
 
-/** Ending a run cannot be undone and stops real spend, so it asks first and says
- *  what it means. It goes through cancel rather than steer because a queued abort
- *  needs a live worker to read it, and cancel escalates behind one that cannot. */
+/** Ending a run cannot be undone, so it asks first. Goes through cancel, not steer:
+ *  a queued abort needs a live worker, and cancel escalates behind one that cannot. */
 function StopRun({ runId, onStopped }: { runId: string; onStopped: () => void }) {
   const [asking, setAsking] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -938,35 +1094,36 @@ function StopRun({ runId, onStopped }: { runId: string; onStopped: () => void })
   )
 }
 
-type HuntTab = 'hyp' | 'evidence' | 'gaps' | 'esc' | 'report'
+type HuntTab = 'hyp' | 'evidence' | 'moves' | 'frontier' | 'gaps' | 'esc' | 'report' | 'next'
 
-/** Five stacked tables ran the panel past the bottom of the modal and squeezed
- *  prose into a sideways scroll. They are four views of one run, so they are tabs;
- *  a view with nothing in it is not offered rather than offered empty. */
+/** Views of one run as tabs rather than stacked tables. A view with nothing in it
+ *  is not offered rather than offered empty. */
 function HuntTabs({ d, hunt }: { d: WfRunDetail; hunt: HuntView }) {
   const found = hunt.evidence ?? []
-  // Live rather than only from the finalized report: report.gaps exists once the
-  // hunt writes a report, so mid-run the operator could not see what it had failed
-  // to look at — which is the half of a hunt that costs money to rediscover.
+  // Live, not only from the finalized report, so gaps are visible mid-run.
   const gaps = hunt.report?.gaps ?? found.filter((one) => one.is_gap).map(liveGap)
   const checkpoints = hunt.report?.checkpoints ?? []
   const handoffs = hunt.handoffs ?? []
   const report = hunt.report_markdown ?? d.result_summary ?? ''
   const supervision = handoffs.length + checkpoints.length
+  const moves = hunt.moves ?? []
+  const frontier = hunt.open_questions ?? []
+  const steps = hunt.narrative?.next_steps ?? []
   const tabs: [HuntTab, string, number | null][] = [
     ['hyp', 'Hypotheses', hunt.hypotheses.length],
     ...(hunt.evidence_count > 0 ? ([['evidence', 'Evidence', hunt.evidence_count]] as [HuntTab, string, number][]) : []),
+    ...(moves.length > 0 ? ([['moves', 'Moves', moves.length]] as [HuntTab, string, number][]) : []),
+    ...(frontier.length > 0 ? ([['frontier', 'Frontier', frontier.length]] as [HuntTab, string, number][]) : []),
     ...(gaps.length > 0 ? ([['gaps', 'Gaps', gaps.length]] as [HuntTab, string, number][]) : []),
     ...(supervision > 0 ? ([['esc', 'Escalations & checkpoints', supervision]] as [HuntTab, string, number][]) : []),
     ['report', 'Report', null],
+    ...(steps.length > 0 ? ([['next', 'Next steps', steps.length]] as [HuntTab, string, number][]) : []),
   ]
-  // Decided at mount, so a report landing mid-poll does not move the tab the
-  // operator is reading out from under them.
-  const [tab, setTab] = useState<HuntTab>(report === '' ? 'hyp' : 'report')
+  const [tab, setTab] = useState<HuntTab>(report === '' ? 'hyp' : 'report') // at mount, so a poll cannot move it
   const shown = tabs.some(([k]) => k === tab) ? tab : 'hyp'
 
   return (
-    <>
+    <HypLabels.Provider value={labelsOf(hunt.hypotheses)}>
       <div className="detail-tabs" role="tablist" aria-label="Hunt views">
         {tabs.map(([k, label, count]) => (
           <button key={k} role="tab" aria-selected={shown === k} className={`tab${shown === k ? ' active' : ''}`} onClick={() => setTab(k)}>
@@ -976,6 +1133,8 @@ function HuntTabs({ d, hunt }: { d: WfRunDetail; hunt: HuntView }) {
       </div>
       {shown === 'hyp' && <HuntStandings hunt={hunt} />}
       {shown === 'evidence' && <HuntEvidenceTable found={found} total={hunt.evidence_count} />}
+      {shown === 'moves' && <HuntMoves moves={moves} />}
+      {shown === 'frontier' && <HuntFrontier runId={d.run_id} frontier={frontier} inFlight={IN_FLIGHT.includes(d.status)} />}
       {shown === 'gaps' && <HuntGaps gaps={gaps} />}
       {shown === 'esc' && (
         <>
@@ -985,8 +1144,119 @@ function HuntTabs({ d, hunt }: { d: WfRunDetail; hunt: HuntView }) {
       )}
       {shown === 'report' && (report === ''
         ? <div className="muted text-[12.5px] py-3">The report is written when the hunt reaches a terminal state — completed, cancelled, or stopped at its budget.</div>
-        : <ReportBody md={report} />)}
-    </>
+        : <HuntAccount hunt={hunt} report={report} gaps={gaps.length} onGo={setTab} />)}
+      {shown === 'next' && <HuntActions hunt={hunt} />}
+    </HypLabels.Provider>
+  )
+}
+
+/** The account, laid out — what happened, with the tabs carrying the evidence and
+ *  metadata the report also lists. The markdown itself is untouched. */
+function HuntAccount({ hunt, report, gaps, onGo }: { hunt: HuntView; report: string; gaps: number; onGo: (tab: HuntTab) => void }) {
+  const account = hunt.narrative ?? null
+  if (account === null) { // no narrative written: show the whole report rather than nothing
+    return (
+      <>
+        <div className="hunt-account-foot" style={{ marginTop: 0, borderTop: 'none', paddingTop: 0 }}>
+          <span className="muted text-[11.5px]">No account was written for this run.</span>
+          <span className="flex-1" />
+          <CopyReport md={report} />
+        </div>
+        <ReportBody md={withoutHeader(report)} />
+      </>
+    )
+  }
+
+  return (
+    <div className="hunt-account">
+      <p className="hunt-lede">{account.summary}</p>
+      <VerdictStrip hunt={hunt} onGo={onGo} />
+      <Incidents md={account.what_happened} />
+      <div className="hunt-account-foot">
+        <span className="muted text-[11.5px]">
+          {hunt.evidence_count} record(s) gathered · {gaps} blind spot(s)
+        </span>
+        <button className="btn ghost text-[11px]" onClick={() => onGo('evidence')}>Evidence ▸</button>
+        {gaps > 0 && <button className="btn ghost text-[11px]" onClick={() => onGo('gaps')}>Gaps ▸</button>}
+        <span className="flex-1" />
+        <CopyReport md={report} />
+      </div>
+      <div className="muted text-[11px] mt-2">
+        Written from the ledger by {account.model_id}. The tabs above are the hunt's own record; this is an account of it.
+      </div>
+    </div>
+  )
+}
+
+/** Drops the report's metadata header, which the run bar above already shows. The
+ *  markdown the copy control hands over keeps it. */
+function withoutHeader(md: string): string {
+  const at = md.indexOf('\n## ')
+  return at === -1 ? md : md.slice(at + 1)
+}
+
+/** The account writes what happened as a section per incident; split on the headings
+ *  it already put there rather than rendering one continuous wall. */
+function Incidents({ md }: { md: string }) {
+  const parts = md.split(/^### /m).map((part) => part.trim()).filter((part) => part !== '')
+  if (!md.trimStart().startsWith('### ') || parts.length < 2) return <ReportBody md={md} /> // one story, told whole
+
+  return (
+    <div className="incidents">
+      {parts.map((part, at) => {
+        const brk = part.indexOf('\n')
+        const title = (brk === -1 ? part : part.slice(0, brk)).trim()
+        const body = brk === -1 ? '' : part.slice(brk + 1).trim()
+        return (
+          <section className="incident" key={at}>
+            <h4 className="incident-h">
+              <span className="incident-n">{String(at + 1).padStart(2, '0')}</span>
+              <span>{title}</span>
+            </h4>
+            {body !== '' && <ReportBody md={body} />}
+          </section>
+        )
+      })}
+    </div>
+  )
+}
+
+/** Where the beliefs landed, grouped by standing — a chip per belief would restate
+ *  the board rather than report a verdict. */
+function VerdictStrip({ hunt, onGo }: { hunt: HuntView; onGo: (tab: HuntTab) => void }) {
+  if (hunt.hypotheses.length === 0) return null
+  const asked = hunt.hypotheses.filter((h) => h.provenance !== 'base_rate') // the loop's own claim, not the operator's
+  if (asked.length === 0) return null
+  const byStatus = new Map<string, number>()
+  for (const h of asked) byStatus.set(h.status, (byStatus.get(h.status) ?? 0) + 1)
+
+  return (
+    <div className="verdict-strip">
+      {[...byStatus].map(([status, n]) => (
+        <span key={status} className="verdict-chip">
+          <span className="dot" style={{ background: hypothesisColor(status) }} />
+          <b>{n}</b>
+          <span style={{ color: hypothesisColor(status) }}>{status}</span>
+        </span>
+      ))}
+      <button className="btn ghost text-[11px]" onClick={() => onGo('hyp')}>
+        {asked.length} belief{asked.length === 1 ? '' : 's'} tested ▸
+      </button>
+    </div>
+  )
+}
+
+/** The markdown is the deliverable; not rendering it inline is not taking it away. */
+function CopyReport({ md }: { md: string }) {
+  const [said, setSaid] = useState(false)
+  const copy = () => {
+    void navigator.clipboard?.writeText(md).then(() => {
+      setSaid(true)
+      setTimeout(() => setSaid(false), 1600)
+    })
+  }
+  return (
+    <button className="btn ghost text-[11px]" onClick={copy}>{said ? 'copied' : 'copy full report'}</button>
   )
 }
 
@@ -1001,23 +1271,178 @@ function liveGap(one: HuntEvidence): HuntGap {
   }
 }
 
-/** What the hunt has gathered, and what each record bears on. Gaps are folded in
- *  rather than hidden: "we looked and it was not there" and "we could not look" are
- *  both here, and the flag says which. */
-function HuntEvidenceTable({ found, total }: { found: HuntEvidence[]; total: number }) {
-  if (found.length === 0) {
-    return <div className="muted text-[12.5px] py-3">{total} record(s) gathered, none reported by this run yet.</div>
+/** The leads waiting to be taken. Pinning is queued like every other directive, so
+ *  the row says the ask was sent rather than that the hunt obeyed. */
+function HuntFrontier({ runId, frontier, inFlight }: { runId: string; frontier: HuntQuestion[]; inFlight: boolean }) {
+  const [pinned, setPinned] = useState<Record<string, string>>({})
+  const pin = (questionId: string) => {
+    setPinned((held) => ({ ...held, [questionId]: 'sending' }))
+    workflowApi
+      .steer(runId, 'boost', '', { question_id: questionId })
+      .then(() => setPinned((held) => ({ ...held, [questionId]: 'pinned for the next turn' })))
+      .catch((e) => setPinned((held) => ({ ...held, [questionId]: errMsg(e) })))
   }
   return (
     <div style={{ marginTop: 12 }}>
-      <div className="muted text-[11.5px] mb-2">
-        Newest first{found.length < total && `, showing ${found.length} of ${total}`}.
+      <div className="muted text-[11.5px] mb-2">Open leads, in the order a worker would take them.</div>
+      <div className="table-wrap">
+        <table className="tbl">
+          <thead><tr><th className="tight">Opened</th><th>Lead</th><th className="tight">Bears on</th><th className="tight" /></tr></thead>
+          <tbody>
+            {frontier.map((q) => (
+              <tr key={q.question_id}>
+                <td className="muted tight">{q.spawned_iteration ?? '—'}</td>
+                <td>
+                  {q.question}
+                  {q.entity_key && <div className="muted mono text-[11px]">{q.entity_key}</div>}
+                </td>
+                <td className="muted tight"><Hyp id={q.hypothesis_id} /></td>
+                <td className="tight">
+                  {pinned[q.question_id]
+                    ? <span className="muted text-[11px]">{pinned[q.question_id]}</span>
+                    : inFlight && <button className="btn ghost" onClick={() => pin(q.question_id)} title="Ask the lead to take this one next.">take next</button>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+/** Why an emission was refused, without the emission. The rejection carries the
+ *  validator's complaint and then the whole payload it complained about — hundreds of
+ *  characters of the model's own prose, cut off mid-word, in a table cell. The
+ *  complaint names the field; the payload is the digest the lead already reads. */
+export function refusalReason(rejection: string): string {
+  const payloadAt = rejection.indexOf('{')
+  const complaint = (payloadAt === -1 ? rejection : rejection.slice(0, payloadAt)).replace(/[:\s]+$/, '')
+  if (complaint === '') return 'the emission did not match the schema'
+  return complaint.length > 160 ? `${complaint.slice(0, 160)}…` : complaint
+}
+
+/** Every move the lead made and why — the only account of what a turn decided, and
+ *  of a turn that stalled. */
+function HuntMoves({ moves }: { moves: HuntMove[] }) {
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div className="muted text-[11.5px] mb-2">Newest first. One decision per turn; a turn may re-ask after a refused emission.</div>
+      <div className="table-wrap">
+        <table className="tbl">
+          <thead><tr><th className="tight">Turn</th><th className="tight">Move</th><th>Why</th><th className="tight">On</th></tr></thead>
+          <tbody>
+            {moves.map((m) => (
+              <tr key={m.decision_id}>
+                <td className="muted tight">{m.iteration}</td>
+                <td className="tight mono text-[11px]">{m.action}</td>
+                <td>
+                  {m.rationale}
+                  {m.query_intent && <div className="muted text-[11px] mt-0.5">asked: {m.query_intent}</div>}
+                  {/* The entity and the worker live here rather than in On: an ip or a
+                      role name in a tight column wrapped a character to a line. */}
+                  {(m.target_entity || m.worker_agent_id) && (
+                    <div className="flex gap-1.5 flex-wrap mt-1">
+                      {m.target_entity && <span className="chip mono" style={{ fontSize: 10 }}>{m.target_entity}</span>}
+                      {m.worker_agent_id && <span className="chip" style={{ fontSize: 10 }}>{m.worker_agent_id}</span>}
+                    </div>
+                  )}
+                  {!!m.rejected_attempts?.length && (
+                    <div className="text-[11px] mt-1" style={{ color: 'var(--high)' }}>
+                      {m.rejected_attempts.length} emission(s) refused first — {refusalReason(m.rejected_attempts[0]!)}
+                    </div>
+                  )}
+                </td>
+                <td className="tight"><Hyp id={m.target_hypothesis_id} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+/** The lead rules every observation against every active belief, so most rulings are
+ *  `neither`. Those stay on the ledger rather than filling a cell. */
+type Bears = NonNullable<HuntEvidence['bears_on']>
+
+function bearing(links: HuntEvidence['bears_on']): { shown: Bears; ruledOut: number } {
+  const all: Bears = links ?? []
+  const shown = all.filter((link) => link.relation !== 'neither')
+  return { shown, ruledOut: all.length - shown.length }
+}
+
+/** Grouped by relation, not one line per link: a record weakening three beliefs
+ *  printed "weakens" three times down a narrow column and made the row taller than
+ *  the summary it belongs to. The relation is the fact; the beliefs are a list. */
+function BearsOn({ links }: { links: HuntEvidence['bears_on'] }) {
+  const { shown, ruledOut } = bearing(links)
+  if (shown.length > 0) {
+    const byRelation = new Map<string, string[]>()
+    for (const link of shown) byRelation.set(link.relation, [...(byRelation.get(link.relation) ?? []), link.hypothesis_id])
+    return (
+      <>
+        {[...byRelation].map(([relation, ids]) => (
+          <div key={relation} className="whitespace-nowrap">
+            {relation}{' '}
+            {ids.map((id) => <Fragment key={id}><Hyp id={id} /> </Fragment>)}
+          </div>
+        ))}
+      </>
+    )
+  }
+  // A record weighed and set aside is not one nobody has ruled on yet.
+  if (ruledOut > 0) return <span className="muted" title={`ruled against ${ruledOut} belief(s), bears on none`}>bears on none</span>
+  return <span className="muted">nothing yet</span>
+}
+
+/** Whether a verdict may rest on this record, and which values an adversary chose.
+ *  "attacker-influenceable" was on every record of a real run: in a hunt the adversary's
+ *  behaviour is the signal, so attacker-caused is universal and said nothing. What a
+ *  reader needs is whether anything here was attested by the telemetry. */
+function Attested({ record }: { record: HuntEvidence }) {
+  const authored = (record.rests_on ?? []).filter((basis) => basis.authored !== 'sensor')
+  const attested = record.sensor_attested ?? !record.attacker_influenceable
+  return (
+    <>
+      {!attested && (
+        <span style={{ color: 'var(--high)' }} title="No value this finding rests on was attested by the telemetry, so it cannot carry a verdict on its own.">
+          nothing sensor-attested
+        </span>
+      )}
+      {authored.length > 0 && (
+        <span className="muted" title={authored.map((basis) => `${basis.field}: ${basis.authored}`).join(', ')}>
+          {authored.length} attacker-authored field{authored.length === 1 ? '' : 's'}
+        </span>
+      )}
+    </>
+  )
+}
+
+function HuntEvidenceTable({ found, total }: { found: HuntEvidence[]; total: number }) {
+  const [showRoutine, setShowRoutine] = useState(false)
+  if (found.length === 0) {
+    return <div className="muted text-[12.5px] py-3">{total} record(s) gathered, none reported by this run yet.</div>
+  }
+  // A negative result is evidence, so routine records are folded rather than dropped.
+  const routine = found.filter((one) => one.salience === 'routine' && !one.is_gap)
+  const rows = showRoutine ? found : found.filter((one) => !routine.includes(one))
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div className="muted text-[11.5px] mb-2 flex gap-2 items-center flex-wrap">
+        <span>Newest first{found.length < total && `, showing ${found.length} of ${total}`}.</span>
+        {routine.length > 0 && (
+          <button className="btn ghost text-[11px]" onClick={() => setShowRoutine((v) => !v)}>
+            {showRoutine ? `hide ${routine.length} routine` : `${routine.length} routine hidden`}
+          </button>
+        )}
       </div>
       <div className="table-wrap">
         <table className="tbl">
           <thead><tr><th className="tight">Turn</th><th className="tight">Source</th><th>What it says</th><th className="tight">Bears on</th></tr></thead>
           <tbody>
-            {found.map((one) => (
+            {rows.map((one) => (
               <tr key={one.evidence_id}>
                 <td className="muted tight">{one.iteration}</td>
                 <td className="muted tight">{one.source_system || '—'}</td>
@@ -1029,17 +1454,11 @@ function HuntEvidenceTable({ found, total }: { found: HuntEvidence[]; total: num
                     {one.is_gap && one.gap_detail && <span className="muted mono break-all">{one.gap_detail}</span>}
                     {one.salience && !one.is_gap && <span className="muted">{one.salience}</span>}
                     {one.attack_technique && <span className="muted mono">{one.attack_technique}</span>}
-                    {one.attacker_influenceable && <span style={{ color: 'var(--high)' }}>attacker-influenceable</span>}
+                    <Attested record={one} />
                     {one.instruction_like && <span style={{ color: 'var(--crit)' }}>reads as instruction</span>}
                   </div>
                 </td>
-                <td className="muted tight">
-                  {(one.bears_on ?? []).length === 0
-                    ? 'nothing yet'
-                    : (one.bears_on ?? []).map((link) => (
-                        <div key={link.hypothesis_id}>{link.relation} {link.hypothesis_id}</div>
-                      ))}
-                </td>
+                <td className="muted"><BearsOn links={one.bears_on} /></td>
               </tr>
             ))}
           </tbody>
@@ -1088,8 +1507,7 @@ function ComposeDetail({ d }: { d: WfRunDetail }) {
   )
 }
 
-/** Markdown at the panel's own type scale rather than the document scale it is
- *  written at. */
+/** Markdown at the panel's type scale rather than the document scale it is written at. */
 function ReportBody({ md }: { md: string }) {
   return (
     <div className="text-[12.5px] text-tx-2 leading-[1.55] [&_h1]:text-[15px] [&_h1]:font-semibold [&_h2]:text-[13.5px] [&_h2]:font-semibold [&_h3]:text-[12.5px] [&_h3]:font-semibold [&_h1]:mt-1 [&_h2]:mt-2.5 [&_h3]:mt-2">
@@ -1098,16 +1516,24 @@ function ReportBody({ md }: { md: string }) {
   )
 }
 
-/** Steer a run that is still going. Queued for the worker holding the ledger,
- *  which is what turns a directive into an event on it — so nothing here is
- *  instant, and the panel re-reads rather than claiming the run obeyed. */
+/** Steer a run that is still going. Queued for the worker holding the ledger, so
+ *  nothing here is instant and the panel re-reads rather than claiming it obeyed. */
+/** What one press of extend buys. Sent as a typed grant rather than as prose the run
+ *  has to parse: `extend` with an empty note parsed to nothing, journaled a note saying
+ *  so, and left the hunt parked at the ceiling it was asking to be let past. */
+const GRANTS: [string, { iterations: number; cost_usd: number; wall_ms: number }][] = [
+  ['+3 turns', { iterations: 3, cost_usd: 0, wall_ms: 0 }],
+  ['+$5', { iterations: 0, cost_usd: 5, wall_ms: 0 }],
+  ['+30 min', { iterations: 0, cost_usd: 0, wall_ms: 30 * 60_000 }],
+]
+
 function Steer({ runId, hunt, onSteered }: { runId: string; hunt: boolean; onSteered: () => void }) {
   const [note, setNote] = useState('')
   const [entity, setEntity] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [said, setSaid] = useState<string | null>(null)
 
-  const send = (kind: string, text: string, fields?: Record<string, string>) => {
+  const send = (kind: string, text: string, fields?: Record<string, unknown>) => {
     setBusy(kind)
     setSaid(null)
     workflowApi
@@ -1117,19 +1543,16 @@ function Steer({ runId, hunt, onSteered }: { runId: string; hunt: boolean; onSte
       .finally(() => setBusy(null))
   }
 
-  // A hunt is the only kind with beliefs to extend or a verdict to be told to
-  // reach. Ending the run is not one of these and lives in the status bar.
-  const kinds = hunt ? ['conclude', 'extend'] : []
-
   return (
     <div className="modal-section">
       <h4>Steer</h4>
+      {hunt && <SteerExtend busy={busy !== null} note={note} send={send} />}
       <div className="flex gap-2 items-center flex-wrap">
-        {kinds.map((kind) => (
-          <button key={kind} className="btn ghost" disabled={busy !== null} onClick={() => send(kind, note.trim())}>
-            {kind}
+        {hunt && (
+          <button className="btn ghost" disabled={busy !== null} onClick={() => send('conclude', note.trim())}>
+            conclude
           </button>
-        ))}
+        )}
         <TextInput
           className="grow"
           placeholder="A note for the run — sent with the button you press, or on its own."
@@ -1146,9 +1569,35 @@ function Steer({ runId, hunt, onSteered }: { runId: string; hunt: boolean; onSte
   )
 }
 
-/** The two directives that name something rather than just saying something: a
- *  known-benign entity the hunt should stop opening work on, and a blind spot no
- *  query would ever report. Both need a typed field the note cannot carry. */
+/** Keep going, by a stated amount. The amount is the whole of the directive — an extend
+ *  that grants nothing is refused now, so there is no press that quietly does nothing. */
+function SteerExtend({
+  busy, note, send,
+}: {
+  busy: boolean
+  note: string
+  send: (kind: string, text: string, fields?: Record<string, unknown>) => void
+}) {
+  return (
+    <div className="flex gap-2 items-center flex-wrap mb-2">
+      <span className="text-[11.5px] text-tx-3">Keep going:</span>
+      {GRANTS.map(([label, grant]) => (
+        <button
+          key={label}
+          className="btn ghost"
+          disabled={busy}
+          title={`extend this run by ${label.replace('+', '')} and let it carry on from where it parked`}
+          onClick={() => send('extend', note.trim(), { grant })}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** The directives that name something rather than just say something, and so need a
+ *  typed field the note cannot carry. */
 function SteerEntity({
   busy, entity, setEntity, note, send,
 }: {
@@ -1173,6 +1622,14 @@ function SteerEntity({
         onClick={() => send('benign', note.trim(), { entity_key: entity.trim() })}
       >
         known-benign
+      </button>
+      <button
+        className="btn ghost"
+        disabled={busy || !note.trim()}
+        title="Put a lead on the frontier — what you want looked at, and the entity it is about."
+        onClick={() => send('lead', note.trim(), entity.trim() ? { entity_key: entity.trim() } : undefined)}
+      >
+        add lead
       </button>
       <button
         className="btn ghost"
@@ -1205,31 +1662,87 @@ function strengthLine(s: HuntStrength): string {
 }
 
 /** What a hunt has tested and how each belief stands — its equivalent of phase rows. */
+/** How the evidence landed on each belief, counted from the rulings the projection
+ *  already carries. Every other field on a standing is written at verdict time, so an
+ *  unresolved board reported the coerced status and nothing else — nine rows saying
+ *  "inconclusive" over a run that had four records supporting one of them. */
+interface Bearing { supports: number; weakens: number; ruledOut: number }
+
+export function bearings(evidence: readonly HuntEvidence[]): Map<string, Bearing> {
+  const held = new Map<string, Bearing>()
+  for (const record of evidence) {
+    for (const link of record.bears_on ?? []) {
+      const tally = held.get(link.hypothesis_id) ?? { supports: 0, weakens: 0, ruledOut: 0 }
+      if (link.relation === 'supports') tally.supports += 1
+      else if (link.relation === 'weakens') tally.weakens += 1
+      else tally.ruledOut += 1
+      held.set(link.hypothesis_id, tally)
+    }
+  }
+  return held
+}
+
+/** A belief nothing has been ruled against yet reads differently from one every record
+ *  was weighed against and set aside: the second is a hunt that looked. */
+function BearingCell({ tally }: { tally?: Bearing }) {
+  if (tally === undefined || tally.supports + tally.weakens + tally.ruledOut === 0) {
+    return <span className="muted">nothing ruled yet</span>
+  }
+  if (tally.supports + tally.weakens === 0) {
+    return <span className="muted" title={`weighed against ${tally.ruledOut} record(s), none bore on it`}>not engaged</span>
+  }
+  return (
+    <span className="whitespace-nowrap">
+      <b>{tally.supports}</b> for · <b>{tally.weakens}</b> against
+    </span>
+  )
+}
+
 function HuntStandings({ hunt }: { hunt: HuntView }) {
   const strengthOf = (id: string) =>
     hunt.report?.hypotheses.find((h) => h.hypothesis_id === id)?.evidence_strength ?? null
+  // Sorted rather than filtered: the benign account is what the others are measured against.
+  const ordered = [...hunt.hypotheses].sort(
+    (a, b) => Number(a.provenance === 'base_rate') - Number(b.provenance === 'base_rate'),
+  )
+  const tallies = bearings(hunt.evidence ?? [])
+  // One run-level fact, said once. A terminal coerces every unresolved belief with the
+  // same sentence, which printed per row is the run bar's news repeated nine times.
+  const reasons = new Set(ordered.map((h) => h.resolution_reason).filter((why) => !!why))
+  const shared = reasons.size === 1 && ordered.length > 1 ? [...reasons][0] : null
+  // The rulings are counted over the records the projection carries, which is capped.
+  const partial = (hunt.evidence?.length ?? 0) < hunt.evidence_count
   return (
     <div style={{ marginTop: 12 }}>
       <div className="muted text-[11.5px] mb-2">
         {hunt.evidence_count} piece{hunt.evidence_count === 1 ? '' : 's'} of evidence gathered so far.
+        {partial && ` Rulings counted over the ${hunt.evidence?.length} most recent.`}
+        {shared !== null && <> All of them: {shared}.</>}
       </div>
       {hunt.hypotheses.length === 0 && <div className="muted" style={{ padding: '4px 0' }}>No hypotheses on the board yet.</div>}
       {hunt.hypotheses.length > 0 && (
         <div className="table-wrap">
           <table className="tbl">
-            <thead><tr><th>Statement</th><th>Techniques cited</th><th>Standing</th></tr></thead>
+            <thead><tr><th className="tight" /><th>Statement</th><th className="tight">Evidence</th><th>Techniques cited</th><th>Standing</th></tr></thead>
             <tbody>
-              {hunt.hypotheses.map((h) => {
+              {ordered.map((h) => {
                 const strength = strengthOf(h.hypothesis_id)
                 return (
                   <tr key={h.hypothesis_id}>
+                    <td className="tight"><Hyp id={h.hypothesis_id} /></td>
                     <td>
                       {h.statement}
                       {h.provenance === 'operator' && <span className="chip ml-2" style={{ fontSize: 10 }}>yours</span>}
-                      {h.resolution_reason && <div className="muted text-[11px]">{h.resolution_reason}</div>}
+                      {h.provenance === 'base_rate' && (
+                        <span className="chip ml-2" style={{ fontSize: 10 }} title="Seeded on every hunt as the claim to beat, not something you asked for.">
+                          the claim to beat
+                        </span>
+                      )}
+                      {h.resolution_reason && shared === null && <div className="muted text-[11px]">{h.resolution_reason}</div>}
                       {strength && <div className="muted text-[11px]">{strengthLine(strength)}</div>}
                     </td>
-                    <td className="muted tight">{techniquesOf(h) || '—'}</td>
+                    <td className="tight"><BearingCell tally={tallies.get(h.hypothesis_id)} /></td>
+                    <td className="muted">{techniquesOf(h) || '—'}</td>
                     <td className="tight"><span style={{ color: hypothesisColor(h.status) }}>{h.status}</span></td>
                   </tr>
                 )
@@ -1242,17 +1755,13 @@ function HuntStandings({ hunt }: { hunt: HuntView }) {
   )
 }
 
-/** The one thing on this panel that is waiting on a person. approve and reject
- *  have always been valid directives and the projection has always carried the
- *  open checkpoint; nothing rendered it, so a parked hunt could be watched and
- *  not answered, and the only way out of one was to abort it. */
+/** The one thing on this panel waiting on a person, and the approve/reject that
+ *  answers it. */
 function OpenCheckpoint({ hunt }: { hunt: HuntView }) {
   const open = hunt.open_checkpoint
   const [busy, setBusy] = useState<string | null>(null)
   const [failed, setFailed] = useState<string | null>(null)
-  // Which question was answered, not merely that one was. The projection keeps
-  // reporting the checkpoint until the run journals a resolution, so without the
-  // id a second question would arrive already wearing the first one's answer.
+  // Which question was answered: the projection reports it until the run journals a resolution.
   const [answered, setAnswered] = useState<{ checkpoint_id: string; kind: string } | null>(null)
   const [why, setWhy] = useState('')
   if (!open) return null
@@ -1267,11 +1776,7 @@ function OpenCheckpoint({ hunt }: { hunt: HuntView }) {
       .finally(() => setBusy(null))
   }
 
-  // Answered, and the run has not caught up yet. The question was the whole of
-  // this panel and it is settled, so it collapses to what was sent rather than
-  // leaving a wall of text under a heading that no longer applies — it is waiting
-  // on the run now, not on a person. It clears itself when the resolution reaches
-  // the ledger and the projection stops reporting an open checkpoint.
+  // Answered and waiting on the run, not on a person; clears when the ledger catches up.
   if (answered?.checkpoint_id === open.checkpoint_id) {
     return (
       <div className="modal-section run-ask" style={{ borderLeftColor: 'var(--ok)', background: 'var(--ok-dim)' }}>
@@ -1313,9 +1818,8 @@ function OpenCheckpoint({ hunt }: { hunt: HuntView }) {
   )
 }
 
-/** Questions the hunt could not answer. The reason this is a section of its own:
- *  "we looked and it was not there" and "we could not look" read identically in a
- *  report that does not separate them, and only one of them clears a hypothesis. */
+/** Questions the hunt could not answer. Its own section because "not there" and
+ *  "could not look" read identically otherwise, and only one clears a hypothesis. */
 function HuntGaps({ gaps }: { gaps: HuntGap[] }) {
   if (gaps.length === 0) return null
   const asked = groupedGaps(gaps)
@@ -1330,7 +1834,7 @@ function HuntGaps({ gaps }: { gaps: HuntGap[] }) {
             {asked.map((g) => (
               <tr key={g.key}>
                 <td className="muted tight">{g.iteration}</td>
-                <td className="muted tight">{g.hypothesis_id || 'unattributed'}</td>
+                <td className="muted tight"><Hyp id={g.hypothesis_id} /></td>
                 <td>
                   {g.query_intent || g.reasons[0]}
                   {g.query_intent && g.reasons.map((reason) => (
@@ -1347,9 +1851,8 @@ function HuntGaps({ gaps }: { gaps: HuntGap[] }) {
   )
 }
 
-/** One row per question, not per worker. A fan-out dispatches the same
- *  query_intent to every worker, so a failed one repeated the whole intent once
- *  per worker and buried the reasons that actually differed. */
+/** One row per question, not per worker: a fan-out sends the same query_intent to
+ *  every worker, so a failure would otherwise repeat it and bury the reasons. */
 export function groupedGaps(gaps: HuntGap[]) {
   const byQuestion = new Map<string, { key: string; iteration: number; hypothesis_id: string | null; query_intent: string; reasons: string[]; workers: number }>()
   for (const gap of gaps) {
@@ -1385,7 +1888,7 @@ function HuntEscalations({ handoffs }: { handoffs: HuntHandoff[] }) {
             {handoffs.map((h) => (
               <tr key={h.case_id}>
                 <td className="mono tight" style={{ fontSize: 11 }}>{h.case_id}</td>
-                <td className="muted tight">{h.hypothesis_id}</td>
+                <td className="muted tight"><Hyp id={h.hypothesis_id} /></td>
                 <td>{h.rationale}</td>
               </tr>
             ))}
