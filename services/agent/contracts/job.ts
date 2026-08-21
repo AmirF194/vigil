@@ -26,14 +26,15 @@ export interface StartRequest {
   config: string;
   prompt: string;
   overrides?: Record<string, unknown>;
-  // What the caller wants tested, beside whatever the playbook already states.
-  // Per-run and so not resolvable from the reference, which names a definition
-  // many runs share.
+  // What the caller wants tested, beside what the playbook states. Per-run, so it is
+  // not resolvable from the reference.
   hypotheses?: string[];
-  // How many turns this run may take. Per-run for the same reason: what an
-  // operator is willing to spend on one question is not a property of the
-  // definition. Absent leaves the config's.
+  // How many turns this run may take. Per-run for the same reason; absent leaves the
+  // config's.
   iterations?: number;
+  // Whether a person approves the hypotheses before the hunt spends anything. The policy
+  // defaults to auto, so a headless run advances with nobody to ask.
+  approve_hypotheses?: boolean;
 }
 
 // A resume carries no request, so a resume path that read one would not compile.

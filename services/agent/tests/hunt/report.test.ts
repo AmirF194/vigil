@@ -126,6 +126,27 @@ describe("citing a technique beside a claim", () => {
     expect(citedTechniques(started.ledger.projection, hypothesisId)).toEqual(["T1071.004"]);
   });
 
+  // The lead rules every observation against every active belief, so most rulings are
+  // `neither` -- and a `neither` is the ruling that this record does not bear on this
+  // belief. Counted, every hypothesis inherited every technique in the run and the
+  // column read identically on all nine rows of a real hunt.
+  it("ignores a technique on a record ruled not to bear on the hypothesis", async () => {
+    const started = await newLedger({ hypotheses: ["a host is beaconing to C2"] });
+    const hypothesisId = started.hypothesisIds[0]!;
+    evidenceOn(started.ledger, hypothesisId, { attackTechnique: "T1071.001" });
+    evidenceOn(started.ledger, hypothesisId, { attackTechnique: "T1496", relation: "neither" });
+
+    expect(citedTechniques(started.ledger.projection, hypothesisId)).toEqual(["T1071.001"]);
+  });
+
+  it("names nothing for a hypothesis every record was ruled against", async () => {
+    const started = await newLedger({ hypotheses: ["a host is beaconing to C2"] });
+    const hypothesisId = started.hypothesisIds[0]!;
+    evidenceOn(started.ledger, hypothesisId, { attackTechnique: "T1071.001", relation: "neither" });
+
+    expect(citedTechniques(started.ledger.projection, hypothesisId)).toEqual([]);
+  });
+
   it("names nothing for a hypothesis no cited record bears on", async () => {
     const started = await newLedger({ hypotheses: ["a host is beaconing to C2"] });
     expect(citedTechniques(started.ledger.projection, started.hypothesisIds[0]!)).toEqual([]);
@@ -169,5 +190,66 @@ describe("citing a technique beside a claim", () => {
     const rendered = renderReport(buildReport(started.ledger.projection), started.ledger.projection);
 
     expect(rendered).not.toMatch(/Declared technique|Techniques cited/);
+  });
+});
+
+// A hunt that gathered thirty records and cleared nothing read exactly like a hunt
+// that did nothing: the verdicts said how each belief stood, the gaps said what could
+// not be looked at, and nothing said what came back.
+describe("what the hunt found", () => {
+  it("prints the records gathered, and what each one bears on", async () => {
+    const started = await newLedger({ hypotheses: ["a host is beaconing to C2"] });
+    const hypothesisId = started.hypothesisIds[0]!;
+    evidenceOn(started.ledger, hypothesisId, { relation: "weakens" });
+    const rendered = renderReport(buildReport(started.ledger.projection), started.ledger.projection);
+
+    expect(rendered).toMatch(/## What the hunt found \(1\)/);
+    expect(rendered).toMatch(/duckdb saw the identity authenticate/);
+    expect(rendered).toMatch(new RegExp(`weakens ${hypothesisId}`));
+  });
+
+  it("says so when nothing came back, rather than leaving the section out", async () => {
+    const started = await newLedger({ hypotheses: ["a host is beaconing to C2"] });
+    const rendered = renderReport(buildReport(started.ledger.projection), started.ledger.projection);
+
+    expect(rendered).toMatch(/## What the hunt found \(0\)/);
+    expect(rendered).toMatch(/Nothing came back that was not a blind spot/);
+  });
+});
+
+// "Reached the end of its frontier" is a claim about coverage, and a hunt an operator
+// concluded early has leads nobody took.
+describe("the one line an operator reads first", () => {
+  const base = {
+    hunt_id: "hunt-1",
+    name: "threat-hunt",
+    outcome: "completed" as const,
+    reason: "an operator asked the hunt to conclude on what it had",
+    iterations: 6,
+    cost_usd: 0.85,
+    budgets: DEFAULT_BUDGETS,
+    created_at: "2026-08-20T00:00:00Z",
+    terminated_at: "2026-08-20T00:30:00Z",
+    hypotheses: [],
+    gaps: [],
+    parked_hypotheses: [],
+    backlog: [],
+    checkpoints: [],
+    suppressions: [],
+    handoffs: [],
+  };
+
+  it("does not claim the frontier was exhausted when leads were left open", () => {
+    const rendered = renderReport({
+      ...base,
+      backlog: [{ question_id: "q-1", question: "45.77.53.176", reason: "below the priority floor" }],
+    });
+
+    expect(rendered).toMatch(/1 lead\(s\) were left open/);
+    expect(rendered).not.toMatch(/reached the end of its frontier/);
+  });
+
+  it("says the frontier was exhausted when it was", () => {
+    expect(renderReport(base)).toMatch(/reached the end of its frontier/);
   });
 });

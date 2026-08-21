@@ -9,7 +9,7 @@ import { harnessFor, internalToken, type HarnessFactory } from "./harness.js";
 import { poolConfig, redisConfig } from "./core/db.js";
 import { healthPort, healthServer } from "./core/health.js";
 import { jobIdFor, RUN_QUEUE, JOB_SCHEMA_VERSION, type RunJob } from "./contracts/job.js";
-import type { AgentEvent, CheckpointPayload, ResolutionPayload, RunKind, RunPayload } from "./contracts/events.js";
+import type { AgentEvent, CheckpointPayload, ResolutionPayload, RunPayload } from "./contracts/events.js";
 import type { SpendPayload } from "./contracts/budget.js";
 import {
   LEASE_TTL_MS,
@@ -41,17 +41,24 @@ type StartJob = Extract<RunJob, { reason: "start" }>;
 export async function resolveSpec(job: StartJob, resolve: PlaybookResolver = defaultResolver()): Promise<RunSpec> {
   const entry = archFor(job.run_kind);
   const arch = job.request.arch === "" ? entry.arch : job.request.arch;
-  // Carried on the job rather than the reference: what a caller wants tested is
-  // this run's, and the reference names a definition many runs share.
+  // Carried on the job, not the reference, which names a definition many runs share.
   const asked = job.request.hypotheses ?? [];
   const turns = job.request.iterations;
+  // Only ever tightens: a caller may ask to be asked, never to skip a declared gate.
+  const gate = job.request.approve_hypotheses === true ? { hypothesis_approval: "ask" } : {};
   const tighten = (spec: RunSpec): RunSpec =>
     withOverrides(
       {
         ...spec,
-        ...(asked.length === 0 ? {} : { sections: { ...spec.sections, operator_hypotheses: asked } }),
-        // Under thresholds because the harness refuses an unknown budgets key,
-        // and turns are the workflow's unit rather than the harness's.
+        sections: {
+          ...spec.sections,
+          ...(asked.length === 0 ? {} : { operator_hypotheses: asked }),
+          ...(Object.keys(gate).length === 0
+            ? {}
+            : { checkpoints: { ...((spec.sections?.["checkpoints"] as object) ?? {}), ...gate } }),
+        },
+        // Under thresholds: the harness refuses an unknown budgets key, and turns are
+        // the workflow's unit rather than its own.
         ...(turns === undefined ? {} : { thresholds: { ...spec.thresholds, max_iterations: turns } }),
       },
       job.request.overrides,
@@ -242,12 +249,9 @@ async function forget(state: State, leases: Leases, job: RunJob, owner: string, 
   await leases.release(job.run_id, owner, 0);
 }
 
-// A spec error answers the same way on every attempt. On a resume the layers come
-// off the ledger, so no retry can change the spec, and releasing for one swept the
-// run again every interval for as long as anybody left it -- 5,860 failed jobs
-// across two runs over five days, not one of which could have succeeded. So say why
-// it stopped and stop: an operator reading a terminal can fix the cause and start a
-// run, which a queue quietly refilling itself never let them see.
+// A spec error answers the same way on every attempt, and on a resume the layers come
+// off the ledger, so no retry can change it. Say why it stopped and stop, rather than
+// refilling the queue with jobs none of which could succeed.
 async function stopBecauseItCannotSucceed(
   state: State,
   leases: Leases,
@@ -255,11 +259,8 @@ async function stopBecauseItCannotSucceed(
   error: unknown,
 ): Promise<boolean> {
   if (!(error instanceof SpecError)) return false;
-  // SpecError is not only about specs: the lead throws one when it emits no
-  // decision, and its reason for emitting none is often that the ledger holds an
-  // open checkpoint. A run waiting on a person is the one case that must never be
-  // killed for not progressing -- the next sweep succeeds the moment somebody
-  // answers, and killing it throws away the answer they were about to give.
+  // SpecError is not only about specs: a lead that emits no decision throws one, often
+  // because a checkpoint is open. A run waiting on a person must never be killed.
   if (await waitingOnSomeone(state, job.run_id)) return false;
 
   const reason = `its spec cannot be built: ${error.message}`;
@@ -357,25 +358,19 @@ async function abandonIfParkedOut(state: State, leases: Leases, job: RunJob, spe
   return true;
 }
 
-// Nothing but the record of being picked up again. A run whose model calls fail
-// without throwing came back here on every sweep, journaled a resume and two
-// zero-token spends, and advanced nothing -- nineteen times, for as long as anybody
-// left it. The SpecError path cannot see this one: nothing threw.
-//
-// Counted off the ledger rather than a counter, because the ledger is what survives
-// a worker restart, and the sweeper hands the run to whichever worker is free.
+// Sweeps that journal nothing but being picked up again: a run whose calls fail without
+// throwing advances nothing, and the SpecError path cannot see it because nothing threw.
+// Counted off the ledger, which is what survives a worker restart.
 export const MAX_STALLED_RESUMES = 6;
 
-// Neither is progress. A spend says a call was paid for, which a failing call also
-// writes at zero, and a resume says only that somebody looked again.
+// Neither is progress: a failing call writes a spend at zero, and a resume says only
+// that somebody looked again.
 const NOT_PROGRESS: ReadonlySet<string> = new Set(["resumed", "spend"]);
 
 async function abandonIfStalled(state: State, leases: Leases, job: RunJob): Promise<boolean> {
   const events = await state.read(job.run_id);
-  // A parked hunt is swept on every interval and journals a resume each time, so
-  // counting those as stalling would end every run that asked a question -- inside
-  // minutes, against a park TTL of a week. abandonIfParkedOut owns the case where
-  // nobody ever answers, and it waits max_park_ms to say so.
+  // A parked hunt journals a resume on every sweep, so counting those would end every
+  // run that asked a question. abandonIfParkedOut owns the case nobody answers.
   if (parkedFor(events) !== null) return false;
   let resumes = 0;
   for (let at = events.length - 1; at >= 0; at -= 1) {
@@ -394,9 +389,8 @@ async function abandonIfStalled(state: State, leases: Leases, job: RunJob): Prom
   return true;
 }
 
-// Whether anything is waiting on a person. Read fresh rather than passed in: the
-// callers reach here from a catch, where the events they read may predate the
-// checkpoint that the failure is about.
+// Whether anything is waiting on a person. Read fresh, since the callers reach here
+// from a catch holding events that may predate the checkpoint.
 async function waitingOnSomeone(state: State, runId: string): Promise<boolean> {
   return parkedFor(await state.read(runId)) !== null;
 }

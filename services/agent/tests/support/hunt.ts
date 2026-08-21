@@ -1,5 +1,4 @@
 import { InProcessState } from "../../core/state.js";
-import type { BudgetLimits } from "../../contracts/budget.js";
 import { DEFAULT_DISPATCH, DEFAULT_RUNTIME, type RunSpec } from "../../core/spec.js";
 import { DEFAULT_CHECKPOINTS, type Checkpoints } from "../../workflows/hunt/checkpoints.js";
 import {
@@ -15,7 +14,7 @@ import { HuntController, startHunt } from "../../workflows/hunt/controller.js";
 import { InProcessDirectiveQueue } from "../../workflows/hunt/directives.js";
 import { Journal, type HuntEvent, type HuntKinds } from "../../workflows/hunt/journal.js";
 import { newId } from "../../workflows/hunt/ids.js";
-import type { Enricher, WorkerDispatcher } from "../../workflows/hunt/ports.js";
+import type { DecisionProvider, Enricher, WorkerDispatcher } from "../../workflows/hunt/ports.js";
 import type { HuntReport } from "../../workflows/hunt/report.js";
 import {
   ScriptedDecisionProvider,
@@ -116,7 +115,10 @@ export interface ControllerOptions {
   enricher?: Enricher;
   costPerDecision?: number;
   verdicts?: Verdicts;
-  provider?: ScriptedDecisionProvider;
+  // Any provider, not only the scripted one: a test that needs the lead to behave
+  // like the real one -- which reads the stored ledger, not this journal -- brings
+  // its own. The controller only ever asked for the interface.
+  provider?: DecisionProvider;
   dispatch?: RunSpec["dispatch"];
   maxWorkers?: number;
 }
@@ -147,6 +149,7 @@ export interface EvidenceOptions {
   source?: string;
   relation?: LinkRelation;
   attackerInfluenceable?: boolean;
+  restsOn?: { field: string; authored: "sensor" | "adversary" | "third_party" }[];
   entities?: Entity[];
   attackTechnique?: string;
 }
@@ -167,6 +170,7 @@ export function evidenceOn(ledger: Journal, hypothesisId: string, options: Evide
       why_notable: "first use of this ASN by the identity",
       provenance: "worker",
       attacker_influenceable: options.attackerInfluenceable ?? false,
+      ...(options.restsOn === undefined ? {} : { rests_on: options.restsOn }),
       instruction_like: false,
       entities: options.entities ?? [],
       captured_at: new Date().toISOString(),

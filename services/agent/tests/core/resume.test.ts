@@ -83,6 +83,20 @@ describe("resolving a run", () => {
   it("leaves the sections alone when the run asked about nothing", async () => {
     expect((await resolveSpec(startJob())).sections["operator_hypotheses"]).toBeUndefined();
   });
+
+  // The policy defaults to auto so a headless run advances with nobody at a
+  // terminal to ask, which left a console operator no way to be asked at all.
+  it("gates the hypotheses on a person when the run asked to be asked", async () => {
+    const job = startJob();
+    job.request.approve_hypotheses = true;
+
+    const gate = (await resolveSpec(job)).sections["checkpoints"] as Record<string, string>;
+    expect(gate["hypothesis_approval"]).toBe("ask");
+  });
+
+  it("declares no policy of its own when the run did not ask", async () => {
+    expect((await resolveSpec(startJob())).sections["checkpoints"]).toBeUndefined();
+  });
 });
 
 describe("the arch a run started under is journaled", () => {

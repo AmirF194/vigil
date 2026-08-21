@@ -185,6 +185,50 @@ describe("bounded re-prompt", () => {
     expect(ledger.projection.hunt.status).toBe("active");
   });
 
+  // A worker whose call dies costs one gap record and a critic whose call dies leaves
+  // its hypothesis standing. The lead's used to take the whole hunt with it, so one 504
+  // on one write-up threw away every iteration behind it.
+  it("asks the lead again when its call dies, rather than losing the iteration", async () => {
+    const { ledger } = await newLedger();
+    let calls = 0;
+    const provider: DecisionProvider = {
+      decide: async (): Promise<DecisionResult> => {
+        calls += 1;
+        if (calls === 1) throw Object.assign(new Error("504 request timed out"), { cost_usd: 0.03 });
+        return { decision: CONCLUDE, model_id: "m", prompt_version: "v", cost_usd: 0.01 };
+      },
+    };
+
+    const iteration = await new HuntController(ledger, provider).advanceIteration();
+
+    expect(calls).toBe(2);
+    expect(iteration.action).toBe("CONCLUDE");
+    const record = ledger.projection.decisions[0]!;
+    expect(record.rejected_attempts).toEqual([expect.stringContaining("504")]);
+    // The failed call was paid for, so the iteration is charged for both.
+    expect(record.cost_usd).toBeCloseTo(0.04, 10);
+  });
+
+  it("journals a stall rather than throwing when every attempt at the lead dies", async () => {
+    const { ledger } = await newLedger();
+    let calls = 0;
+    const provider: DecisionProvider = {
+      decide: async (): Promise<DecisionResult> => {
+        calls += 1;
+        throw Object.assign(new Error("504 request timed out"), { cost_usd: 0.02 });
+      },
+    };
+
+    await expect(new HuntController(ledger, provider).advanceIteration()).rejects.toThrow(InvalidDecision);
+
+    expect(calls).toBe(MAX_DECISION_ATTEMPTS);
+    const record = ledger.projection.decisions[0]!;
+    expect(record.decision.action).toBe("STALLED");
+    expect(record.cost_usd).toBeCloseTo(0.06, 10);
+    // Still active: the iteration never advanced, so a resume retries it.
+    expect(ledger.projection.hunt.status).toBe("active");
+  });
+
   // A stall a lead could emit would be a way to end a hunt without a verdict.
   it("refuses a STALLED emitted by the lead", async () => {
     const { ledger } = await newLedger();

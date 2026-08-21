@@ -60,14 +60,13 @@ class Run<T, Kinds extends Record<string, unknown>> {
   private readonly transcript: Message[] = [];
   private prefix: Prefix = { system: "", tools: [], recall: "" };
   private lastFold = 0;
-  // Null until a write-up dies. DEFAULT_FOLD keeps 40 messages, and a role that made
-  // twenty-nine tool calls lands just under it -- so the most expensive request it
-  // could possibly send is the one that goes unfolded. Retrying that identically is
-  // three times the cost for the same answer, so the retry sends less instead.
+  // Null until a write-up dies: retrying the largest request a role can send, unchanged,
+  // is three times the cost for the same answer, so the retry sends less.
   private tightened: FoldPolicy | null = null;
   private folds = 0;
   private turns = 0;
   private capped = false;
+  private spent = 0;
   private prose = "";
   private readonly folder: Folder<Kinds>;
 
@@ -80,14 +79,9 @@ class Run<T, Kinds extends Record<string, unknown>> {
     this.folder = new Folder(harness.state, cfg.run_id);
   }
 
-  // A provider that dies is a run that failed, which is what Outcome is for: it
-  // carries the status, the reason, and the calls already made. Letting the error
-  // escape instead threw all three away, so a role that made eight successful calls
-  // and then lost the one that writes up their answer reported having made none --
-  // one flaky call discarding every result behind it. Every workflow reads a failed outcome
-  // (status === "failed" || value === null), so this is the contract they were
-  // written against; only this path disagreed. An abort still throws, because a
-  // cancelled run is not a run that answered.
+  // A provider that dies is a run that failed, which is what Outcome is for: it carries
+  // the status, the reason and the calls already made, where a thrown error loses all
+  // three. An abort still throws, because a cancelled run is not a run that answered.
   async *execute(): TurnStream<T> {
     try {
       return yield* this.attempt();
@@ -166,7 +160,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
   // The store is the authority on whether the run is still going, so one
   // cancelled or answered out of band is seen on the next pass rather than never.
   private settled(fold: Fold): Outcome<T> | null {
-    if (fold.terminal !== null) {
+    if (fold.terminal !== null && this.cfg.after_terminal !== true) {
       const status: Status = fold.terminal.outcome === "completed" ? "completed" : "failed";
       return this.done(status, null, `the ledger already ended this run: ${fold.terminal.reason}`);
     }
@@ -229,8 +223,8 @@ class Run<T, Kinds extends Record<string, unknown>> {
       const refusal = await this.harness.budget.beginCall();
       if (refusal !== null) return this.exhausted(refusal);
 
-      // A write-up that dies on the wire has still gathered everything behind it, so
-      // the one thing worth changing before asking again is how much it is asked over.
+      // A write-up that died has still gathered everything behind it, so the only thing
+      // worth changing before asking again is how much it is asked over.
       let turn;
       try {
         turn = yield* this.burn({ messages: this.assembled(tail), tools: [], emit: schema });
@@ -323,6 +317,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
       pricing_source: priced.source,
     };
     this.harness.budget.record(payload);
+    this.spent += payload.cost_usd ?? 0;
     await this.write({ run_id: this.cfg.run_id, run_kind: this.cfg.run_kind, kind: "spend", payload });
     return payload;
   }
@@ -362,17 +357,14 @@ class Run<T, Kinds extends Record<string, unknown>> {
       turns: this.turns,
       rejected: this.rejected,
       reason,
+      cost_usd: Number(this.spent.toFixed(6)),
     };
   }
 }
 
-// Not every throw is a turn that failed. A gateway with no budget left cannot serve
-// the next call either, so reporting it as one failed turn invites the caller to
-// retry into it; and a bounds violation is a defect in an adapter, which must not
-// read as a role that could not answer.
+// Not every throw is a turn that failed: an exhausted gateway cannot serve the next
+// call either, and a defect in this process is not a role that could not answer.
 function hardStop(error: unknown): boolean {
-  // A defect in this process is not a role that could not answer. Swallowing one into
-  // a failed outcome cost real debugging time: a mistyped name read as a dead gateway.
   if (error instanceof TypeError || error instanceof ReferenceError || error instanceof SyntaxError) return true;
   return error instanceof GatewayExhausted || error instanceof ToolBoundsViolation;
 }
@@ -436,14 +428,15 @@ class Folder<Kinds extends Record<string, unknown>> {
   }
 }
 
-// Tried in order, one step per failed write-up. A gateway holds a ceiling on how long
-// one call may take, and a write-up composed over eight groups of results is the call
-// most likely to cross it: measured, one over a single group streams without pausing
-// where the unfolded request went quiet for half a minute. Raising the ceiling is the
-// real fix and belongs to the deployment; this is what the run can do unaided.
+// Tried in order, one step per failed write-up. DEFAULT_FOLD already bounds a request
+// by weight, so this is the backstop rather than the mechanism: a ceiling lower than
+// the one DEFAULT_FOLD was set for, reached only after a write-up has already died.
+// Both ceilings are reachable, which matters: neither edge folds below one message, so
+// the floor is roughly two result_caps and a budget under that is a budget the fold can
+// never meet. It would spend the whole ladder failing to.
 const FOLD_LADDER: readonly FoldPolicy[] = [
-  { head: 2, tail: 4, max_messages: 10 },
-  { head: 1, tail: 1, max_messages: 4 },
+  { head: 2, tail: 4, max_messages: 10, max_chars: 60_000 },
+  { head: 1, tail: 1, max_messages: 4, max_chars: 40_000 },
 ];
 
 // Names what was dropped rather than reproducing it: a summary that quotes the

@@ -21,12 +21,31 @@ export const EMIT_TOOL = "emit";
 type Body = Omit<OpenAI.Chat.ChatCompletionCreateParams, "stream" | "stream_options">;
 
 // Not every provider honours response_format, so a 400 downgrades once to a tool
-// whose parameters are the schema. Keyed by model and schema together: the refusal
-// is a property of the schema as much as the provider -- Anthropic requires
-// additionalProperties: false on every object, which a free-form payload cannot
-// carry -- and keyed by model alone one worker's 400 downgraded the lead, whose
-// own schema the same gateway accepts.
-const emitModes = new Map<string, "schema" | "tool">();
+// whose parameters are the schema. Keyed by model and schema together, because the
+// refusal is a property of the schema as much as of the provider.
+const emitModes = new Map<string, "schema" | "tool" | "prompt">();
+
+// Statuses that mean the gateway will not carry this shape, however often it is asked.
+// Everything else -- a 504, a 429, a dropped socket -- is a fact about load, not shape.
+const REFUSED = new Set([400, 404, 422, 501]);
+
+// Which field a model takes its output ceiling under: the reasoning families answer 400
+// to max_tokens. Remembered per model, for the reason emitModes is.
+type OutputCap = "max_tokens" | "max_completion_tokens";
+const outputCaps = new Map<string, OutputCap>();
+
+export function resetOutputCap(): void {
+  outputCaps.clear();
+}
+
+// The gateway relays the upstream complaint, and it names the field. Matching on that
+// rather than on a model-id table, which goes stale on the next model release.
+function renamed(error: unknown, current: OutputCap): OutputCap | null {
+  if (statusOf(error) !== 400) return null;
+  const message = error instanceof Error ? error.message : String(error);
+  if (!message.includes(current)) return null;
+  return current === "max_tokens" ? "max_completion_tokens" : "max_tokens";
+}
 
 export function resetEmitMode(): void {
   emitModes.clear();
@@ -46,10 +65,8 @@ class OpenAiSurface implements Provider {
     readonly provider_type: string,
   ) {}
 
-  // Assembled before the events are emitted, so usage precedes the tool calls --
-  // the order the loop needs. The transport streams; this does not re-emit the
-  // deltas, because nothing downstream renders a partial turn and a half-written
-  // tool call is not a tool call.
+  // Assembled before the events are emitted, so usage precedes the tool calls. The
+  // deltas are not re-emitted: nothing downstream renders a partial turn.
   async *stream(request: TurnRequest): AsyncGenerator<ProviderEvent> {
     const turn = request.emit === undefined ? await this.ask(request) : await this.emit(request, request.emit);
     if (turn.content !== "") yield { type: "text_delta", text: turn.content };
@@ -69,11 +86,8 @@ class OpenAiSurface implements Provider {
       try {
         const format = { type: "json_schema" as const, json_schema: { name: "emission", strict: false, schema } };
         const turn = turnOf(await this.call({ model: this.model, messages, response_format: format }, request.signal));
-        // A gateway that drops response_format answers 200 with an object of the
-        // model's own invention, which reads as a schema-invalid answer and costs
-        // two retries against a schema it was never shown. Falling through to the
-        // tool, whose parameters the same gateway does forward, is the only fix
-        // available from this side.
+        // A gateway that drops response_format answers 200 with an object of the model's
+        // own invention, so fall through to the tool, whose parameters it does forward.
         if (honours(turn.content, schema)) return turn;
         emitModes.set(mode, "tool");
       } catch (error) {
@@ -82,72 +96,122 @@ class OpenAiSurface implements Provider {
       }
     }
 
-    const emit = { name: EMIT_TOOL, description: "Emit your answer.", parameters: schema };
-    const turn = turnOf(
+    if (emitModes.get(mode) !== "prompt") {
+      const carried = await this.viaTool(messages, schema, request.signal);
+      if (carried !== null) return carried;
+      emitModes.set(mode, "prompt");
+    }
+
+    // Neither wire carried it, so the schema goes in the prompt, which asks nothing of
+    // the gateway. What comes back is JSON the caller already parses and corrects.
+    const asked = [...messages, { role: "user" as const, content: prompted(schema) }];
+    const turn = turnOf(await this.call({ model: this.model, messages: asked }, request.signal));
+    if (turn.content !== "" || turn.tool_calls.length === 0) return turn;
+
+    // No tools were offered and it called one anyway: a provider that finds a name in
+    // the transcript reaches for it rather than answering. Correct it, as viaTool does.
+    return turnOf(
       await this.call(
-        {
-          model: this.model,
-          messages,
-          tools: [{ type: "function", function: emit }],
-          tool_choice: { type: "function", function: { name: EMIT_TOOL } },
-        },
+        { model: this.model, messages: [...asked, { role: "user", content: instead(turn) }] },
         request.signal,
       ),
     );
+  }
+
+  // The emission carried by a forced tool call, or null when this wire cannot carry it
+  // here -- the gateway refused, or the model answered with something else.
+  private async viaTool(
+    messages: OpenAI.Chat.ChatCompletionMessageParam[],
+    schema: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<Turn | null> {
+    const emit = { name: EMIT_TOOL, description: "Emit your answer.", parameters: schema };
+    const forced = {
+      model: this.model,
+      messages,
+      tools: [{ type: "function" as const, function: emit }],
+      tool_choice: { type: "function" as const, function: { name: EMIT_TOOL } },
+    };
+
+    let turn: Turn;
+    try {
+      turn = turnOf(await this.call(forced, signal));
+    } catch (error) {
+      // Only a refusal: returning null claims this wire never works here, which a local
+      // fault (no status) and a ceiling ("not now") do not establish.
+      if (signal?.aborted === true || !REFUSED.has(statusOf(error) ?? 0)) throw error;
+      return null;
+    }
+
     // The emission arrived as the tool's arguments. It is returned as content so
     // the loop validates one shape whichever mode produced it.
     const emitted = emissionOf(turn);
     if (emitted !== undefined) return { ...turn, content: emitted, tool_calls: [] };
 
-    // Asked for the emission and handed a call to something else: a provider that
-    // does not enforce tool_choice reaches for a tool name out of the transcript
-    // instead. That left content empty, which every caller above reads as an
-    // unparseable answer and spends its retries on. Said plainly, it is answerable.
-    const called = turn.tool_calls.map((call) => call.tool).join(", ");
+    // Asked for the emission and handed a call to something else: a provider that does
+    // not enforce tool_choice reaches for a name out of the transcript. Say so plainly.
     const corrected = turnOf(
       await this.call(
-        {
-          model: this.model,
-          messages: [
-            ...messages,
-            {
-              role: "user",
-              content: `You called ${called === "" ? "no function" : called}, which is not available here. Call ${EMIT_TOOL} with your final answer, and call nothing else.`,
-            },
-          ],
-          tools: [{ type: "function", function: emit }],
-          tool_choice: { type: "function", function: { name: EMIT_TOOL } },
-        },
-        request.signal,
+        { ...forced, messages: [...messages, { role: "user", content: instead(turn, `Call ${EMIT_TOOL} with your final answer, and call nothing else.`) }] },
+        signal,
       ),
     );
-    return { ...corrected, content: emissionOf(corrected) ?? "", tool_calls: [] };
+    const second = emissionOf(corrected);
+    return second === undefined ? null : { ...corrected, content: second, tool_calls: [] };
   }
 
-  // Streamed, and not for the deltas: a buffered completion is subject to the
-  // gateway's non-streaming request ceiling -- 30 seconds in Bifrost, which no
-  // network_config setting moves and which it returns as a 504. Every call that ran
-  // longer died, so a role emitting a long answer failed where one emitting a short
-  // decision went through, and the caller could only record that its tool had
-  // failed. The method was already named stream() and the interface already said
-  // "assembled from its stream"; only the wire disagreed.
+  // Streamed, and not for the deltas: a buffered completion is subject to the gateway's
+  // non-streaming ceiling -- 30 seconds in Bifrost, returned as a 504.
   private async call(body: Body, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> {
     // Before the limiter, not only inside the request: a call still queued behind
     // a rate limit is the cheapest one to give up on.
     signal?.throwIfAborted();
+    const cap = outputCaps.get(this.model) ?? "max_tokens";
+    try {
+      return await this.send(body, cap, signal);
+    } catch (error) {
+      const other = renamed(error, cap);
+      if (other === null) throw error;
+      outputCaps.set(this.model, other);
+      return await this.send(body, other, signal);
+    }
+  }
+
+  private async send(body: Body, cap: OutputCap, signal?: AbortSignal): Promise<OpenAI.Chat.ChatCompletion> {
+    const limit = cap === "max_tokens" ? { max_tokens: MAX_OUTPUT_TOKENS } : { max_completion_tokens: MAX_OUTPUT_TOKENS };
+    const estimate = estimateTokens(JSON.stringify(body));
     // Assembled inside run() rather than after it, so the rate-limit slot is held
     // for the whole call and a mid-stream failure is retried like any other.
-    return this.limiter.run(estimateTokens(JSON.stringify(body)), async () => {
+    return this.limiter.run(estimate, async () => {
       const stream = await this.client.chat.completions.create(
-        { max_tokens: MAX_OUTPUT_TOKENS, ...body, stream: true, stream_options: { include_usage: true } },
+        { ...limit, ...body, stream: true, stream_options: { include_usage: true } },
         signal ? { signal } : {},
       );
       if (!(Symbol.asyncIterator in stream)) {
         throw new ProviderError("the gateway answered a stream request with a whole completion");
       }
-      return assemble(stream);
+      const response = await assemble(stream);
+      return response.usage === undefined ? { ...response, usage: guessed(estimate, response) } : response;
     });
   }
+}
+
+// The schema as an instruction, for a gateway carrying neither a response format nor a
+// tool. Indented, and explicit about prose, because a fenced answer costs a parse.
+function prompted(schema: Record<string, unknown>): string {
+  return [
+    "Emit your answer now as JSON matching this schema.",
+    "Reply with the JSON object only -- no prose, no code fence.",
+    "",
+    JSON.stringify(schema, null, 1),
+  ].join("\n");
+}
+
+// What to say to a model that answered with a call instead of an answer. Naming the
+// function it reached for is what makes the correction answerable.
+function instead(turn: Turn, ask = "Answer with the JSON object only, and call nothing."): string {
+  const called = turn.tool_calls.map((call) => call.tool).join(", ");
+  return `You called ${called === "" ? "no function" : called}, which is not available here. ${ask}`;
 }
 
 // The forced call's arguments, or undefined when the model called something else.
@@ -155,9 +219,8 @@ function emissionOf(turn: Turn): string | undefined {
   return turn.tool_calls.find((call) => call.tool === EMIT_TOOL)?.args;
 }
 
-// Whether an emission looks like the schema's rather than the model's own: every
-// required property present. Shallow on purpose -- this decides which wire to use,
-// and the caller validates properly.
+// Whether an emission looks like the schema's rather than the model's own. Shallow on
+// purpose: this only decides which wire to use, and the caller validates properly.
 function honours(content: string, schema: Record<string, unknown>): boolean {
   const required = schema["required"];
   if (!Array.isArray(required) || required.length === 0) return true;
@@ -171,9 +234,8 @@ function honours(content: string, schema: Record<string, unknown>): boolean {
   return required.every((key) => typeof key === "string" && key in (parsed as Record<string, unknown>));
 }
 
-// One completion out of its chunks. A tool call arrives split across them: the
-// opening fragment carries id and name, every later one carries null for both and
-// another slice of the arguments, so held values are kept rather than overwritten.
+// One completion out of its chunks. A tool call arrives split across them, so held ids
+// and names are kept rather than overwritten by the nulls that follow.
 async function assemble(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>): Promise<OpenAI.Chat.ChatCompletion> {
   const calls = new Map<number, OpenAI.Chat.ChatCompletionMessageToolCall>();
   let content = "";
@@ -219,6 +281,16 @@ async function assemble(stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>):
     ],
     ...(usage === undefined ? {} : { usage }),
   };
+}
+
+// A gateway that does not honour stream_options sends no usage chunk, and zero tokens
+// price at $0 rather than null, so nothing would bind the run. An estimate is wrong by
+// some margin; $0 is wrong by the whole amount and looks deliberate.
+function guessed(promptTokens: number, response: OpenAI.Chat.ChatCompletion): OpenAI.CompletionUsage {
+  const message = response.choices[0]?.message;
+  const written = (message?.content ?? "") + (message?.tool_calls ?? []).map((call) => call.function.arguments).join("");
+  const completion_tokens = estimateTokens(written);
+  return { prompt_tokens: promptTokens, completion_tokens, total_tokens: promptTokens + completion_tokens };
 }
 
 function turnOf(response: OpenAI.Chat.ChatCompletion): Turn {

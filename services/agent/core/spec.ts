@@ -491,11 +491,8 @@ function constrainWorkerId(
   return { ...schema, properties: { ...properties, worker_agent_id: { ...field, enum: ids } } };
 }
 
-// A field inside a worker's result rows, narrowed to a vocabulary the playbook
-// declared. A reader that counts distinct values of an unconstrained string
-// counts a typo as a second source, or a model's own guess as a classification
-// nothing checked -- source_system and attack_technique are two instances of
-// the same problem, so this is the one mechanism for both.
+// A field inside a worker's result rows, narrowed to a vocabulary the playbook declared:
+// a reader counting distinct values of a free string counts a typo as a second source.
 function constrainResultField(
   schema: Record<string, unknown> | null,
   field: string,
@@ -530,8 +527,7 @@ function constrainResultField(
   };
 }
 
-// The vocabulary a playbook declared for a section, if it declared one. Absent
-// on a playbook that owns no such section, which then constrains nothing.
+// The vocabulary a playbook declared for a section. Absent constrains nothing.
 function declaredStrings(playbook: Playbook, section: string): readonly string[] {
   const declared = playbook.sections[section];
   return Array.isArray(declared) ? declared.filter((one): one is string => typeof one === "string") : [];
@@ -562,9 +558,8 @@ function providersOf(tools: readonly ToolSpec[]): Map<string, string[]> {
   return byCapability;
 }
 
-// The inverse of bindCapabilities: what the roles asked for that this deployment
-// answers with nothing. Dropping it is what keeps a run alive; saying so is what
-// keeps the run honest. Order is declaration order, so a ledger replays the same.
+// The inverse of bindCapabilities: what the roles asked for that this deployment answers
+// with nothing. Declaration order, so a ledger replays the same.
 export function unboundCapabilities(roles: Roles, tools: readonly ToolSpec[]): string[] {
   const providers = providersOf(tools);
   const asking = [roles.lead, roles.critic, ...Object.values(roles.workers)];

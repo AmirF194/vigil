@@ -125,3 +125,43 @@ describe("what the evidence actually says", () => {
     expect(projection.evidence_count).toBe(EVIDENCE_SHOWN + 3);
   });
 });
+
+// The standings say what a hunt believes; nothing said how it got there. An operator
+// watching a run could see the turn counter move and not which move it made.
+describe("the moves the lead made", () => {
+  it("carries each decision, newest first, without the digest it was made over", async () => {
+    const started = await newLedger();
+    started.ledger.append({
+      kind: "decision",
+      payload: {
+        decision: { action: "INVESTIGATE", rationale: "start broad", query_intent: "who did it talk to" },
+        decision_id: "dec-1",
+        iteration: 1,
+        model_id: "m",
+        prompt_version: "v1",
+        cost_usd: 0.01,
+        digest_presented: { iteration: 1 },
+        created_at: new Date().toISOString(),
+      } as never,
+    });
+    started.ledger.append({
+      kind: "decision",
+      payload: {
+        decision: { action: "VALIDATE", rationale: "worth testing", target_hypothesis_id: started.hypothesisIds[0] },
+        decision_id: "dec-2",
+        iteration: 2,
+        model_id: "m",
+        prompt_version: "v1",
+        cost_usd: 0.02,
+        rejected_attempts: ["VALIDATE must cite the evidence it rests on"],
+        digest_presented: { iteration: 2 },
+        created_at: new Date().toISOString(),
+      } as never,
+    });
+    const view = await project(started);
+
+    expect(view.moves.map((move) => move.action)).toEqual(["VALIDATE", "INVESTIGATE"]);
+    expect(view.moves[0]!.rejected_attempts).toHaveLength(1);
+    expect(JSON.stringify(view.moves)).not.toContain("digest_presented");
+  });
+});

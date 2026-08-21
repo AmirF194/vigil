@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { Attempt } from "../../core/loop.js";
 import { wrap, scannerFor } from "../../core/security.js";
 import { callsOf, charged, link, salvaged, workerDispatcher } from "../../workflows/hunt/adapters.js";
-import { getEventListeners } from "node:events";
+import { getEventListeners, getMaxListeners } from "node:events";
 import { narrativeOf, renderDispatch, renderNullCheck } from "../../workflows/hunt/render.js";
 import { budgetOf, unmeteredQuota } from "../../core/budget.js";
 import { defineTool } from "../../contracts/tool.js";
@@ -232,12 +232,45 @@ describe("the lease signal is not a place listeners accumulate", () => {
     expect(on(asked)).toBe(0);
   });
 
-  it("attaches nothing when there is only one signal to honour", () => {
+  // Passing the one signal straight through looked free and was not. The HTTP client
+  // attaches an abort listener per request and never removes it, so a role handed the
+  // run-long lease signal directly collected one per model call for the whole run --
+  // four workers, ten calls each, five iterations, and Node warning it had a leak. A
+  // controller per turn costs nothing and dies with the turn, so the accumulation lands
+  // on something short-lived.
+  it("gives a turn its own signal even when there is only one to honour", () => {
     const lease = new AbortController();
     const linked = link(lease.signal, undefined);
-    expect(linked.signal).toBe(lease.signal);
-    expect(getEventListeners(lease.signal, "abort")).toHaveLength(0);
+
+    expect(linked.signal).not.toBe(lease.signal);
+    expect(getEventListeners(lease.signal, "abort")).toHaveLength(1);
     linked.release();
+    expect(getEventListeners(lease.signal, "abort")).toHaveLength(0);
+  });
+
+  // What the leak actually looked like: many calls on one turn's signal. That is
+  // bounded and released, so the ceiling is raised rather than the warning silenced.
+  it("carries the calls of one turn without warning about them", () => {
+    const lease = new AbortController();
+    const linked = link(lease.signal, undefined);
+    for (let call = 0; call < 30; call += 1) {
+      linked.signal!.addEventListener("abort", () => {});
+    }
+
+    expect(getEventListeners(linked.signal!, "abort").length).toBeGreaterThan(10);
+    expect(getMaxListeners(linked.signal!)).toBeGreaterThan(30);
+    // And still only the one relay on the signal the run owns.
+    expect(getEventListeners(lease.signal, "abort")).toHaveLength(1);
+    linked.release();
+  });
+
+  it("relays a single signal's abort to the turn", () => {
+    const lease = new AbortController();
+    const linked = link(lease.signal, undefined);
+    lease.abort(new Error("lease lost"));
+
+    expect(linked.signal!.aborted).toBe(true);
+    expect((linked.signal!.reason as Error).message).toBe("lease lost");
   });
 
   it("still aborts from whichever signal fires", () => {
@@ -388,6 +421,10 @@ describe("what the critic is actually told", () => {
           why_notable: "low jitter",
           payload: { dest_ip: "45.77.53.176" },
           attacker_influenceable: false,
+          rests_on: [
+            { field: "conn_count", authored: "sensor" },
+            { field: "dest_ip", authored: "adversary" },
+          ],
         },
       },
     ],
@@ -397,7 +434,11 @@ describe("what the critic is actually told", () => {
     const rendered = renderNullCheck(CHECK as never);
 
     expect(rendered).toContain("[hyp-7] credentials taken from HOST-42 were reused elsewhere");
-    expect(rendered).toContain('<vigil:evidence id="ev-1" relation="supports" source="cisco:asa" attacker_influenceable="false">');
+    // Which half of a record the adversary authored is the argument's best lever, so the
+    // critic is told the basis rather than one blanket flag.
+    expect(rendered).toContain(
+      '<vigil:evidence id="ev-1" relation="supports" source="cisco:asa" sensor_attested="true" rests_on="conn_count:sensor dest_ip:adversary">',
+    );
     expect(rendered).toContain("</vigil:evidence>");
     expect(rendered).toContain("45.77.53.176");
     expect(rendered).toContain("Frothly, August 2018.");

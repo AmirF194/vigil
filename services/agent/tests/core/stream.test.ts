@@ -536,6 +536,30 @@ describe("the status the store holds", () => {
     expect(seen.at(-1)?.type).toBe("done");
   });
 
+  // A terminal stops the run acting. A turn that describes a run rather than
+  // continuing it -- no tools, an answer folded into nothing -- has no act for the
+  // terminal to protect against, and the run whose write-up a person most wants
+  // redone is exactly one that has already ended.
+  it("lets a turn marked after_terminal run against a ledger that already ended", async () => {
+    const state = new InProcessState();
+    await seed(state, terminal("completed", "answered on an earlier pass"));
+    const harness = harnessOf([{ calls: [] }, HALT], { state });
+    const { outcome } = await watch(config({ after_terminal: true }), harness);
+
+    expect(requestsOf(harness)).toBeGreaterThan(0);
+    expect(outcome.value).toEqual({ verb: "HALT" });
+  });
+
+  it("still refuses one that is not, so the flag is what permits it and not the shape", async () => {
+    const state = new InProcessState();
+    await seed(state, terminal("completed", "answered on an earlier pass"));
+    const harness = harnessOf([{ calls: [] }, HALT], { state });
+    const { outcome } = await watch(config(), harness);
+
+    expect(requestsOf(harness)).toBe(0);
+    expect(outcome.value).toBeNull();
+  });
+
   // A checkpoint this harness never raised still parks it: the open one on the
   // ledger is what the run is waiting for, whoever asked the question.
   it("parks on a checkpoint raised out of band and names no call for it", async () => {

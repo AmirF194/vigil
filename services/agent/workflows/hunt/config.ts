@@ -20,19 +20,20 @@ export interface Termination {
   hard_max_iterations: number;
   hard_max_calls: number;
   hard_max_cost_usd: number;
+  hard_max_wall_ms: number;
 }
 
 // A frontier score tops out at 16, so five is a novel lead bearing on one active
 // hypothesis: below it a lead is backlog rather than a reason to keep spending.
-// Twice the budget, not equal to it: a ceiling sitting on the default clamps
-// every extension to what the hunt already had, so an operator asking for more
-// is told it was granted and gets nothing.
+// Twice the budget, not equal to it: a ceiling on the default clamps every extension
+// to what the hunt already had.
 export const DEFAULT_TERMINATION: Termination = {
   priority_floor: 5,
   park_ttl_ms: 604_800_000,
   hard_max_iterations: 2 * DEFAULT_BUDGETS.max_iterations,
   hard_max_calls: 2 * DEFAULT_BUDGETS.max_calls,
   hard_max_cost_usd: 2 * DEFAULT_BUDGETS.max_cost_usd,
+  hard_max_wall_ms: 2 * DEFAULT_BUDGETS.max_wall_ms,
 };
 
 export interface DigestPolicy {
@@ -80,32 +81,30 @@ export function verdictsOf(spec: RunSpec): Verdicts {
   return over(DEFAULT_VERDICTS, spec.thresholds);
 }
 
-// The ceiling rides the budget unless a config states its own: an operator who
-// asks for more turns than the shipped default means to run them, and a fixed
-// ceiling would refuse the spec rather than cap the extension it exists to cap.
+// The ceiling rides the budget unless a config states its own, so a spec asking for
+// more than the default is run rather than refused.
+const atLeast = (deployment: number, asked: number): number => Math.max(deployment, asked);
+
 export function terminationOf(spec: RunSpec): Termination {
   const budgets = budgetsOf(spec);
   return {
     ...over(DEFAULT_TERMINATION, spec.thresholds),
-    hard_max_iterations: spec.thresholds["hard_max_iterations"] ?? 2 * budgets.max_iterations,
-    hard_max_calls: spec.thresholds["hard_max_calls"] ?? 2 * budgets.max_calls,
-    hard_max_cost_usd: spec.thresholds["hard_max_cost_usd"] ?? 2 * budgets.max_cost_usd,
+    // The deployment's ceiling or twice this run's ask, whichever is higher: twice the
+    // ask alone makes the cap proportional to the thing it caps, locking a short run short.
+    hard_max_iterations: spec.thresholds["hard_max_iterations"] ?? atLeast(DEFAULT_TERMINATION.hard_max_iterations, 2 * budgets.max_iterations),
+    hard_max_calls: spec.thresholds["hard_max_calls"] ?? atLeast(DEFAULT_TERMINATION.hard_max_calls, 2 * budgets.max_calls),
+    hard_max_cost_usd: spec.thresholds["hard_max_cost_usd"] ?? atLeast(DEFAULT_TERMINATION.hard_max_cost_usd, 2 * budgets.max_cost_usd),
+    hard_max_wall_ms: spec.thresholds["hard_max_wall_ms"] ?? atLeast(DEFAULT_TERMINATION.hard_max_wall_ms, 2 * budgets.max_wall_ms),
   };
 }
 
-// The harness budget block is a fixed key set it refuses additions to, and turns
-// are the hunt's unit rather than the harness's, so the count is configured with
-// the hunt's other numbers and composed onto the budget here. max_calls rises
-// with it: left where it was, the call meter would end the hunt first and the
-// iteration budget would be a number nothing enforced.
+// Turns are the hunt's unit, not the harness's, whose budget block refuses added keys.
+// max_calls rises with the count, or the call meter would end the hunt first.
 export function budgetsOf(spec: RunSpec): Budgets {
-  // The journaled spec of a resumed run already carries the count, and it wins
-  // over the shipped default: a hunt an operator capped at three turns must not
-  // come back from a resume with eight.
+  // A resumed run's journaled count wins over the shipped default.
   const held = (spec.budgets as Partial<Budgets>).max_iterations;
   const asked = spec.thresholds["max_iterations"] ?? held ?? DEFAULT_BUDGETS.max_iterations;
-  // This run's fan-out, not the shipped one: an arch dispatching more workers
-  // spends more per turn, and a ceiling read off the default would cut it short.
+  // This run's fan-out, not the shipped one, which would cut a wider arch short.
   const perTurn = callsPerIteration(spec.dispatch.max_workers, spec.runtime.max_turns);
   return {
     ...spec.budgets,
@@ -147,9 +146,8 @@ export interface HuntSpec extends RunSpec {
   // The caller's own, kept apart from the definition's so the console can show an
   // operator that the thing they asked about is a thing being tested.
   operator_hypotheses: string[];
-  // The technique vocabulary a worker's citation is gated against, and nothing
-  // else -- not a label per hypothesis. Empty declares no vocabulary, which gates
-  // nothing rather than refusing everything.
+  // The vocabulary a worker's citation is gated against, not a label per hypothesis.
+  // Empty gates nothing rather than refusing everything.
   attack_techniques: string[];
   data_domains: string[];
   enrichment: EnrichmentPolicy;
@@ -166,6 +164,8 @@ function validateCeilings(termination: Termination, budgets: Budgets): void {
     throw new SpecError(`thresholds.hard_max_calls is below budgets.max_calls (${budgets.max_calls})`);
   if (termination.hard_max_cost_usd < budgets.max_cost_usd)
     throw new SpecError(`thresholds.hard_max_cost_usd is below budgets.max_cost_usd (${budgets.max_cost_usd})`);
+  if (termination.hard_max_wall_ms < budgets.max_wall_ms)
+    throw new SpecError(`thresholds.hard_max_wall_ms is below budgets.max_wall_ms (${budgets.max_wall_ms})`);
 }
 
 export function huntSpec(spec: RunSpec): HuntSpec {

@@ -14,7 +14,6 @@ import type {
   Salience,
 } from "./types.js";
 
-export const DEFAULT_EVIDENCE_WINDOW = 25;
 const DIRECTIVE_WINDOW = 5;
 
 // How much likelier an unshown record is to be resurfaced than one the lead has
