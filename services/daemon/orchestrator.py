@@ -58,17 +58,20 @@ except Exception:
     _inv_created = _inv_completed = _inv_failed = _dedup_prevented = _stuck_agents = None  # type: ignore[assignment]
 from core.agents.projections import read_projection, run_id_for
 from core.agents.queue import build_start_job, enqueue_run
-from core.response.checkpoints import raise_for_checkpoint
-from services.daemon.plan_generator import (count_steps,
-                                            generate_case_review_context,
-                                            generate_case_review_plan,
-                                            generate_initial_context,
-                                            generate_initial_state,
-                                            generate_plan, select_workflow)
-from services.daemon.shared_intel import SharedIntelligence
-from services.daemon.workdir import WorkdirManager
 from core.integrations.mcp.client import process_mcp_client
 from core.response.approval_service import ApprovalService
+from core.response.checkpoints import raise_for_checkpoint
+from services.daemon.plan_generator import (
+    count_steps,
+    generate_case_review_context,
+    generate_case_review_plan,
+    generate_initial_context,
+    generate_initial_state,
+    generate_plan,
+    select_workflow,
+)
+from services.daemon.shared_intel import SharedIntelligence
+from services.daemon.workdir import WorkdirManager
 
 logger = logging.getLogger(__name__)
 
@@ -145,8 +148,7 @@ class Orchestrator:
     def _init_services(self):
         if self._data_service is None:
             try:
-                from core.storage.database_data_service import \
-                    DatabaseDataService
+                from core.storage.database_data_service import DatabaseDataService
 
                 self._data_service = DatabaseDataService()
                 logger.info("Orchestrator: Database service initialized")
@@ -329,8 +331,7 @@ class Orchestrator:
         await self._create_investigation(
             workflow_id=workflow_id,
             findings=findings,
-            # The intake is shared, so what put the item on it is the item's to
-            # say: a nightly hunt and an analyst's request are not the same event.
+            # The intake is shared, so what put the item on it is the item's to say.
             trigger_type=item.get("trigger_type") or "manual",
             priority=item.get("priority", "medium"),
             case_id=case_id,
@@ -369,9 +370,8 @@ class Orchestrator:
             if prior_context:
                 context_md = context_md + "\n\n" + prior_context
         self.workdir.write_file(inv_id, "context.md", context_md)
-        # Beside the context and read back the same way at enqueue. A hunt tests
-        # beliefs, so what this one was opened to test has to reach its board as
-        # a hypothesis rather than as prose inside the brief.
+        # Beside the context and read back the same way at enqueue: what the hunt was
+        # opened to test reaches its board as a hypothesis, not as prose in the brief.
         if hypothesis:
             self.workdir.write_file(inv_id, "hypotheses.txt", hypothesis)
 
@@ -636,11 +636,13 @@ class Orchestrator:
             "config": "",
             "arch": "",
             "prompt": self.workdir.read_file(inv_id, "context.md") or "",
-            # One per line, as the console's run modal also sends them. Empty for
-            # a workflow that walks phases, which has no board to put them on.
+            # One per line, as the console's run modal sends them. Empty for a workflow
+            # that walks phases and has no board to put them on.
             "hypotheses": [
                 line.strip()
-                for line in (self.workdir.read_file(inv_id, "hypotheses.txt") or "").splitlines()
+                for line in (
+                    self.workdir.read_file(inv_id, "hypotheses.txt") or ""
+                ).splitlines()
                 if line.strip()
             ],
             # ORCHESTRATOR_MAX_COST and ORCHESTRATOR_MAX_RUNTIME keep their meaning
@@ -1008,8 +1010,10 @@ class Orchestrator:
         try:
             # Route through the single helper (#129) so the daemon,
             # MCP server, and ClaudeService all resolve the same path.
-            from core.platform.mempalace_paths import (get_closed_cases_dir,
-                                                       get_palace_path)
+            from core.platform.mempalace_paths import (
+                get_closed_cases_dir,
+                get_palace_path,
+            )
 
             data_dir = get_palace_path()
             get_closed_cases_dir()  # mkdir side-effect for investigation snapshots
