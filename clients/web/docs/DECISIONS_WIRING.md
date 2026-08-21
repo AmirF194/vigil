@@ -1,8 +1,14 @@
 # AI Decisions — wiring plan (historical)
 
-Approach doc for connecting the redesign **AI Decisions** screen to the real
-backend, mirroring how `CasesScreen` was wired (`useCases.ts` + `mappers.ts`).
-Written before implementation — see "Open decisions" before starting.
+> ⚠️ **Implemented — this is the plan, kept for its reasoning, not a task list.**
+> The wiring below shipped: `screens/decisions/` now holds `DecisionsScreen.tsx`,
+> `useDecisions.ts` (fetching through the shared axios client) and
+> `ApprovalsTab.test.tsx`. Paths in this file predate the 2026-08-21 flatten —
+> there is no `src/redesign/`, and the screen is `src/screens/decisions/`.
+> The "Open decisions" section records questions that were settled by building it.
+
+Approach doc for connecting the **AI Decisions** screen to the real backend,
+mirroring how `CasesScreen` was wired (`useCases.ts` + `mappers.ts`).
 
 Cross-refs: `CONSOLE_GAPS.md` §6 (API surface), §8 (decision depth — "AI
 Decisions tabs are dead"), §9 (data plumbing pattern).

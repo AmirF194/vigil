@@ -1,20 +1,28 @@
 # SOC Console — gaps & follow-up work
 
-> 📋 For the current at-a-glance **"what's left"** checklist, see
-> [`CONSOLE_TODO.md`](./CONSOLE_TODO.md). This file is the detailed audit
-> history; some §7 "not represented" notes below have since landed (Auto-Ops
-> runtime, Login) — the TODO reflects current state.
+> ⚠️ **This file is audit history, not a current-state document.** It records the
+> 2026-06-18 and 2026-06-22 passes and is preserved for the reasoning, not the
+> status. Several sections below were true when written and are not now — §7's
+> "not represented" notes (Auto-Ops runtime, Login) have landed, and §12's open
+> decision was settled by #502. For what is actually left, see
+> [`CONSOLE_TODO.md`](./CONSOLE_TODO.md), reconciled 2026-08-21.
+>
+> **Paths in this file predate the flatten.** `src/redesign/` no longer exists;
+> the shell is `src/shell/`, views are `src/screens/`, guards and the transition
+> loader are `src/routing/`, and the stylesheet is `src/styles.css`.
 
 This documents the UI redesign ported from the **Claude Design** handoff bundle
 (`full-screen-design-update`) and, importantly, everything the design **did not
 account for** so we can tackle it in future passes.
 
 > The design medium was an HTML/CSS/JS prototype. It was recreated faithfully
-> ("pixel-perfect") in React/TSX, mounted as a **standalone preview route**.
+> ("pixel-perfect") in React/TSX. It was mounted as a standalone preview route at
+> the time of writing; since #502 it is the application itself, served from `/`.
 >
-> **Styling: Tailwind.** The redesign uses Tailwind v3, **scoped to
-> `src/redesign`** with **preflight disabled** so it can't reset the rest of the
-> MUI app. The reusable design-system primitives (data table, per-row badges,
+> **Styling: Tailwind.** The console uses Tailwind v3 with **preflight disabled**,
+> because the scoped root reset in `styles.css` (`@layer base`) does that job and
+> the two would fight. Content globbing was scoped to `src/redesign` when written
+> and is now `./src/**`; there is no second UI left to leak into. The reusable design-system primitives (data table, per-row badges,
 > chart internals, the dock / tweaks / rail / timeline / master-detail) live in
 > `styles.css` under `@layer components` (the idiomatic Tailwind home for
 > repeated patterns); screen layout/composition uses utility classes. Everything
@@ -529,7 +537,17 @@ nit remains open.*
 - 🔴 Layout targets desktop; not designed for mobile/tablet (full responsive
   pass still out of scope — the above is just the narrow-toolbar polish).
 
-### 12. Theme / app integration strategy — 🔴 OPEN (decision needed)
+### 12. Theme / app integration strategy — ✅ RESOLVED (#502)
+
+**Resolution (2026-08-21):** the canonical-vs-preview question below was settled by
+**#502**, which deleted the legacy MUI frontend. Option (a) won by default — the
+Tailwind + CSS-vars console is canonical because it is the only UI — so the migration
+and rollout plan option (a) was said to need is moot, as is the MUI reconciliation
+inventory. Route gating also landed: the console sits behind `ProtectedRoute` +
+`SetupGate`, and `/login` is the single sign-in surface. The one live remnant is
+**cross-device accent**, which is still `localStorage`-only; it is tracked in
+`CONSOLE_TODO.md`. Everything below this line is the 2026-06-22 reasoning, kept for
+history and no longer accurate.
 **Update (2026-06-22):** the shell now consumes `AuthContext` (account menu +
 permission-gated nav + logout), so it is no longer *auth-blind* — but the
 **`/redesign/:screen` route is still public** (not wrapped in `ProtectedRoute`).
@@ -606,50 +624,74 @@ page replaced the floating Tweaks panel).
 ---
 
 ## File map
+
+Updated 2026-08-21 for the flattened tree.
+
 ```
-frontend/tailwind.config.cjs   Tailwind config (scoped to src/redesign, preflight off; re-exposes CSS vars as utilities)
-frontend/postcss.config.cjs    PostCSS: tailwindcss + autoprefixer
-frontend/src/redesign/
-  SocConsole.tsx       shell: rail, topbar, view router, chat dock, FAB, error boundary
-  SocConsole.test.tsx  smoke test: mount, nav, dashboard tabs, master-detail, chat, decisions, skills
+clients/web/tailwind.config.cjs  Tailwind config (./src/**, preflight off; re-exposes CSS vars as utilities)
+clients/web/postcss.config.cjs   PostCSS: tailwindcss + autoprefixer
+clients/web/src/
+  App.tsx              route table: /login, /setup, /:screen, catch-all
+  main.tsx             Vite entry (pinned by index.html), mounts ColorSchemeProvider
   styles.css           Tailwind directives + scoped .soc-console root (base tokens in :root) + design system in @layer components; IBM Plex @import at line 1
 
-  shell/               app-shell-only pieces
-    Chat.tsx           Vigil chat dock (real SSE via streamFetch; see §5 for open items)
+  routing/             what App.tsx composes, all outside the console shell
+    Loader.tsx         route-transition Suspense fallback (App.tsx + both guards)
+    ProtectedRoute.tsx auth gate
+    SetupGate.tsx      first-run setup gate
+    useSetupStatus.ts  hard-gate status feeding SetupGate
+
+  shell/               the console frame
+    SocConsole.tsx     rail, topbar, view router, chat dock, FAB, error boundary
+    SocConsole.test.tsx smoke test: mount, nav, dashboard tabs, master-detail, chat, decisions, skills
+    Chat.tsx           Vigil chat dock (real SSE via streamFetch; see §5)
+    useConversations.ts durable chat history (Chat.tsx's private hook)
     UserMenu.tsx       rail account menu (name/email/role, Settings, Logout) — useAuth
-    theme.tsx          RedesignThemeProvider (light/dark + accent → data-theme/CSS vars)
+    theme.tsx          SocThemeProvider / useSocTheme (scheme + accent + bg → data-theme/CSS vars)
     toast.tsx          global snackbar (useToast, scoped under .soc-console; §10)
-    Loader.tsx         redesign-styled Suspense fallback (used by App.tsx for /redesign)
     useDesktopNotifications.ts  OS notifications for new findings, gated by settings (§10)
     ErrorBoundary.tsx  wraps the active screen, resets on screen change
-    accent.ts          accent presets + hex/lighten helpers + accentVars()
+    accent.ts / bg.ts  accent + background presets, hex/lighten helpers, accentVars()
 
   shared/              cross-screen primitives
     ui.tsx             shared UI primitives (select, Rating, Slider, etc.)
+    formKit.tsx        form controls for the Settings screens
     VigilLogo.tsx      inline-SVG brand lockup + mark (recolor via currentColor)
     icons.tsx          Icon component + ICON path map
     charts.tsx         Donut / Spark / Trend / Hbars / Heatmap (inline-SVG, accent-aware)
     Markdown.tsx       markdown renderer (chat + case/workflow text)
-    types.ts           ScreenProps contract + shared view types
+    DataTable.tsx      shared table shell
+    SourceChip.tsx     source badge chip
+    types.ts           ConsoleScreenProps contract + shared view types
 
-  data/                view-model types + display config + API→view mappers (NO mock data)
-    data.ts            ScreenKey, NAV, TITLES + Finding/CaseRow types
+  data/                view-model types + display config + API->view mappers (NO mock data)
+    data.ts            ConsoleScreenKey, NAV, TITLES + Finding/CaseRow types
     appData.ts         AGENT_META, prettyHandle + Workflow/Decision/AgentTemplate/Skill types
-    mitre.ts           MITRE technique→tactic lookup (reference data)
-    mappers.ts         map real API responses (snake_case) → view shapes
+    mitre.ts           MITRE technique->tactic lookup (reference data)
+    mappers.ts         map real API responses (snake_case) -> view shapes
+    sourceEvidence.ts  Source Evidence envelope parser
 
-  screens/<name>/      each screen + its private hooks/components
+  extensions/          page-extension host + connector contracts
+    ExtensionHost.tsx / ExtensionProvider.tsx / contracts.ts / registry.ts
+
+  contexts/
+    AuthContext.tsx        session + hasPermission
+    ColorSchemeContext.tsx light/dark, backend-persisted, app-wide
+
+  screens/<name>/      each view + its private hooks/components
     dashboard/         DashboardScreen, AttackTechniqueFindings, FindingPopup,
-                       attackData (timeline types/config), useAttack, useFindings, useTimeline
-    cases/             CasesScreen, CaseSections (SLA/tasks/IOCs/comments/watchers cards), useCases
+                       SourceEvidenceSection, attackData, findingsColumns,
+                       useAttack, useFindings, useTimeline
+    cases/             CasesScreen, CaseSections (SLA/tasks/IOCs/comments/watchers), useCases
     decisions/         DecisionsScreen, useDecisions
     metrics/           MetricsScreen, useCaseMetrics
     analytics/         AnalyticsScreen, useAnalytics
     workflows/         WorkflowsScreen, WorkflowBuilder, useWorkflowsData
     autoops/           AutoOpsScreen, InvestigationDetail, statusBadge, useAutoOps, useInvestigationDetail
-    login/             LoginScreen (routed at /redesign/login via App.tsx)
+    login/             LoginScreen (routed at /login, outside the shell)
+    setup/             SetupScreen + dialogs, setupSteps, useSetupChecklist (routed at /setup)
     notfound/          NotFoundScreen (in-shell 404)
     settings/          SettingsScreen, useSettings + section components (General/System/
                        Federation/Users/Appearance/SlaPolicies/AutoInvestigate/AiConfig/
-                       Integrations/Developer + dialogs); useSlaPolicies hook for the SLA section
+                       Integrations/Developer + dialogs); useSlaPolicies for the SLA section
 ```
