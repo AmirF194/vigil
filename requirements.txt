@@ -12,7 +12,7 @@
 # Core
 numpy>=1.26.0
 pyarrow>=15.0.0
-ijson>=3.2.0
+ijson>=3.5.1
 anthropic>=0.45.0
 claude-agent-sdk>=0.1.0
 # The MCP SDK arrives transitively via claude-agent-sdk; pinned for the same
