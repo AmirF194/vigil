@@ -31,7 +31,7 @@ Every agent has access to 19 backend tools via Agent SDK and 100+ additional too
 
 ## Workflows — One-Click Multi-Agent Workflows
 
-Workflows are the operational core of Vigil. Each worfklow chains multiple specialized AI agents into an end-to-end playbook that executes with a single command. No manual hand-offs, no copy-pasting between tools — the agents coordinate automatically.  
+Workflows are the operational core of Vigil. Each workflow chains multiple specialized AI agents into an end-to-end playbook that executes with a single command. No manual hand-offs, no copy-pasting between tools — the agents coordinate automatically.  
 
 | Workflow | Agents | What It Does |
 |----------|--------|-------------|
@@ -506,3 +506,5 @@ Apache 2.0 — See [LICENSE](LICENSE)
 - [DeepTempo](https://deeptempo.ai) — Vigil sponsor; LogLM connects via MCP as an AI-native detection layer
 - [Model Context Protocol](https://modelcontextprotocol.io/) — MCP specification
 - [ATT&CK Navigator](https://mitre-attack.github.io/attack-navigator/) — MITRE visualization
+- [SOCBench](https://socbench.org) — Open benchmark for AI in cybersecurity operations
+
