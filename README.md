@@ -1,6 +1,8 @@
 # Vigil
 
-Vigil is the open-source AI SOC where your playbooks are plain-text files, your agent logic is readable Python, and your integrations use an open standard ([MCP](https://modelcontextprotocol.io/)). Every proprietary AI SOC on the market is a black box you rent. Vigil is a capability you own.
+Vigil is the leading open source AI SOC: an agentic SOC with 13 specialized AI agents, 30+ MCP integrations, and 7,200+ community detection rules, released under Apache 2.0. Your playbooks are plain-text files, your agent logic is readable Python, and your integrations use an open standard ([MCP](https://modelcontextprotocol.io/)). Every proprietary AI SOC on the market is a black box you rent. Vigil is a capability you own.
+
+Vigil pairs with [LogLM](https://www.deeptempo.ai/platform), a cybersecurity foundation model for [behavioral anomaly detection](https://www.deeptempo.ai/learning-center/behavioral-anomaly-detection), to form the [Intelligent Defense Platform](https://www.deeptempo.ai) from [DeepTempo](https://www.deeptempo.ai). Measured in the open by [SOCBench](https://socbench.org). Docs and community: [vigilsoc.org](https://vigilsoc.org).
 
 The inspiration for the project is in part StackStorm and the experience of some of the founders of this project had in building the Linux Foundation project [StackStorm](https://github.com/StackStorm/st2) and in supporting Netflix and others who used StackStorm to achieve, carefully, very high levels of automation.  You'll sometimes hear us talking about the journey towards full autonomy and lessons learned.  One lesson - the system can only demote itself and only humans can promote additional autonomy.  You'll find this playing out on the way Vigil is designed; for example Vigil will check thresholds for projected costs and confidence levels in completion before executing an automation.  If it looks dodgy or two expensive, it'll double check with the humans before moving ahead.  
 
