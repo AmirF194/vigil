@@ -29,6 +29,8 @@ class LLMWorkerManager:
         while not shutdown_event.is_set():
             self._sync_enabled_from_db()
 
+            # EX_CONFIG (78) is treated like any other child death: restart
+            # on the next poll. Compose/Helm see 78 on the container.
             if self._enabled and not self._is_running():
                 self._start_worker()
             elif not self._enabled and self._is_running():
